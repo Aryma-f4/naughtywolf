@@ -206,6 +206,7 @@ async fn beacons_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
 }
 
 async fn listeners_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
+    let can_act = user.0.role.can_perform(&Role::Operator);
     let ctx = templates::PageContext {
         title: "Listeners".to_string(),
         current_page: "listeners",
@@ -213,26 +214,34 @@ async fn listeners_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
         role: user.0.role.to_string(),
         profile_name: None,
     };
-    let content = r#"
+    let content = format!(r#"
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+    <h3 style="color:var(--text-muted);font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px;">Active Listeners</h3>
+    {action_btn}
+</div>
 <div class="card">
-    <h3>Listeners</h3>
-    <p>Active Sliver listeners will be listed here in a later task.</p>
     <table class="data-table">
         <thead><tr><th>ID</th><th>Protocol</th><th>Bind Address</th><th>Status</th></tr></thead>
         <tbody id="listeners-tbody"></tbody>
     </table>
 </div>
 <script>
-    fetch('/api/listeners').then(r=>r.json()).then(listeners=>{
+    fetch('/api/listeners').then(r=>r.json()).then(listeners=>{{
         const tbody=document.getElementById('listeners-tbody');
-        listeners.forEach(l=>{
+        listeners.forEach(l=>{{
             const tr=document.createElement('tr');
-            tr.innerHTML=`<td>${l.id}</td><td>${l.protocol}</td><td>${l.bind}</td><td>${l.status}</td>`;
+            tr.innerHTML=`<td>${{l.id}}</td><td>${{l.protocol}}</td><td>${{l.bind}}</td><td>${{l.status}}</td>`;
             tbody.appendChild(tr);
-        });
-    });
+        }});
+    }});
 </script>
-"#.to_string();
+"#,
+        action_btn = if can_act {
+            r#"<button class="btn btn-primary btn-sm" onclick="alert('Listener creation coming in a later task')">+ New Listener</button>"#
+        } else {
+            r#"<span style="color:var(--text-muted);font-size:0.85rem;" title="Read-only">Actions disabled</span>"#
+        }
+    );
     templates::render_page(&ctx, &content)
 }
 
