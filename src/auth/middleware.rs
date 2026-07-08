@@ -20,18 +20,27 @@ pub struct AuthSession {
 
 impl AuthSession {
     pub async fn login(&self, user_id: Uuid, username: &str, role: &Role) {
-        self.session
+        if self.session
             .insert(SESSION_USER_ID_KEY, user_id)
             .await
-            .ok();
-        self.session
+            .is_err()
+        {
+            tracing::warn!("Failed to insert user_id into session for user '{username}'");
+        }
+        if self.session
             .insert(SESSION_USERNAME_KEY, username.to_string())
             .await
-            .ok();
-        self.session
+            .is_err()
+        {
+            tracing::warn!("Failed to insert username into session for user '{username}'");
+        }
+        if self.session
             .insert(SESSION_ROLE_KEY, role.to_string())
             .await
-            .ok();
+            .is_err()
+        {
+            tracing::warn!("Failed to insert role into session for user '{username}'");
+        }
     }
 
     pub async fn logout(&self) {

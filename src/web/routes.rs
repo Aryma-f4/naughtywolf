@@ -67,11 +67,15 @@ async fn login_handler(
         Ok(Some(user)) => {
             match password::verify_password(&form.password, &user.password_hash) {
                 Ok(true) => {
-                    let role = Role::from_str(&user.role).unwrap_or(Role::Viewer);
+                    let role = Role::from_str(&user.role).unwrap_or_else(|| {
+                        tracing::warn!("Unknown role '{}' for user '{}', downgrading to Viewer", user.role, user.username);
+                        Role::Viewer
+                    });
                     auth.login(user.id, &user.username, &role).await;
                     Redirect::to("/dashboard").into_response()
                 }
                 _ => {
+                    tracing::warn!("Password verification failed for user '{}'", form.username);
                     let mut html = String::from(include_str!("../../static/login.html"));
                     html = html.replace("<!-- ERROR_PLACEHOLDER -->",
                         r#"<div class="error-message">Invalid username or password</div>"#);
@@ -80,6 +84,7 @@ async fn login_handler(
             }
         }
         _ => {
+            tracing::warn!("Login failed: user '{}' not found or DB error", form.username);
             let mut html = String::from(include_str!("../../static/login.html"));
             html = html.replace("<!-- ERROR_PLACEHOLDER -->",
                 r#"<div class="error-message">Invalid username or password</div>"#);
