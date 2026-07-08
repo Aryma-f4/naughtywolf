@@ -25,8 +25,8 @@ prost = "0.13"
 prost-types = "0.13"
 thiserror = "2"
 moka = { version = "0.12", features = ["sync"] }
-tower-sessions = "0.15"
-tower-sessions-sqlx-store = "0.15"
+tower-sessions = "0.14"
+tower-sessions-sqlx-store = { version = "0.15", features = ["postgres"] }
 async-trait = "0.1"
 dirs = "5"
 anyhow = "1"
