@@ -15,13 +15,16 @@ use crate::auth::{
 };
 use crate::db;
 use crate::sliver::events::SliverEvent;
+use crate::sliver::connection::SliverConnection;
 use crate::web::templates;
-use tokio::sync::broadcast;
+use std::sync::Arc;
+use tokio::sync::{broadcast, Mutex};
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub event_tx: broadcast::Sender<SliverEvent>,
+    pub sliver: Arc<Mutex<Option<SliverConnection>>>,
 }
 
 pub fn routes() -> Router<AppState> {

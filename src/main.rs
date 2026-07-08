@@ -4,9 +4,11 @@ use naughtywolf::{
     config::Config,
     db,
     sliver::events::SliverEvent,
+    sliver::SliverAdapter,
     web::{self, routes::AppState},
 };
-use tokio::sync::broadcast;
+use std::sync::Arc;
+use tokio::sync::{broadcast, Mutex, watch};
 use tower_http::services::ServeDir;
 use tower_sessions::{cookie::time::Duration, session_store::ExpiredDeletion, SessionManagerLayer};
 use tower_sessions_sqlx_store::PostgresStore;
@@ -90,7 +92,21 @@ async fn main() -> anyhow::Result<()> {
         ));
 
     let (event_tx, _) = broadcast::channel::<SliverEvent>(256);
-    let state = AppState { pool: pool.clone(), event_tx };
+
+    // Sliver adapter — creates the shared connection storage that the event
+    // listener and API handlers both access.
+    let (_profile_tx, profile_rx) = watch::channel(None);
+    let adapter = SliverAdapter {
+        connection: Arc::new(Mutex::new(None)),
+        active_profile: profile_rx,
+    };
+    let sliver_conn = adapter.connection.clone();
+
+    let state = AppState {
+        pool: pool.clone(),
+        event_tx,
+        sliver: sliver_conn,
+    };
 
     let app = web::routes::routes()
         .merge(web::api::api_routes())
