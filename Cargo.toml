@@ -31,6 +31,8 @@ rpassword = "7"
 async-trait = "0.1"
 dirs = "5"
 anyhow = "1"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

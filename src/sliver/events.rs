@@ -11,7 +11,7 @@ use crate::sliver::proto::clientpb;
 use crate::sliver::proto::commonpb;
 
 /// The canonical NaughtyWolf event type wrapping Sliver server events.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum SliverEvent {
     SessionOpened(String),
     SessionClosed(String),

@@ -3,8 +3,10 @@ use naughtywolf::{
     cli::Commands,
     config::Config,
     db,
+    sliver::events::SliverEvent,
     web::{self, routes::AppState},
 };
+use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 use tower_sessions::{cookie::time::Duration, session_store::ExpiredDeletion, SessionManagerLayer};
 use tower_sessions_sqlx_store::PostgresStore;
@@ -87,9 +89,12 @@ async fn main() -> anyhow::Result<()> {
             Duration::hours(8) // 8 hours
         ));
 
-    let state = AppState { pool: pool.clone() };
+    let (event_tx, _) = broadcast::channel::<SliverEvent>(256);
+    let state = AppState { pool: pool.clone(), event_tx };
 
     let app = web::routes::routes()
+        .merge(web::api::api_routes())
+        .merge(web::sse::event_stream_routes())
         .with_state(state)
         .layer(session_layer)
         .nest_service("/static", ServeDir::new("static"));
