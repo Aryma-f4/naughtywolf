@@ -20,7 +20,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"
 prost-types = "0.13"
 thiserror = "2"
@@ -31,6 +31,9 @@ rpassword = "7"
 async-trait = "0.1"
 dirs = "5"
 anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 tonic-build = "0.12"
