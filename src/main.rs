@@ -1,4 +1,6 @@
+use clap::Parser;
 use naughtywolf::{
+    cli::Commands,
     config::Config,
     db,
     web::{self, routes::AppState},
@@ -18,6 +20,44 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .init();
+
+    // Use clap::Parser::try_parse to detect CLI mode vs server mode.
+    // - No args: MissingSubcommand → fall through to server mode
+    // - "serve": Ok(Serve) → fall through to server mode
+    // - "user list" / "profile scan" etc: Ok(cmd) → CLI mode (load DB, execute, exit)
+    // - "--help" / "--version": clap handles internally and exits
+    match naughtywolf::cli::Cli::try_parse() {
+        Ok(cli) => match cli.command {
+            Commands::Serve => {
+                // fall through to server mode below
+            }
+            cmd => {
+                // CLI mode: need DB but not full server
+                let config = Config::from_env()?;
+                let pool = db::create_pool(&config.database_url).await?;
+                db::run_migrations(&pool).await?;
+
+                match cmd {
+                    Commands::User(user) => user.execute(&pool).await?,
+                    Commands::Profile(profile) => {
+                        profile.execute(&pool, &config.sliver_config_dir).await?
+                    }
+                    Commands::Migrate => {
+                        println!("Migrations already applied");
+                    }
+                    Commands::Serve => unreachable!(),
+                }
+                return Ok(());
+            }
+        },
+        Err(e) => {
+            // MissingSubcommand (no args) → server mode
+            // DisplayHelp / DisplayVersion → clap handles and exits
+            if e.kind() != clap::error::ErrorKind::MissingSubcommand {
+                e.exit();
+            }
+        }
+    }
 
     let config = Config::from_env()?;
     tracing::info!("NaughtyWolf starting on {}", config.bind);
