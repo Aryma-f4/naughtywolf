@@ -1,4 +1,5 @@
 use naughtywolf::config::Config;
+use naughtywolf::db;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -15,7 +16,10 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     tracing::info!("NaughtyWolf starting on {}", config.bind);
 
-    // DB pool setup (wired in Task 2)
+    let pool = db::create_pool(&config.database_url).await?;
+    db::run_migrations(&pool).await?;
+    tracing::info!("Database connected and migrations applied");
+
     // Router setup (wired in Task 3+)
     // axum::serve(listener, app).await?;
 
