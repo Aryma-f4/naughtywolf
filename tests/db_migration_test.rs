@@ -2,6 +2,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::env;
 
 #[tokio::test]
+#[ignore = "Requires DATABASE_URL and running PostgreSQL"]
 async fn test_migration_applies_cleanly() {
     let database_url = env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set for integration tests");
