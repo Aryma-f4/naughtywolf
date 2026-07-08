@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::actions::{beacons, listeners, sessions};
+use crate::actions::{beacons, creds, listeners, loot, payloads, sessions, websites};
 use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
@@ -81,6 +81,10 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/sessions", axum::routing::get(list_sessions))
         .route("/api/beacons", axum::routing::get(list_beacons))
         .route("/api/listeners", axum::routing::get(list_listeners))
+        .route("/api/payloads", axum::routing::get(list_payloads))
+        .route("/api/websites", axum::routing::get(list_websites))
+        .route("/api/loot", axum::routing::get(list_loot))
+        .route("/api/creds", axum::routing::get(list_creds))
 }
 
 async fn list_users(
@@ -90,7 +94,7 @@ async fn list_users(
     if user.0.role != Role::Admin {
         return Err((axum::http::StatusCode::FORBIDDEN, "Admin only".to_string()));
     }
-    let users = sqlx::query_as::<_, db::models::User>("SELECT * FROM users ORDER BY created_at")
+    let users = sqlx::query_as::<_, db::models::User>("SELECT id, username, password_hash, role::text as role, disabled, created_at, updated_at FROM users ORDER BY created_at")
         .fetch_all(&state.pool)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -255,4 +259,92 @@ async fn list_listeners(
         .collect();
 
     Ok(Json(response))
+}
+
+async fn list_payloads(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<
+    Json<Vec<payloads::ImplantBuildResponse>>,
+    (axum::http::StatusCode, String),
+> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    let builds = payloads::list_builds(conn)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    Ok(Json(builds))
+}
+
+async fn list_websites(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<
+    Json<Vec<websites::WebsiteResponse>>,
+    (axum::http::StatusCode, String),
+> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    let sites = websites::list_websites(conn)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    Ok(Json(sites))
+}
+
+async fn list_loot(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<
+    Json<Vec<loot::LootResponse>>,
+    (axum::http::StatusCode, String),
+> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    let items = loot::list_loot(conn)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    Ok(Json(items))
+}
+
+async fn list_creds(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<
+    Json<Vec<creds::CredResponse>>,
+    (axum::http::StatusCode, String),
+> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    let credentials = creds::list_creds(conn)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    Ok(Json(credentials))
 }

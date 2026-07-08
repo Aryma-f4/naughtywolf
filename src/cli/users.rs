@@ -77,7 +77,7 @@ impl UserCli {
         let id = Uuid::new_v4();
 
         sqlx::query(
-            "INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4::user_role)",
         )
         .bind(id)
         .bind(username)
@@ -92,7 +92,7 @@ impl UserCli {
 
     async fn list_users(pool: &PgPool) -> anyhow::Result<()> {
         let users =
-            sqlx::query_as::<_, crate::db::models::User>("SELECT * FROM users ORDER BY created_at")
+            sqlx::query_as::<_, crate::db::models::User>("SELECT id, username, password_hash, role::text as role, disabled, created_at, updated_at FROM users ORDER BY created_at")
                 .fetch_all(pool)
                 .await?;
 

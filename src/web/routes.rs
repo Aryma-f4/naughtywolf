@@ -37,6 +37,10 @@ pub fn routes() -> Router<AppState> {
         .route("/listeners", get(listeners_page))
         .route("/admin", get(admin_page))
         .route("/events", get(events_page))
+        .route("/payloads", get(payloads_page))
+        .route("/websites", get(websites_page))
+        .route("/loot", get(loot_page))
+        .route("/creds", get(creds_page))
         .route("/audit", get(audit_page))
         .route("/", get(root_redirect))
 }
@@ -69,7 +73,7 @@ async fn login_handler(
 
     // Look up user
     let user = sqlx::query_as::<_, db::models::User>(
-        "SELECT * FROM users WHERE username = $1 AND disabled = false",
+        "SELECT id, username, password_hash, role::text as role, disabled, created_at, updated_at FROM users WHERE username = $1 AND disabled = false",
     )
     .bind(&form.username)
     .fetch_optional(&state.pool)
@@ -340,6 +344,115 @@ async fn events_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
     };
 </script>
 "#.to_string();
+    templates::render_page(&ctx, &content)
+}
+
+async fn payloads_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
+    let ctx = templates::PageContext {
+        title: "Payloads".to_string(),
+        current_page: "payloads",
+        username: user.0.username.clone(),
+        role: user.0.role.to_string(),
+        profile_name: None,
+    };
+    let content = r#"
+<div class="card">
+    <h3>Implant Builds</h3>
+    <table class="data-table">
+        <thead><tr><th>Name</th><th>OS/Arch</th><th>Type</th><th>Format</th><th>Actions</th></tr></thead>
+        <tbody id="payloads-tbody"><tr><td colspan="5" style="text-align:center;color:var(--text-muted);">Connect to Sliver to see payload builds</td></tr></tbody>
+    </table>
+</div>
+<script>
+fetch('/api/payloads').then(r=>r.json()).then(builds=>{
+    const tbody=document.getElementById('payloads-tbody');
+    const formats=['shared','shellcode','exe','service'];
+    tbody.innerHTML=builds.map(b=>`<tr><td>${b.name}</td><td>${b.goos}/${b.goarch}</td><td>${b.is_beacon?'beacon':'session'}</td><td>${formats[b.format]||'unknown'}</td><td>—</td></tr>`).join('');
+});
+</script>
+"#
+    .to_string();
+    templates::render_page(&ctx, &content)
+}
+
+async fn websites_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
+    let ctx = templates::PageContext {
+        title: "Websites".to_string(),
+        current_page: "websites",
+        username: user.0.username.clone(),
+        role: user.0.role.to_string(),
+        profile_name: None,
+    };
+    let content = r#"
+<div class="card">
+    <h3>Websites</h3>
+    <table class="data-table">
+        <thead><tr><th>ID</th><th>Name</th><th>Content Items</th><th>Total Size</th></tr></thead>
+        <tbody id="websites-tbody"><tr><td colspan="4" style="text-align:center;color:var(--text-muted);">Connect to Sliver to see websites</td></tr></tbody>
+    </table>
+</div>
+<script>
+fetch('/api/websites').then(r=>r.json()).then(sites=>{
+    const tbody=document.getElementById('websites-tbody');
+    tbody.innerHTML=sites.map(s=>`<tr><td>${s.id}</td><td>${s.name}</td><td>${s.content_count}</td><td>${s.total_size} bytes</td></tr>`).join('');
+});
+</script>
+"#
+    .to_string();
+    templates::render_page(&ctx, &content)
+}
+
+async fn loot_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
+    let ctx = templates::PageContext {
+        title: "Loot".to_string(),
+        current_page: "loot",
+        username: user.0.username.clone(),
+        role: user.0.role.to_string(),
+        profile_name: None,
+    };
+    let content = r#"
+<div class="card">
+    <h3>Loot</h3>
+    <table class="data-table">
+        <thead><tr><th>ID</th><th>Name</th><th>File Type</th><th>Size</th></tr></thead>
+        <tbody id="loot-tbody"><tr><td colspan="4" style="text-align:center;color:var(--text-muted);">Connect to Sliver to see loot</td></tr></tbody>
+    </table>
+</div>
+<script>
+fetch('/api/loot').then(r=>r.json()).then(items=>{
+    const tbody=document.getElementById('loot-tbody');
+    tbody.innerHTML=items.map(l=>`<tr><td>${l.id}</td><td>${l.name}</td><td>${l.file_type}</td><td>${l.size} bytes</td></tr>`).join('');
+});
+</script>
+"#
+    .to_string();
+    templates::render_page(&ctx, &content)
+}
+
+async fn creds_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
+    let ctx = templates::PageContext {
+        title: "Credentials".to_string(),
+        current_page: "creds",
+        username: user.0.username.clone(),
+        role: user.0.role.to_string(),
+        profile_name: None,
+    };
+    let content = r#"
+<div class="card">
+    <h3>Credentials</h3>
+    <table class="data-table">
+        <thead><tr><th>ID</th><th>Username</th><th>Hash Type</th><th>Cracked</th><th>Collection</th></tr></thead>
+        <tbody id="creds-tbody"><tr><td colspan="5" style="text-align:center;color:var(--text-muted);">Connect to Sliver to see credentials</td></tr></tbody>
+    </table>
+</div>
+<script>
+fetch('/api/creds').then(r=>r.json()).then(creds=>{
+    const tbody=document.getElementById('creds-tbody');
+    tbody.innerHTML=creds.map(c=>`<tr><td>${c.id}</td><td>${c.username}</td><td>${c.hash_type}</td><td>${c.is_cracked?'Yes':'No'}</td><td>${c.collection}</td></tr>`).join('');
+});
+</script>
+"#
+    .to_string();
     templates::render_page(&ctx, &content)
 }
 

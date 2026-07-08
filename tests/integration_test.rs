@@ -94,3 +94,64 @@ async fn test_server_boots() {
 
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_api_auth_enforced() {
+    let pool = setup_test_pool().await;
+    let (event_tx, _) = broadcast::channel::<SliverEvent>(256);
+
+    use naughtywolf::sliver::connection::SliverConnection;
+    let sliver = Arc::new(Mutex::new(None::<SliverConnection>));
+
+    let state = AppState {
+        pool,
+        event_tx,
+        sliver,
+    };
+
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use tower_sessions::{MemoryStore, SessionManagerLayer};
+
+    let session_store = MemoryStore::default();
+    let session_layer = SessionManagerLayer::new(session_store).with_secure(false);
+
+    let app = naughtywolf::web::routes::routes()
+        .merge(naughtywolf::web::api::api_routes())
+        .merge(naughtywolf::web::sse::event_stream_routes())
+        .with_state(state)
+        .layer(session_layer);
+
+    for path in &[
+        "/api/users",
+        "/api/dashboard/stats",
+        "/api/sessions",
+        "/api/beacons",
+        "/api/listeners",
+        "/api/payloads",
+        "/api/websites",
+        "/api/loot",
+        "/api/creds",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(*path)
+                    .method("GET")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Without session cookie, these should all return 401
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{} should require auth",
+            path
+        );
+    }
+}
