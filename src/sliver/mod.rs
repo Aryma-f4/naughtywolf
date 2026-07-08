@@ -1,6 +1,6 @@
-pub mod profiles;
 pub mod connection;
 pub mod events;
+pub mod profiles;
 pub mod proto;
 
 use std::sync::Arc;

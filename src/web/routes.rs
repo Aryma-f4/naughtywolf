@@ -1,7 +1,7 @@
 use axum::{
+    Form, Router,
     extract::State,
     response::{Html, IntoResponse, Redirect},
-    Form, Router,
     routing::get,
 };
 use serde::Deserialize;
@@ -14,11 +14,11 @@ use crate::auth::{
     rbac::Role,
 };
 use crate::db;
-use crate::sliver::events::SliverEvent;
 use crate::sliver::connection::SliverConnection;
+use crate::sliver::events::SliverEvent;
 use crate::web::templates;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -69,37 +69,46 @@ async fn login_handler(
 
     // Look up user
     let user = sqlx::query_as::<_, db::models::User>(
-        "SELECT * FROM users WHERE username = $1 AND disabled = false"
+        "SELECT * FROM users WHERE username = $1 AND disabled = false",
     )
     .bind(&form.username)
     .fetch_optional(&state.pool)
     .await;
 
     match user {
-        Ok(Some(user)) => {
-            match password::verify_password(&form.password, &user.password_hash) {
-                Ok(true) => {
-                    let role = Role::from_str(&user.role).unwrap_or_else(|| {
-                        tracing::warn!("Unknown role '{}' for user '{}', downgrading to Viewer", user.role, user.username);
-                        Role::Viewer
-                    });
-                    auth.login(user.id, &user.username, &role).await;
-                    Redirect::to("/dashboard").into_response()
-                }
-                _ => {
-                    tracing::warn!("Password verification failed for user '{}'", form.username);
-                    let mut html = String::from(include_str!("../../static/login.html"));
-                    html = html.replace("<!-- ERROR_PLACEHOLDER -->",
-                        r#"<div class="error-message">Invalid username or password</div>"#);
-                    Html(html).into_response()
-                }
+        Ok(Some(user)) => match password::verify_password(&form.password, &user.password_hash) {
+            Ok(true) => {
+                let role = user.role.parse::<Role>().unwrap_or_else(|_| {
+                    tracing::warn!(
+                        "Unknown role '{}' for user '{}', downgrading to Viewer",
+                        user.role,
+                        user.username
+                    );
+                    Role::Viewer
+                });
+                auth.login(user.id, &user.username, &role).await;
+                Redirect::to("/dashboard").into_response()
             }
-        }
+            _ => {
+                tracing::warn!("Password verification failed for user '{}'", form.username);
+                let mut html = String::from(include_str!("../../static/login.html"));
+                html = html.replace(
+                    "<!-- ERROR_PLACEHOLDER -->",
+                    r#"<div class="error-message">Invalid username or password</div>"#,
+                );
+                Html(html).into_response()
+            }
+        },
         _ => {
-            tracing::warn!("Login failed: user '{}' not found or DB error", form.username);
+            tracing::warn!(
+                "Login failed: user '{}' not found or DB error",
+                form.username
+            );
             let mut html = String::from(include_str!("../../static/login.html"));
-            html = html.replace("<!-- ERROR_PLACEHOLDER -->",
-                r#"<div class="error-message">Invalid username or password</div>"#);
+            html = html.replace(
+                "<!-- ERROR_PLACEHOLDER -->",
+                r#"<div class="error-message">Invalid username or password</div>"#,
+            );
             Html(html).into_response()
         }
     }
@@ -142,7 +151,8 @@ async fn dashboard_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
         if (feed.children.length > 100) feed.removeChild(feed.lastChild);
     };
 </script>
-"#.to_string();
+"#
+    .to_string();
     templates::render_page(&ctx, &content)
 }
 
@@ -217,7 +227,8 @@ async fn listeners_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
         role: user.0.role.to_string(),
         profile_name: None,
     };
-    let content = format!(r#"
+    let content = format!(
+        r#"
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
     <h3 style="color:var(--text-muted);font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px;">Active Listeners</h3>
     {action_btn}
@@ -268,8 +279,13 @@ async fn admin_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
         role: user.0.role.to_string(),
         profile_name: None,
     };
-    let can_manage_users = if user.0.role == Role::Admin { "true" } else { "false" };
-    let content = format!(r#"
+    let can_manage_users = if user.0.role == Role::Admin {
+        "true"
+    } else {
+        "false"
+    };
+    let content = format!(
+        r#"
 <div class="card">
     <h3>User Management</h3>
     <p>Manage NaughtyWolf users.</p>
@@ -292,7 +308,9 @@ async fn admin_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
         }});
     }});
 </script>
-"#, can_manage_users = can_manage_users);
+"#,
+        can_manage_users = can_manage_users
+    );
     templates::render_page(&ctx, &content).into_response()
 }
 

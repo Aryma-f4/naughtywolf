@@ -50,10 +50,9 @@ impl UserCli {
                 password,
             } => Self::create_user(pool, &username, &role, password.as_deref()).await,
             UserAction::List => Self::list_users(pool).await,
-            UserAction::ResetPassword {
-                username,
-                password,
-            } => Self::reset_password(pool, &username, password.as_deref()).await,
+            UserAction::ResetPassword { username, password } => {
+                Self::reset_password(pool, &username, password.as_deref()).await
+            }
             UserAction::Disable { username } => Self::disable_user(pool, &username).await,
         }
     }
@@ -64,8 +63,9 @@ impl UserCli {
         role: &str,
         password: Option<&str>,
     ) -> anyhow::Result<()> {
-        let role = Role::from_str(role)
-            .ok_or_else(|| anyhow::anyhow!("Invalid role: {role}. Use admin, operator, or viewer"))?;
+        let role = role
+            .parse::<Role>()
+            .map_err(|_| anyhow::anyhow!("Invalid role: {role}. Use admin, operator, or viewer"))?;
 
         let password = match password {
             Some(p) => p.to_string(),
@@ -91,11 +91,10 @@ impl UserCli {
     }
 
     async fn list_users(pool: &PgPool) -> anyhow::Result<()> {
-        let users = sqlx::query_as::<_, crate::db::models::User>(
-            "SELECT * FROM users ORDER BY created_at",
-        )
-        .fetch_all(pool)
-        .await?;
+        let users =
+            sqlx::query_as::<_, crate::db::models::User>("SELECT * FROM users ORDER BY created_at")
+                .fetch_all(pool)
+                .await?;
 
         if users.is_empty() {
             println!("No users found.");
@@ -149,13 +148,12 @@ impl UserCli {
     }
 
     async fn disable_user(pool: &PgPool, username: &str) -> anyhow::Result<()> {
-        let updated = sqlx::query(
-            "UPDATE users SET disabled = true, updated_at = now() WHERE username = $1",
-        )
-        .bind(username)
-        .execute(pool)
-        .await?
-        .rows_affected();
+        let updated =
+            sqlx::query("UPDATE users SET disabled = true, updated_at = now() WHERE username = $1")
+                .bind(username)
+                .execute(pool)
+                .await?
+                .rows_affected();
 
         if updated == 0 {
             anyhow::bail!("User '{username}' not found");

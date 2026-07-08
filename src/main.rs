@@ -3,14 +3,14 @@ use naughtywolf::{
     cli::Commands,
     config::Config,
     db,
-    sliver::events::SliverEvent,
     sliver::SliverAdapter,
+    sliver::events::SliverEvent,
     web::{self, routes::AppState},
 };
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, watch};
+use tokio::sync::{Mutex, broadcast, watch};
 use tower_http::services::ServeDir;
-use tower_sessions::{cookie::time::Duration, session_store::ExpiredDeletion, SessionManagerLayer};
+use tower_sessions::{SessionManagerLayer, cookie::time::Duration, session_store::ExpiredDeletion};
 use tower_sessions_sqlx_store::PostgresStore;
 use tracing_subscriber::EnvFilter;
 
@@ -21,9 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,naughtywolf=debug"));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // Use clap::Parser::try_parse to detect CLI mode vs server mode.
     // - No args: MissingSubcommand → fall through to server mode
@@ -86,9 +84,9 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let session_layer = SessionManagerLayer::new(session_store)
-        .with_secure(false)         // set true when behind HTTPS reverse proxy
+        .with_secure(false) // set true when behind HTTPS reverse proxy
         .with_expiry(tower_sessions::Expiry::OnInactivity(
-            Duration::hours(8) // 8 hours
+            Duration::hours(8), // 8 hours
         ));
 
     let (event_tx, _) = broadcast::channel::<SliverEvent>(256);

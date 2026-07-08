@@ -1,5 +1,5 @@
-pub mod users;
 pub mod profiles;
+pub mod users;
 
 use clap::{Parser, Subcommand};
 

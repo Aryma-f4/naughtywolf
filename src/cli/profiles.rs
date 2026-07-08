@@ -29,11 +29,7 @@ pub enum ProfileAction {
 }
 
 impl ProfileCli {
-    pub async fn execute(
-        self,
-        pool: &PgPool,
-        config_dir: &std::path::Path,
-    ) -> anyhow::Result<()> {
+    pub async fn execute(self, pool: &PgPool, config_dir: &std::path::Path) -> anyhow::Result<()> {
         match self.action {
             ProfileAction::Scan { config_dir: dir } => {
                 let dir = dir
@@ -109,9 +105,7 @@ impl ProfileCli {
                 .fetch_optional(pool)
                 .await?
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Profile '{profile}' not found. Run 'profile scan' first."
-                    )
+                    anyhow::anyhow!("Profile '{profile}' not found. Run 'profile scan' first.")
                 })?;
 
                 // Check if assignment exists

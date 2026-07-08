@@ -34,23 +34,19 @@ pub enum SliverEvent {
 ///
 /// Events are forwarded into the broadcast channel `tx`. The task exits
 /// when the stream ends, an error occurs, or all receivers are dropped.
-pub fn spawn_event_listener(
-    mut connection: SliverConnection,
-    tx: broadcast::Sender<SliverEvent>,
-) {
+pub fn spawn_event_listener(mut connection: SliverConnection, tx: broadcast::Sender<SliverEvent>) {
     tokio::spawn(async move {
-        let mut stream: Streaming<clientpb::Event> =
-            match connection
-                .client
-                .events(tonic::Request::new(commonpb::Empty {}))
-                .await
-            {
-                Ok(response) => response.into_inner(),
-                Err(e) => {
-                    tracing::error!("Failed to open event stream: {e}");
-                    return;
-                }
-            };
+        let mut stream: Streaming<clientpb::Event> = match connection
+            .client
+            .events(tonic::Request::new(commonpb::Empty {}))
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(e) => {
+                tracing::error!("Failed to open event stream: {e}");
+                return;
+            }
+        };
 
         loop {
             match stream.message().await {
@@ -79,15 +75,27 @@ fn convert_event(event: clientpb::Event) -> SliverEvent {
 
     match event_type {
         "session-opened" => {
-            let id = event.session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+            let id = event
+                .session
+                .as_ref()
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
             SliverEvent::SessionOpened(id)
         }
         "session-closed" => {
-            let id = event.session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+            let id = event
+                .session
+                .as_ref()
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
             SliverEvent::SessionClosed(id)
         }
         "session-updated" => {
-            let id = event.session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+            let id = event
+                .session
+                .as_ref()
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
             SliverEvent::SessionUpdated(id)
         }
         "beacon-registered" => {

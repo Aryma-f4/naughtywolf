@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
-use std::fs;
 use serde::Deserialize;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SliverCfg {
@@ -55,7 +55,7 @@ pub fn scan_config_dir(dir: &Path) -> Result<Vec<ParsedProfile>, ProfileError> {
         let entry = entry.map_err(|e| ProfileError::Io(dir.to_path_buf(), e))?;
         let path = entry.path();
 
-        if path.extension().map_or(false, |ext| ext == "cfg") {
+        if path.extension().is_some_and(|ext| ext == "cfg") {
             match SliverCfg::from_file(&path) {
                 Ok(cfg) => {
                     profiles.push(ParsedProfile {

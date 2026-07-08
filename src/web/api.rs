@@ -1,17 +1,10 @@
-use axum::{
-    extract::State,
-    response::Json,
-    Router,
-};
+use axum::{Router, extract::State, response::Json};
 use chrono::DateTime;
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::actions::{beacons, listeners, sessions};
-use crate::auth::{
-    middleware::AuthenticatedUserGuard,
-    rbac::Role,
-};
+use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
 
@@ -97,20 +90,21 @@ async fn list_users(
     if user.0.role != Role::Admin {
         return Err((axum::http::StatusCode::FORBIDDEN, "Admin only".to_string()));
     }
-    let users = sqlx::query_as::<_, db::models::User>(
-        "SELECT * FROM users ORDER BY created_at"
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let users = sqlx::query_as::<_, db::models::User>("SELECT * FROM users ORDER BY created_at")
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let response: Vec<UserResponse> = users.into_iter().map(|u| UserResponse {
-        id: u.id,
-        username: u.username,
-        role: u.role,
-        disabled: u.disabled,
-        created_at: u.created_at.to_rfc3339(),
-    }).collect();
+    let response: Vec<UserResponse> = users
+        .into_iter()
+        .map(|u| UserResponse {
+            id: u.id,
+            username: u.username,
+            role: u.role,
+            disabled: u.disabled,
+            created_at: u.created_at.to_rfc3339(),
+        })
+        .collect();
 
     Ok(Json(response))
 }
@@ -178,7 +172,11 @@ async fn list_sessions(
             username: s.username,
             transport: s.transport,
             last_checkin: ts_to_string(s.last_checkin),
-            status: if s.is_dead { "Dead".to_string() } else { "Active".to_string() },
+            status: if s.is_dead {
+                "Dead".to_string()
+            } else {
+                "Active".to_string()
+            },
         })
         .collect();
 
@@ -214,7 +212,11 @@ async fn list_beacons(
             next_checkin: ts_to_string(b.next_checkin),
             interval: format!("{}s", b.interval),
             jitter: format!("{}s", b.jitter),
-            status: if b.is_dead { "Dead".to_string() } else { "Active".to_string() },
+            status: if b.is_dead {
+                "Dead".to_string()
+            } else {
+                "Active".to_string()
+            },
         })
         .collect();
 

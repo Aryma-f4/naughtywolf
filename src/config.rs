@@ -14,8 +14,7 @@ impl Config {
         Ok(Config {
             database_url: env::var("DATABASE_URL")
                 .map_err(|_| ConfigError::Missing("DATABASE_URL"))?,
-            bind: env::var("NAUGHTYWOLF_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
+            bind: env::var("NAUGHTYWOLF_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
             session_secret: env::var("NAUGHTYWOLF_SESSION_SECRET")
                 .map_err(|_| ConfigError::Missing("NAUGHTYWOLF_SESSION_SECRET"))?,
             sliver_config_dir: env::var("SLIVER_CONFIG_DIR")

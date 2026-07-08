@@ -30,10 +30,7 @@ impl AuthInterceptor {
 }
 
 impl tonic::service::Interceptor for AuthInterceptor {
-    fn call(
-        &mut self,
-        mut req: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         req.metadata_mut()
             .insert("authorization", self.token.clone());
         Ok(req)
@@ -53,20 +50,14 @@ impl SliverConnection {
         // Parse CA certificate
         let ca = Certificate::from_pem(profile.ca_certificate.as_bytes());
 
-        let tls = ClientTlsConfig::new()
-            .ca_certificate(ca)
-            .identity(identity);
+        let tls = ClientTlsConfig::new().ca_certificate(ca).identity(identity);
 
         let addr = format!("{}:{}", profile.lhost, profile.lport);
 
         let channel = Channel::from_shared(format!("https://{}", addr))
-            .map_err(|e| {
-                ConnectionError::Address(format!("Invalid address {}: {}", addr, e))
-            })?
+            .map_err(|e| ConnectionError::Address(format!("Invalid address {}: {}", addr, e)))?
             .tls_config(tls)
-            .map_err(|e| {
-                ConnectionError::Tls(format!("TLS config for {}: {}", addr, e))
-            })?
+            .map_err(|e| ConnectionError::Tls(format!("TLS config for {}: {}", addr, e)))?
             .connect()
             .await
             .map_err(|e| {

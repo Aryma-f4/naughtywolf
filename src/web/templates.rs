@@ -82,17 +82,61 @@ pub fn render_page(ctx: &PageContext, content: &str) -> Html<String> {
 </body>
 </html>"#,
         title = ctx.title,
-        active_dash = if ctx.current_page == "dashboard" { "active" } else { "" },
-        active_sessions = if ctx.current_page == "sessions" { "active" } else { "" },
-        active_beacons = if ctx.current_page == "beacons" { "active" } else { "" },
-        active_listeners = if ctx.current_page == "listeners" { "active" } else { "" },
-        active_payloads = if ctx.current_page == "payloads" { "active" } else { "" },
-        active_websites = if ctx.current_page == "websites" { "active" } else { "" },
-        active_loot = if ctx.current_page == "loot" { "active" } else { "" },
-        active_creds = if ctx.current_page == "creds" { "active" } else { "" },
-        active_events = if ctx.current_page == "events" { "active" } else { "" },
-        active_audit = if ctx.current_page == "audit" { "active" } else { "" },
-        active_admin = if ctx.current_page == "admin" { "active" } else { "" },
+        active_dash = if ctx.current_page == "dashboard" {
+            "active"
+        } else {
+            ""
+        },
+        active_sessions = if ctx.current_page == "sessions" {
+            "active"
+        } else {
+            ""
+        },
+        active_beacons = if ctx.current_page == "beacons" {
+            "active"
+        } else {
+            ""
+        },
+        active_listeners = if ctx.current_page == "listeners" {
+            "active"
+        } else {
+            ""
+        },
+        active_payloads = if ctx.current_page == "payloads" {
+            "active"
+        } else {
+            ""
+        },
+        active_websites = if ctx.current_page == "websites" {
+            "active"
+        } else {
+            ""
+        },
+        active_loot = if ctx.current_page == "loot" {
+            "active"
+        } else {
+            ""
+        },
+        active_creds = if ctx.current_page == "creds" {
+            "active"
+        } else {
+            ""
+        },
+        active_events = if ctx.current_page == "events" {
+            "active"
+        } else {
+            ""
+        },
+        active_audit = if ctx.current_page == "audit" {
+            "active"
+        } else {
+            ""
+        },
+        active_admin = if ctx.current_page == "admin" {
+            "active"
+        } else {
+            ""
+        },
         profile_badge = match &ctx.profile_name {
             Some(name) => format!(r#"<span class="profile-badge">{}</span>"#, name),
             None => String::new(),

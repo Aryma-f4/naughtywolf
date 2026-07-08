@@ -1,7 +1,7 @@
 pub mod models;
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 
 /// Create a connection pool to the PostgreSQL database

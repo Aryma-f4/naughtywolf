@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Role {
@@ -8,16 +9,20 @@ pub enum Role {
     Viewer,
 }
 
-impl Role {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for Role {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "admin" => Some(Role::Admin),
-            "operator" => Some(Role::Operator),
-            "viewer" => Some(Role::Viewer),
-            _ => None,
+            "admin" => Ok(Role::Admin),
+            "operator" => Ok(Role::Operator),
+            "viewer" => Ok(Role::Viewer),
+            _ => Err(()),
         }
     }
+}
 
+impl Role {
     pub fn can_perform(&self, required: &Role) -> bool {
         match (self, required) {
             (Role::Admin, _) => true,
@@ -63,8 +68,8 @@ mod tests {
 
     #[test]
     fn test_role_from_str() {
-        assert_eq!(Role::from_str("admin"), Some(Role::Admin));
-        assert_eq!(Role::from_str("VIEWER"), Some(Role::Viewer));
-        assert_eq!(Role::from_str("unknown"), None);
+        assert_eq!("admin".parse(), Ok(Role::Admin));
+        assert_eq!("VIEWER".parse(), Ok(Role::Viewer));
+        assert_eq!("unknown".parse::<Role>(), Err(()));
     }
 }

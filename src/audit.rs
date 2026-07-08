@@ -41,7 +41,7 @@ pub async fn query_events(
     offset: i64,
 ) -> Result<Vec<AuditEvent>, sqlx::Error> {
     sqlx::query_as::<_, AuditEvent>(
-        "SELECT * FROM audit_events ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+        "SELECT * FROM audit_events ORDER BY created_at DESC LIMIT $1 OFFSET $2",
     )
     .bind(limit)
     .bind(offset)
