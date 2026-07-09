@@ -106,11 +106,16 @@ pub async fn generate_implant(
     let bin_cmd = parts[0];
     let bin_args: Vec<&str> = parts[1..].iter().map(|s| *s).collect();
 
+    // Write commands to a temp RC file (more reliable than /dev/stdin piping)
+    let rc_path = format!("/tmp/nw_gen_{}.rc", std::process::id());
+    if let Err(e) = std::fs::write(&rc_path, &cmd) {
+        tracing::error!("Failed to write RC file {rc_path}: {e}");
+    }
+
     let mut command = tokio::process::Command::new(bin_cmd);
     command
         .args(&bin_args)
-        .args(["--rc", "/dev/stdin"])
-        .stdin(std::process::Stdio::piped())
+        .args(["--rc", &rc_path])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
@@ -121,14 +126,13 @@ pub async fn generate_implant(
         Err(e) => {
             let msg = format!("Failed to spawn {bin_cmd}: {e}. Set SLIVER_SERVER_PATH or install sliver-server");
             tracing::error!("{msg}");
+            std::fs::remove_file(&rc_path).ok();
             return GenerateResponse { success: false, message: msg, implant_name: None };
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        stdin.write_all(cmd.as_bytes()).await.ok();
-    }
+    // Clean up RC file after spawning
+    std::fs::remove_file(&rc_path).ok();
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(180),
