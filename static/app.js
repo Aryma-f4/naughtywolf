@@ -546,7 +546,8 @@
       document.getElementById('gen-form')?.addEventListener('submit', async (e) => {
         e.preventDefault();
         const msg = document.getElementById('gen-msg');
-        msg.textContent = 'Generating...'; msg.style.color = 'var(--cyan)';
+        const btn = e.target.querySelector('button[type="submit"]');
+        msg.textContent = 'Starting...'; msg.style.color = 'var(--cyan)'; btn.disabled = true;
         try {
           const r = await apiPost('/api/payloads/generate', {
             name: document.getElementById('gen-name').value,
@@ -559,13 +560,30 @@
             lport: parseInt(document.getElementById('gen-lport').value),
           });
           if (r.success) {
-            msg.innerHTML = 'Done! <a href="'+escapeHtml(r.output_path||'')+'" class="btn btn-sm btn-primary" style="margin-left:8px;text-decoration:none;" target="_blank">📥 Download</a>';
+            msg.innerHTML = '⚙️ Generating in background (2-3 min)... <span id="poll-status" style="color:var(--cyan)">⏳</span>';
             msg.style.color = 'var(--green)';
             showToast(r.message, 'success');
-            window.router.navigate('#/payloads');
+            // Poll every 10s for 3min to detect new payload file
+            var pollCount = 0;
+            var pollTimer = setInterval(async function() {
+              pollCount++;
+              document.getElementById('poll-status').textContent = '⏳ ' + (pollCount*10) + 's';
+              try {
+                var builds = await apiGet('/api/payloads');
+                var name = document.getElementById('gen-name').value;
+                var found = (builds||[]).find(function(b) { return b.name.indexOf(name) >= 0; });
+                if (found) {
+                  document.getElementById('poll-status').textContent = '✅ Ready!';
+                  clearInterval(pollTimer);
+                  window.router.navigate('#/payloads');
+                }
+              } catch(e) {}
+              if (pollCount > 18) { clearInterval(pollTimer); document.getElementById('poll-status').textContent = '❌ Timeout'; }
+            }, 10000);
+          } else {
+            msg.textContent = r.message; msg.style.color = 'var(--red)'; btn.disabled = false;
           }
-          else { msg.textContent = r.message; msg.style.color = 'var(--red)'; }
-        } catch(e) { msg.textContent = e.message; msg.style.color = 'var(--red)'; }
+        } catch(e) { msg.textContent = e.message; msg.style.color = 'var(--red)'; btn.disabled = false; }
       });
     })();
     return () => { cancelled = true; };

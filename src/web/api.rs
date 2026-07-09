@@ -369,18 +369,26 @@ async fn generate_payload_handler(
     _user: AuthenticatedUserGuard,
     axum::Json(req): axum::Json<payloads::GeneratePayloadRequest>,
 ) -> Json<payloads::GenerateResponse> {
-    let mut guard = state.sliver.lock().await;
-    if let Some(conn) = guard.as_mut() {
-        let result = payloads::generate_implant(conn, req).await;
-        Json(result)
-    } else {
-        Json(payloads::GenerateResponse {
-            success: false,
-            message: "Sliver not connected".to_string(),
-            implant_name: None,
-            output_path: None,
-        })
-    }
+    let name = req.name.clone();
+    // Spawn generation in background to prevent HTTP timeout / VPS hang
+    let sliver = state.sliver.clone();
+    tokio::spawn(async move {
+        let mut guard = sliver.lock().await;
+        if let Some(conn) = guard.as_mut() {
+            let _result = payloads::generate_implant(conn, req).await;
+            tracing::info!("Background generation complete: {:?}", _result.implant_name);
+        } else {
+            tracing::warn!("Background generation skipped: Sliver not connected");
+        }
+    });
+
+    // Return immediately — the generation runs in the background
+    Json(payloads::GenerateResponse {
+        success: true,
+        message: format!("Generation started for '{}' — check payloads page in a few minutes", name),
+        implant_name: Some(name),
+        output_path: None,
+    })
 }
 
 async fn download_payload_handler(
