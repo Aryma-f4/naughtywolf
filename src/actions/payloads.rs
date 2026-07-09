@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::sliver::connection::SliverConnection;
-use crate::sliver::proto::{clientpb, commonpb};
+use crate::sliver::proto::commonpb;
 
 /// A simplified implant build representation for API responses.
 #[derive(Debug, Clone, Serialize)]
@@ -80,105 +79,101 @@ pub struct GenerateResponse {
     pub output_path: Option<String>,
 }
 
-/// Generate an implant via the Sliver daemon's gRPC `Generate` RPC.
-/// Falls back to generating with inline ImplantConfig if no profile exists.
-/// On success, saves the binary to `./payloads` for download.
+/// Generate an implant via sliver-server CLI with `--rc`.
+/// The process spawns sliver-server non-interactively and runs `generate`.
 pub async fn generate_implant(
-    conn: &mut SliverConnection,
+    _conn: &mut SliverConnection,
     req: GeneratePayloadRequest,
 ) -> GenerateResponse {
-    let format = match req.format.as_str() {
-        "shared" => clientpb::OutputFormat::SharedLib,
-        "shellcode" => clientpb::OutputFormat::Shellcode,
-        "service" => clientpb::OutputFormat::Service,
-        _ => clientpb::OutputFormat::Executable,
+    let proto = match req.protocol.as_str() {
+        "mtls" => format!("--mtls {}:{}", req.lhost, req.lport),
+        "http" => format!("--http {}:{}", req.lhost, req.lport),
+        "https" => format!("--https {}:{}", req.lhost, req.lport),
+        "dns" => format!("--dns {}:{}", req.lhost, req.lport),
+        _ => format!("--mtls {}:{}", req.lhost, req.lport),
     };
-    let c2_url = format!("{}://{}:{}", req.protocol, req.lhost, req.lport);
+    let beacon = if req.is_beacon { " --beacon" } else { "" };
 
-    let implant_name = req.name.clone();
-    let profile_name = format!("nw_{}", Uuid::new_v4().to_string().split('-').next().unwrap_or("x"));
+    let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
+    let save_str = save_dir.to_string_lossy().to_string();
+    std::fs::create_dir_all(&save_dir).ok();
 
-    // Step 1: Save an implant profile
-    let profile_config = clientpb::ImplantConfig {
-        id: format!("nw-cfg-{}", Uuid::new_v4()),
-        goos: req.goos.clone(),
-        goarch: req.goarch.clone(),
-        format: format.into(),
-        is_beacon: req.is_beacon,
-        debug: false,
-        obfuscate_symbols: true,
-        sgn_enabled: true,
-        include_http: req.protocol.starts_with("http"),
-        include_mtls: req.protocol == "mtls",
-        include_dns: req.protocol == "dns",
-        c2: vec![clientpb::ImplantC2 {
-            url: c2_url,
-            priority: 1,
-            ..Default::default()
-        }],
-        reconnect_interval: 60,
-        max_connection_errors: 100,
-        ..Default::default()
-    };
+    let rc_cmd = format!(
+        "generate --name {} --os {} --arch {} --format {} {} {} --save {}\nexit",
+        req.name, req.goos, req.goarch, req.format, proto, beacon, save_str
+    );
 
-    // Save profile, then GenerateStage
-    let profile_save = conn.client.save_implant_profile(tonic::Request::new(
-        clientpb::ImplantProfile {
-            name: profile_name.clone(),
-            config: Some(profile_config),
-            ..Default::default()
-        }
-    )).await;
+    let bin_raw = std::env::var("SLIVER_SERVER_PATH").unwrap_or_else(|_| "sliver-server".to_string());
+    let parts: Vec<&str> = bin_raw.split_whitespace().collect();
+    let (bin_cmd, bin_args) = parts.split_first().unwrap_or((&"sliver-server", &[]));
 
-    match profile_save {
-        Ok(_) => tracing::info!("Profile '{}' saved", profile_name),
-        Err(e) => tracing::warn!("Save profile failed (non-fatal): {}", e),
-    }
+    let rc_path = format!("/tmp/nw_rc_{}.txt", std::process::id());
+    let _ = std::fs::write(&rc_path, &rc_cmd);
 
-    // Step 2: GenerateStage uses the profile
-    let gen_result = conn.client.generate_stage(tonic::Request::new(
-        clientpb::GenerateStageReq {
-            profile: profile_name,
-            name: format!("implant-{}", implant_name),
-            prepend_size: false,
-            ..Default::default()
-        }
-    )).await;
-
-    match gen_result {
-        Ok(response) => {
-            let out = response.into_inner();
-            tracing::info!("Payload generated: {} (build_id: {})", out.implant_name, out.implant_build_id);
-
-            // Save binary to ./payloads for download
-            let mut dl_path = None;
-            if let Some(file) = out.file {
-                let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
-                let _ = std::fs::create_dir_all(&save_dir);
-                let fpath = save_dir.join(&out.implant_name);
-                if std::fs::write(&fpath, &file.data).is_ok() {
-                    dl_path = Some(format!("/api/payloads/download/{}", out.implant_name));
-                    tracing::info!("Binary saved: {:?} ({} bytes)", fpath, file.data.len());
-                }
-            }
-
-            GenerateResponse {
-                success: true,
-                message: format!("Payload '{}' generated", out.implant_name),
-                implant_name: Some(out.implant_name),
-                output_path: dl_path,
+    let output = match tokio::process::Command::new(bin_cmd)
+        .args(bin_args)
+        .args(["--rc", &rc_path])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => {
+            let _ = std::fs::remove_file(&rc_path);
+            match tokio::time::timeout(std::time::Duration::from_secs(300), c.wait_with_output()).await {
+                Ok(r) => r.map_err(|e| e.to_string()),
+                Err(_) => return GenerateResponse {
+                    success: false,
+                    message: "Generation timed out after 300s (first compile may take long)".into(),
+                    implant_name: None, output_path: None,
+                },
             }
         }
         Err(e) => {
-            tracing::error!("Generate failed: {}", e);
-            GenerateResponse {
+            let _ = std::fs::remove_file(&rc_path);
+            return GenerateResponse {
                 success: false,
-                message: format!("Generate failed: {}", e),
-                implant_name: None,
-                output_path: None,
-            }
+                message: format!("Failed to start sliver-server (set SLIVER_SERVER_PATH): {e}"),
+                implant_name: None, output_path: None,
+            };
+        }
+    };
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => return GenerateResponse { success: false, message: e, implant_name: None, output_path: None },
+    };
+
+    if output.status.success() {
+        // Scan the save dir for the binary
+        let dl = scan_save_dir(&save_dir).map(|f| format!("/api/payloads/download/{}", f));
+        GenerateResponse {
+            success: true,
+            message: format!("Payload '{}' generated", req.name),
+            implant_name: Some(req.name),
+            output_path: dl,
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{}{}", &stdout[..100.min(stdout.len())], &stderr[..200.min(stderr.len())]);
+        GenerateResponse {
+            success: false,
+            message: format!("sliver-server failed: {}", combined),
+            implant_name: None, output_path: None,
         }
     }
+}
+
+/// Scan directory for binary file matching our naming convention.
+fn scan_save_dir(dir: &std::path::Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with('.') && e.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Search for the generated binary in the save dir, returning the filename.
