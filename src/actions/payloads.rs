@@ -87,7 +87,7 @@ pub async fn generate_implant(
 ) -> GenerateResponse {
     let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
     std::fs::create_dir_all(&save_dir).ok();
-    let beacon_str = if req.is_beacon { "true" } else { "false" };
+    let beacon_str = if req.is_beacon { "true".to_string() } else { "false".to_string() };
     let port_str = req.lport.to_string();
 
     // Build the gen-payload.sh command
