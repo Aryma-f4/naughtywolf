@@ -144,4 +144,67 @@
       }
     } catch { /* server down, leave badge as-is */ }
   };
+  // ── Dashboard ────────────────────────────────────────────
+  window.router.register('/dashboard', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const stats = await apiGet('/api/dashboard/stats')
+          .catch(() => ({ active_listeners: 0, sessions: 0, beacons: 0, jobs: 0 }));
+
+        if (cancelled) return;
+
+        // Metric cards
+        const metrics = `
+          <div class="metric-grid">
+            <div class="metric-card">
+              <div class="metric-label">Listeners</div>
+              <div class="metric-value">${stats.active_listeners || 0}</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Sessions</div>
+              <div class="metric-value">${stats.sessions || 0}</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Beacons</div>
+              <div class="metric-value">${stats.beacons || 0}</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Jobs</div>
+              <div class="metric-value">${stats.jobs || 0}</div>
+            </div>
+          </div>`;
+
+        // Graph preview panel
+        const graphPreview = `
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Infrastructure Graph</h3>
+              <a href="#" onclick="window.router.navigate('#/graph');return false" class="btn btn-ghost btn-sm">View Graph</a>
+            </div>
+            <div class="panel-body" style="text-align:center;padding:24px;color:var(--text-dim);font-size:0.8rem;">
+              View live chain graph showing listeners, sessions, and beacons.
+            </div>
+          </div>`;
+
+        // Event panel uses SSE in the dedicated Events page. Dashboard shows stable empty state.
+        const eventPanel = `
+          <div class="panel">
+            <div class="panel-header"><h3>Event Feed</h3></div>
+            <div class="terminal-panel" style="max-height:250px">
+              <div class="terminal-line" style="color:var(--text-dim)">Open Events for live SSE stream.</div>
+            </div>
+          </div>`;
+
+        main.innerHTML = metrics + graphPreview + eventPanel;
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  });
+
 })();
