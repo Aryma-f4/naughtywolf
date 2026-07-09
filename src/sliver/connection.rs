@@ -65,17 +65,12 @@ impl SliverConnection {
             .map_err(|e| {
                 let err_msg = format!("Failed to connect to {}: {}", addr, e);
                 tracing::error!("{}", err_msg);
-                // Log full error chain
-                let mut source = e.source();
-                while let Some(s) = source {
-                    tracing::error!("  cause: {}", s);
-                    source = s.source();
-                }
                 ConnectionError::Connect(err_msg)
             })?;
 
         let interceptor = AuthInterceptor::new(&profile.token);
-        let client = SliverRpcClient::with_interceptor(channel, interceptor);
+        let client = SliverRpcClient::with_interceptor(channel, interceptor)
+            .max_decoding_message_size(100 * 1024 * 1024);
 
         Ok(Self {
             client,
