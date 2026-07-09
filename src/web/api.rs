@@ -349,12 +349,11 @@ async fn list_payloads(
     let mut builds = Vec::new();
 
     // Try gRPC if connected
-    if let Ok(mut guard) = state.sliver.try_lock() {
-        if let Some(conn) = guard.as_mut() {
-            if let Ok(server_builds) = payloads::list_builds(conn).await {
-                builds.extend(server_builds);
-            }
-        }
+    if let Ok(mut guard) = state.sliver.try_lock()
+        && let Some(conn) = guard.as_mut()
+        && let Ok(server_builds) = payloads::list_builds(conn).await
+    {
+        builds.extend(server_builds);
     }
 
     // Scan local payloads directory for CLI-generated files
