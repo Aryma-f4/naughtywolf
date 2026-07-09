@@ -296,7 +296,7 @@
 
   // ── Chain Graph ──────────────────────────────────────────
   
-  window.router.register('/graph', function(main) {
+    window.router.register('/graph', function(main) {
     main.innerHTML = window.renderLoading();
     let cancelled = false;
     const renderGraph = async () => {
@@ -309,44 +309,56 @@
         ]);
         if (cancelled) return;
 
-        const W = 900, H = 500;
-        const COL1 = 150, COL2 = 350, COL3 = 600;
+        var W = 900, H = 500;
+        var COL1 = 150, COL2 = 350, COL3 = 600;
 
-        const nodes = [{ id:'root', label:status.connected ? (status.profile_name||'Sliver Server') : 'Sliver (disconnected)', x:COL1, y:250, color:status.connected?'#38bdf8':'#7895b8', type:'server' }];
-        const la = Array.isArray(listeners) ? listeners : [];
-        la.forEach((l,i) => nodes.push({ id:'l-'+l.id, label:l.protocol+':'+l.port, sub:l.bind, x:COL2, y:100+i*80, color:'#34d399', type:'listener' }));
-        if (!la.length) nodes.push({ id:'nl', label:'No listeners', x:COL2, y:250, color:'#7895b8', type:'empty' });
+        var nodes = [{ id:'root', label:status.connected?(status.profile_name||'Sliver Server'):'Sliver (disconnected)', x:COL1, y:250, color:status.connected?'#38bdf8':'#7895b8', type:'server', os:'' }];
+        var la = Array.isArray(listeners)?listeners:[];
+        la.forEach(function(l,i){ nodes.push({ id:'l-'+l.id, label:l.protocol+':'+l.port, sub:l.bind, x:COL2, y:100+i*80, color:'#34d399', type:'listener', os:'' }); });
+        if(!la.length) nodes.push({ id:'nl', label:'No listeners', x:COL2, y:250, color:'#7895b8', type:'empty', os:'' });
 
-        const imps = [];
-        (Array.isArray(sessions)?sessions:[]).forEach(s => imps.push({id:'im-'+imps.length, label:s.hostname||s.name, sub:'session | '+(s.transport||'?'), x:COL3, y:60+imps.length*60, color:s.status==='Active'?'#34d399':'#fb7185', type:'session' }));
-        (Array.isArray(beacons)?beacons:[]).forEach(b => imps.push({id:'im-'+imps.length, label:b.hostname||b.name, sub:'beacon | '+(b.transport||'?'), x:COL3, y:60+imps.length*60, color:b.status==='Active'?'#34d399':'#fb7185', type:'beacon' }));
-        if (!imps.length) nodes.push({ id:'ni', label:'No implants', x:COL3, y:250, color:'#7895b8', type:'empty' });
+        var imps = [];
+        (Array.isArray(sessions)?sessions:[]).forEach(function(s){ imps.push({id:s.id?'s-'+s.id:'s-'+imps.length, label:s.hostname||s.name, sub:'session | '+(s.transport||'?'), x:COL3, y:60+imps.length*60, color:s.status==='Active'?'#34d399':'#fb7185', type:'session', os:s.goos||'linux' }); });
+        (Array.isArray(beacons)?beacons:[]).forEach(function(b){ imps.push({id:b.id?'b-'+b.id:'b-'+imps.length, label:b.hostname||b.name, sub:'beacon | '+(b.transport||'?'), x:COL3, y:60+imps.length*60, color:b.status==='Active'?'#34d399':'#fb7185', type:'beacon', os:b.goos||'linux' }); });
+        if(!imps.length) nodes.push({ id:'ni', label:'No implants', x:COL3, y:250, color:'#7895b8', type:'empty', os:'' });
 
         var nm = {}; nodes.forEach(function(n){nm[n.id]=n;});
 
-        var svg = '<div class="graph-toolbar"><button class="btn btn-ghost btn-sm" id="g-refresh">\u21bb Refresh</button><span style="font-size:0.75rem;color:var(--text-dim)">' + imps.length + ' implant(s), ' + la.length + ' listener(s)</span></div>';
+        var edges = [];
+        la.forEach(function(l){ edges.push({ from:'root', to:'l-'+l.id }); });
+        la.forEach(function(l){
+          imps.forEach(function(im){
+            if((im.sub||'').toLowerCase().indexOf(l.protocol)>=0) edges.push({ from:'l-'+l.id, to:im.id });
+          });
+        });
+        imps.forEach(function(im){
+          if(!edges.some(function(e){return e.to===im.id;})) edges.push({ from:'root', to:im.id });
+        });
+
+        function osI(n){
+          if(!n||!n.os)return''; var o=n.os.toLowerCase();
+          if(o.indexOf('win')>=0)return 'W'; if(o.indexOf('darwin')>=0||o.indexOf('mac')>=0)return 'A'; if(o.indexOf('linux')>=0)return 'L'; return'?';
+        }
+
+        var svg = '<div class="graph-toolbar"><button class="btn btn-ghost btn-sm" id="g-refresh">↻ Refresh</button><span style="font-size:0.75rem;color:var(--text-dim)">'+imps.length+' implant(s), '+la.length+' listener(s)</span></div>';
         svg += '<div class="graph-container"><svg viewBox="0 0 900 500" xmlns="http://www.w3.org/2000/svg">';
         svg += '<defs><pattern id="g" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(56,189,248,0.04)" stroke-width="1"/></pattern></defs>';
         svg += '<rect width="900" height="500" fill="url(#g)"/>';
 
-        // Edges
-        la.forEach(function(l) {
-          var from = nm['root'], to = nm['l-'+l.id];
-          if (from && to) { svg += '<line x1="'+from.x+'" y1="'+from.y+'" x2="'+to.x+'" y2="'+to.y+'" class="graph-edge active" />'; }
-        });
-        imps.forEach(function(im) {
-          var from = nm['root'], to = nm[im.id];
-          if (from && to) { svg += '<line x1="'+from.x+'" y1="'+from.y+'" x2="'+to.x+'" y2="'+to.y+'" class="graph-edge active" />'; }
+        edges.forEach(function(e){
+          var f=nm[e.from],t=nm[e.to];
+          if(f&&t) svg += '<line x1="'+f.x+'" y1="'+f.y+'" x2="'+t.x+'" y2="'+t.y+'" class="graph-edge active" data-from="'+e.from+'" data-to="'+e.to+'" />';
         });
 
-        // Nodes
-        nodes.forEach(function(n) {
-          var r = n.type === 'server' ? 32 : 24;
-          svg += '<g class="graph-node" data-id="'+n.id+'">';
+        nodes.forEach(function(n){
+          var r=n.type==='server'?32:24;
+          var icon=osI(n);
+          svg += '<g class="graph-node" data-id="'+n.id+'" data-type="'+n.type+'" data-os="'+n.os+'">';
           svg += '<circle cx="'+n.x+'" cy="'+n.y+'" r="'+r+'" fill="none" stroke="'+n.color+'" stroke-width="2" stroke-opacity="0.8" style="filter:drop-shadow(0 0 6px '+n.color+'40)" />';
           svg += '<circle cx="'+n.x+'" cy="'+n.y+'" r="'+(r-4)+'" fill="'+n.color+'15" stroke="none" />';
+          if(icon) svg += '<text x="'+n.x+'" y="'+(n.y+6)+'" text-anchor="middle" font-size="'+(r>28?16:12)+'" fill="'+n.color+'" font-weight="bold">'+icon+'</text>';
           svg += '<text x="'+n.x+'" y="'+(n.y+r+14)+'" text-anchor="middle" class="graph-node-label" fill="'+n.color+'">'+escapeHtml(n.label)+'</text>';
-          if (n.sub) svg += '<text x="'+n.x+'" y="'+(n.y+r+28)+'" text-anchor="middle" font-size="8" fill="var(--text-dim)" font-family="var(--font-mono)">'+escapeHtml(n.sub)+'</text>';
+          if(n.sub) svg += '<text x="'+n.x+'" y="'+(n.y+r+28)+'" text-anchor="middle" font-size="8" fill="var(--text-dim)" font-family="var(--font-mono)">'+escapeHtml(n.sub)+'</text>';
           svg += '</g>';
         });
 
@@ -354,76 +366,56 @@
         main.innerHTML = svg;
 
         var container = main.querySelector('.graph-container');
-        var svgEl = container?.querySelector('svg');
 
-        // Hover via event delegation
-        container?.addEventListener('mouseover', function(ev) {
+        container?.addEventListener('mouseover', function(ev){
           var g = ev.target.closest('.graph-node');
-          if (!g) { document.getElementById('gd').style.display = 'none'; return; }
+          if(!g){ document.getElementById('gd').style.display='none'; return; }
           var n = nm[g.dataset.id];
-          if (!n) return;
-          var d = document.getElementById('gd');
-          d.innerHTML = '<h4>'+escapeHtml(n.label)+'</h4><div class="detail-row"><span>Type</span><span>'+escapeHtml(n.type)+'</span></div><div class="detail-row"><span>ID</span><span>'+escapeHtml(n.id)+'</span></div>' + (n.sub ? '<div class="detail-row"><span>Info</span><span>'+escapeHtml(n.sub)+'</span></div>' : '');
-          d.style.display = 'block';
+          if(!n) return;
+          document.getElementById('gd').innerHTML = '<h4>'+escapeHtml(n.label)+'</h4><div class="detail-row"><span>Type</span><span>'+escapeHtml(n.type)+'</span></div><div class="detail-row"><span>ID</span><span>'+escapeHtml(n.id)+'</span></div>'+(n.sub?'<div class="detail-row"><span>Info</span><span>'+escapeHtml(n.sub)+'</span></div>':'')+(n.os?'<div class="detail-row"><span>OS</span><span>'+escapeHtml(n.os)+'</span></div>':'');
+          document.getElementById('gd').style.display='block';
         });
-        container?.addEventListener('mouseout', function(ev) {
-          if (ev.target.closest('.graph-node')) return;
-          document.getElementById('gd').style.display = 'none';
+        container?.addEventListener('mouseout', function(ev){
+          if(ev.target.closest('.graph-node')) return;
+          document.getElementById('gd').style.display='none';
         });
 
-        // Drag & Drop for nodes
-        var dragNode = null, dragOffX = 0, dragOffY = 0;
-        container?.addEventListener('mousedown', function(ev) {
-          var g = ev.target.closest('.graph-node');
-          if (!g || g.dataset.id === 'root') return;
-          dragNode = g;
-          var cx = parseFloat(g.querySelector('circle').getAttribute('cx'));
-          var cy = parseFloat(g.querySelector('circle').getAttribute('cy'));
-          dragOffX = ev.offsetX - cx;
-          dragOffY = ev.offsetY - cy;
+        // Drag using data-from/data-to on edges (no position matching)
+        var dragId=null, dragOffX=0, dragOffY=0, dragEl=null;
+        container?.addEventListener('mousedown', function(ev){
+          var g=ev.target.closest('.graph-node');
+          if(!g||g.dataset.id==='root') return;
+          dragId=g.dataset.id; dragEl=g;
+          var cx=parseFloat(g.querySelector('circle').getAttribute('cx'));
+          var cy=parseFloat(g.querySelector('circle').getAttribute('cy'));
+          var rect=container.getBoundingClientRect();
+          dragOffX=ev.clientX-rect.left-cx; dragOffY=ev.clientY-rect.top-cy;
         });
-        container?.addEventListener('mousemove', function(ev) {
-          if (!dragNode) return;
-          var nx = ev.offsetX - dragOffX, ny = ev.offsetY - dragOffY;
-          nx = Math.max(30, Math.min(870, nx));
-          ny = Math.max(30, Math.min(470, ny));
-          var id = dragNode.dataset.id;
-          var n = nm[id];
-          if (n) { n.x = nx; n.y = ny; }
-          // Update circles
-          dragNode.querySelectorAll('circle').forEach(function(c) { c.setAttribute('cx', nx); c.setAttribute('cy', ny); });
-          // Update labels
-          dragNode.querySelectorAll('text').forEach(function(t) {
-            var y = parseFloat(t.getAttribute('y'));
-            var origY = y;
-            dragNode.querySelectorAll('text').forEach(function(t2) {
-              var oy = parseFloat(t2.getAttribute('y'));
-              var base = parseFloat(t2.getAttribute('data-base-y') || t2.getAttribute('y'));
-              if (!t2.getAttribute('data-base-y')) t2.setAttribute('data-base-y', base);
-            });
-            var base = parseFloat(t.getAttribute('data-base-y') || t.getAttribute('y'));
-            var dy = origY - (n ? (n.type === 'server' ? 250 : (100 + parseInt(id.replace(/[^\d]/g,'')||0)*80)) : origY);
-            t.setAttribute('y', ny + dy);
+        container?.addEventListener('mousemove', function(ev){
+          if(!dragId||!dragEl) return;
+          var rect=container.getBoundingClientRect();
+          var nx=ev.clientX-rect.left-dragOffX, ny=ev.clientY-rect.top-dragOffY;
+          nx=Math.max(30,Math.min(870,nx)); ny=Math.max(30,Math.min(470,ny));
+          var n=nm[dragId]; if(n){n.x=nx;n.y=ny;}
+          // Update circles and text in this node
+          dragEl.querySelectorAll('circle').forEach(function(el){el.setAttribute('cx',nx);el.setAttribute('cy',ny);});
+          // Update text labels
+          dragEl.querySelectorAll('text').forEach(function(t){
+            var base=parseFloat(t.getAttribute('data-base-y')||t.getAttribute('y'));
+            if(!t.getAttribute('data-base-y'))t.setAttribute('data-base-y',base);
+            t.setAttribute('y',ny+(base-(n?n.y:0)));
           });
-          // Update connected edges
-          container.querySelectorAll('line').forEach(function(line) {
-            var x1 = parseFloat(line.getAttribute('x1'));
-            var y1 = parseFloat(line.getAttribute('y1'));
-            var x2 = parseFloat(line.getAttribute('x2'));
-            var y2 = parseFloat(line.getAttribute('y2'));
-            var startNode = null, endNode = null;
-            for (var k in nm) {
-              if (nm[k].x === x1 && nm[k].y === y1) startNode = nm[k];
-              if (nm[k].x === x2 && nm[k].y === y2) endNode = nm[k];
-            }
-            if (startNode && startNode.id === id) { line.setAttribute('x1', nx); line.setAttribute('y1', ny); }
-            if (endNode && endNode.id === id) { line.setAttribute('x2', nx); line.setAttribute('y2', ny); }
+          // Update edges by data-from/data-to
+          container.querySelectorAll('line[data-from="'+dragId+'"],line[data-to="'+dragId+'"]').forEach(function(line){
+            var f=nm[line.getAttribute('data-from')], t=nm[line.getAttribute('data-to')];
+            if(f){line.setAttribute('x1',f.x);line.setAttribute('y1',f.y);}
+            if(t){line.setAttribute('x2',t.x);line.setAttribute('y2',t.y);}
           });
         });
-        container?.addEventListener('mouseup', function() { dragNode = null; });
-        container?.addEventListener('mouseleave', function() { dragNode = null; });
+        container?.addEventListener('mouseup', function(){dragId=null;dragEl=null;});
+        container?.addEventListener('mouseleave', function(){dragId=null;dragEl=null;});
 
-        document.getElementById('g-refresh')?.addEventListener('click', function() { window.router.navigate('#/graph'); });
+        document.getElementById('g-refresh')?.addEventListener('click', function(){window.router.navigate('#/graph');});
       } catch (err) {
         if (!cancelled) main.innerHTML = window.renderError(err.message);
       }
@@ -431,9 +423,7 @@
     renderGraph();
     return function() { cancelled = true; };
   });
-
-  // ── Sessions ──────────────────────────────────────────────
-  window.router.register('/sessions', function(main) {
+window.router.register('/sessions', function(main) {
     main.innerHTML = window.renderLoading();
     let cancelled = false;
     (async () => {
