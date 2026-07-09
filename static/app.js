@@ -377,6 +377,58 @@
     return () => { cancelled = true; };
   });
 
+  // ── Events ───────────────────────────────────────────────
+  window.router.register('/events', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const events = await apiGet('/api/events');
+        if (cancelled) return;
+        const lines = Array.isArray(events) && events.length > 0
+          ? events.map(e => `<div class="terminal-line">${escapeHtml(JSON.stringify(e))}</div>`).join('')
+          : '<div class="terminal-line" style="color:var(--text-dim)">No events yet</div>';
+        main.innerHTML = `<div class="panel"><div class="panel-header"><h3>Event Stream</h3></div><div class="terminal-panel" style="max-height:600px">${lines}</div></div>`;
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+
+  // ── Admin ────────────────────────────────────────────────
+  window.router.register('/admin', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const users = await apiGet('/api/users');
+        if (cancelled) return;
+        if (!users || users.length === 0) {
+          main.innerHTML = window.renderEmpty('⚙️', 'No Users', 'Create users from the CLI.');
+          return;
+        }
+        const rows = users.map(u => [
+          escapeHtml(u.username),
+          `<span class="badge ${u.role === 'admin' ? 'badge-active' : 'badge-unknown'}">${escapeHtml(u.role)}</span>`,
+          u.disabled ? `<span class="badge badge-dead">Disabled</span>` : `<span class="badge badge-active">Active</span>`,
+          escapeHtml(u.created_at || '—'),
+        ]);
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>User Management</h3></div><div class="panel-body">'
+          + window.renderTable(['Username','Role','Status','Created'], rows)
+          + '</div></div>';
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+
+  // ── Audit ────────────────────────────────────────────────
+  window.router.register('/audit', function(main) {
+    main.innerHTML = window.renderEmpty('📋', 'Audit Log', 'Audit log feature pending implementation.');
+  });
+
   // ── Credentials ──────────────────────────────────────────
   window.router.register('/creds', function(main) {
     main.innerHTML = window.renderLoading();
