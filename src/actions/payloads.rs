@@ -101,19 +101,25 @@ pub async fn generate_implant(
 
     tracing::info!("Running sliver-server generate: {}", &cmd[..cmd.find('\n').unwrap_or(cmd.len())]);
 
-    let bin = std::env::var("SLIVER_SERVER_PATH").unwrap_or_else(|_| "sliver-server".to_string());
+    let bin_raw = std::env::var("SLIVER_SERVER_PATH").unwrap_or_else(|_| "sliver-server".to_string());
+    let parts: Vec<&str> = bin_raw.split_whitespace().collect();
+    let bin_cmd = parts[0];
+    let bin_args: Vec<&str> = parts[1..].iter().map(|s| *s).collect();
 
-    let result = tokio::process::Command::new(&bin)
+    let mut command = tokio::process::Command::new(bin_cmd);
+    command
+        .args(&bin_args)
         .args(["--rc", "/dev/stdin"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+        .stderr(std::process::Stdio::piped());
+
+    let result = command.spawn();
 
     let mut child = match result {
         Ok(c) => c,
         Err(e) => {
-            let msg = format!("Failed to spawn {bin}: {e}. Set SLIVER_SERVER_PATH or install sliver-server");
+            let msg = format!("Failed to spawn {bin_cmd}: {e}. Set SLIVER_SERVER_PATH or install sliver-server");
             tracing::error!("{msg}");
             return GenerateResponse { success: false, message: msg, implant_name: None };
         }
