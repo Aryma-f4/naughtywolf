@@ -83,6 +83,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/listeners", axum::routing::get(list_listeners).post(create_listener))
         .route("/api/listeners/kill/{id}", axum::routing::post(kill_listener))
         .route("/api/payloads", axum::routing::get(list_payloads))
+        .route("/api/payloads/generate", axum::routing::post(generate_payload_handler))
         .route("/api/websites", axum::routing::get(list_websites))
         .route("/api/loot", axum::routing::get(list_loot))
         .route("/api/creds", axum::routing::get(list_creds))
@@ -359,6 +360,24 @@ async fn list_payloads(
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
 
     Ok(Json(builds))
+}
+
+async fn generate_payload_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    axum::Json(req): axum::Json<payloads::GeneratePayloadRequest>,
+) -> Json<payloads::GenerateResponse> {
+    let mut guard = state.sliver.lock().await;
+    if let Some(conn) = guard.as_mut() {
+        let result = payloads::generate_implant(conn, req).await;
+        Json(result)
+    } else {
+        Json(payloads::GenerateResponse {
+            success: false,
+            message: "Sliver not connected".to_string(),
+            implant_name: None,
+        })
+    }
 }
 
 async fn list_websites(

