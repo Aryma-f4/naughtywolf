@@ -141,6 +141,8 @@
   const toastContainer = document.createElement('div');
   toastContainer.style.cssText = 'position:fixed;top:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px;';
   document.addEventListener('DOMContentLoaded', () => document.body.appendChild(toastContainer));
+  // Fallback: append immediately if body already exists
+  if (document.body) document.body.appendChild(toastContainer);
 
   window.showToast = function(msg, type) {
     type = type || 'info';
@@ -545,6 +547,7 @@
       main.addEventListener('click', async (e) => {
         const btn = e.target.closest('[data-kill]');
         if (!btn) return;
+        if (!confirm('Kill listener ' + btn.dataset.kill + '?')) return;
         const id = btn.dataset.kill;
         try {
           await apiPost('/api/listeners/kill/' + id, {});
