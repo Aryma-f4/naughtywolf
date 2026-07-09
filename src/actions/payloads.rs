@@ -101,7 +101,7 @@ pub async fn generate_implant(
     std::fs::create_dir_all(&save_dir).ok();
 
     let rc_cmd = format!(
-        "generate --name {} --os {} --arch {} --format {} {} {} --save {}\nexit",
+        "generate --name {} --os {} --arch {} --format {} {} {} --save {}",
         req.name, req.goos, req.goarch, req.format, proto, beacon, save_str
     );
 
