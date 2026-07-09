@@ -351,21 +351,76 @@
         svg += '</svg></div><div id="gd" class="graph-details" style="display:none;"></div>';
         main.innerHTML = svg;
 
+        var container = main.querySelector('.graph-container');
+        var svgEl = container?.querySelector('svg');
+
         // Hover via event delegation
-        main.querySelector('.graph-container')?.addEventListener('mouseover', function(ev) {
+        container?.addEventListener('mouseover', function(ev) {
           var g = ev.target.closest('.graph-node');
           if (!g) { document.getElementById('gd').style.display = 'none'; return; }
-          var id = g.dataset.id;
-          var n = nm[id];
+          var n = nm[g.dataset.id];
           if (!n) return;
           var d = document.getElementById('gd');
           d.innerHTML = '<h4>'+escapeHtml(n.label)+'</h4><div class="detail-row"><span>Type</span><span>'+escapeHtml(n.type)+'</span></div><div class="detail-row"><span>ID</span><span>'+escapeHtml(n.id)+'</span></div>' + (n.sub ? '<div class="detail-row"><span>Info</span><span>'+escapeHtml(n.sub)+'</span></div>' : '');
           d.style.display = 'block';
         });
-        main.querySelector('.graph-container')?.addEventListener('mouseout', function(ev) {
+        container?.addEventListener('mouseout', function(ev) {
           if (ev.target.closest('.graph-node')) return;
           document.getElementById('gd').style.display = 'none';
         });
+
+        // Drag & Drop for nodes
+        var dragNode = null, dragOffX = 0, dragOffY = 0;
+        container?.addEventListener('mousedown', function(ev) {
+          var g = ev.target.closest('.graph-node');
+          if (!g || g.dataset.id === 'root') return;
+          dragNode = g;
+          var cx = parseFloat(g.querySelector('circle').getAttribute('cx'));
+          var cy = parseFloat(g.querySelector('circle').getAttribute('cy'));
+          dragOffX = ev.offsetX - cx;
+          dragOffY = ev.offsetY - cy;
+        });
+        container?.addEventListener('mousemove', function(ev) {
+          if (!dragNode) return;
+          var nx = ev.offsetX - dragOffX, ny = ev.offsetY - dragOffY;
+          nx = Math.max(30, Math.min(870, nx));
+          ny = Math.max(30, Math.min(470, ny));
+          var id = dragNode.dataset.id;
+          var n = nm[id];
+          if (n) { n.x = nx; n.y = ny; }
+          // Update circles
+          dragNode.querySelectorAll('circle').forEach(function(c) { c.setAttribute('cx', nx); c.setAttribute('cy', ny); });
+          // Update labels
+          dragNode.querySelectorAll('text').forEach(function(t) {
+            var y = parseFloat(t.getAttribute('y'));
+            var origY = y;
+            dragNode.querySelectorAll('text').forEach(function(t2) {
+              var oy = parseFloat(t2.getAttribute('y'));
+              var base = parseFloat(t2.getAttribute('data-base-y') || t2.getAttribute('y'));
+              if (!t2.getAttribute('data-base-y')) t2.setAttribute('data-base-y', base);
+            });
+            var base = parseFloat(t.getAttribute('data-base-y') || t.getAttribute('y'));
+            var dy = origY - (n ? (n.type === 'server' ? 250 : (100 + parseInt(id.replace(/[^\d]/g,'')||0)*80)) : origY);
+            t.setAttribute('y', ny + dy);
+          });
+          // Update connected edges
+          container.querySelectorAll('line').forEach(function(line) {
+            var x1 = parseFloat(line.getAttribute('x1'));
+            var y1 = parseFloat(line.getAttribute('y1'));
+            var x2 = parseFloat(line.getAttribute('x2'));
+            var y2 = parseFloat(line.getAttribute('y2'));
+            var startNode = null, endNode = null;
+            for (var k in nm) {
+              if (nm[k].x === x1 && nm[k].y === y1) startNode = nm[k];
+              if (nm[k].x === x2 && nm[k].y === y2) endNode = nm[k];
+            }
+            if (startNode && startNode.id === id) { line.setAttribute('x1', nx); line.setAttribute('y1', ny); }
+            if (endNode && endNode.id === id) { line.setAttribute('x2', nx); line.setAttribute('y2', ny); }
+          });
+        });
+        container?.addEventListener('mouseup', function() { dragNode = null; });
+        container?.addEventListener('mouseleave', function() { dragNode = null; });
+
         document.getElementById('g-refresh')?.addEventListener('click', function() { window.router.navigate('#/graph'); });
       } catch (err) {
         if (!cancelled) main.innerHTML = window.renderError(err.message);
@@ -560,11 +615,28 @@
             lport: parseInt(document.getElementById('gen-lport').value),
           });
           if (r.success) {
-            msg.textContent = '⏳ Generating (2-3 min). Check back or refresh page.';
+            msg.innerHTML = '<span style="color:var(--cyan)">⚙ Forging payload...</span>';
             msg.style.color = 'var(--cyan)';
-            showToast('Generation started for ' + document.getElementById('gen-name').value, 'success');
-            btn.disabled = false;
-            btn.textContent = 'Generate';
+            showToast('Forging payload: ' + document.getElementById('gen-name').value, 'success');
+            // Auto-refresh payloads list every 8s until file appears or 3min
+            var pName = document.getElementById('gen-name').value;
+            var pCount = 0;
+            var pTimer = setInterval(async function() {
+              pCount++;
+              try {
+                var pBuilds = await apiGet('/api/payloads');
+                var pFound = (pBuilds||[]).find(function(b) { return b.name.indexOf(pName) >= 0; });
+                if (pFound || pCount > 20) {
+                  clearInterval(pTimer);
+                  msg.innerHTML = pFound ? '<span style="color:var(--green)">✅ Payload ready!</span>' : '<span style="color:var(--red)">❌ Timed out</span>';
+                  btn.disabled = false;
+                  btn.textContent = 'Generate';
+                  window.router.navigate('#/payloads');
+                } else {
+                  msg.innerHTML = '<span style="color:var(--cyan)">⚙ Forging payload... ' + (pCount*8) + 's</span>';
+                }
+              } catch(e) {}
+            }, 8000);
           } else {
             msg.textContent = r.message; msg.style.color = 'var(--red)'; btn.disabled = false;
           }
