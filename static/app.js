@@ -747,6 +747,24 @@ window.router.register('/sessions', function(main) {
     main.innerHTML = window.renderEmpty('📋', 'Audit Log', 'Audit log feature pending implementation.');
   });
 
+  // ── Shell ────────────────────────────────────────────────
+  window.router.register('/shell', function(main) {
+    main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Shell</h3></div><div class="panel-body"><form id="shell-form"><div class="field"><label>Command</label><input class="input" id="shell-cmd" placeholder="ls -la" style="font-family:var(--font-mono)"></div><button type="submit" class="btn btn-primary" style="margin-top:8px">Run</button></form><div id="shell-out" style="margin-top:12px;font-family:var(--font-mono);font-size:0.8rem;white-space:pre-wrap;background:var(--bg-app);padding:8px;border-radius:4px;min-height:40px;max-height:400px;overflow-y:auto;"></div></div></div>';
+    document.getElementById('shell-form')?.addEventListener('submit', async function(e) {
+      e.preventDefault();
+      var cmd = document.getElementById('shell-cmd').value;
+      if (!cmd) return;
+      var out = document.getElementById('shell-out');
+      out.textContent = 'Running: ' + cmd + '\n---\n';
+      try {
+        var r = await apiPost('/api/shell/exec', { command: cmd });
+        out.textContent += r.stdout;
+        if (r.stderr) out.textContent += '\nSTDERR:\n' + r.stderr;
+        out.textContent += '\n---\nExit code: ' + r.exit_code;
+      } catch(e) { out.textContent += '\nError: ' + e.message; }
+    });
+  });
+
   // ── Credentials ──────────────────────────────────────────
   window.router.register('/creds', function(main) {
     main.innerHTML = window.renderLoading();

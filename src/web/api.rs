@@ -92,6 +92,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/sliver/connect", axum::routing::post(sliver_connect))
         .route("/api/sliver/disconnect", axum::routing::post(sliver_disconnect))
         .route("/api/sliver/status", axum::routing::get(sliver_status))
+        .route("/api/shell/exec", axum::routing::post(shell_exec_handler))
 }
 
 async fn list_users(
@@ -556,4 +557,50 @@ async fn sliver_status(
 ) -> axum::Json<sliver::SliverStatusResponse> {
     let status = sliver::status(&state.sliver);
     axum::Json(status)
+}
+
+#[derive(Deserialize)]
+struct ShellCommand {
+    command: String,
+}
+
+#[derive(Serialize)]
+struct ShellResponse {
+    success: bool,
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+async fn shell_exec_handler(
+    _user: AuthenticatedUserGuard,
+    axum::Json(req): axum::Json<ShellCommand>,
+) -> axum::Json<ShellResponse> {
+    let output = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(&req.command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let code = output.status.code().unwrap_or(-1);
+            axum::Json(ShellResponse {
+                success: output.status.success(),
+                stdout,
+                stderr,
+                exit_code: code,
+            })
+        }
+        Err(e) => axum::Json(ShellResponse {
+            success: false,
+            stdout: String::new(),
+            stderr: format!("Failed to execute: {e}"),
+            exit_code: -1,
+        }),
+    }
 }
