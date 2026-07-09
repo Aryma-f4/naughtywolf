@@ -41,6 +41,7 @@ pub fn routes() -> Router<AppState> {
         .route("/websites", get(websites_page))
         .route("/loot", get(loot_page))
         .route("/creds", get(creds_page))
+        .route("/app", get(spa_shell))
         .route("/audit", get(audit_page))
         .route("/", get(root_redirect))
 }
@@ -475,4 +476,8 @@ async fn audit_page(user: AuthenticatedUserGuard) -> impl IntoResponse {
 </div>
 "#.to_string();
     templates::render_page(&ctx, &content)
+}
+
+async fn spa_shell(_user: AuthenticatedUserGuard) -> impl IntoResponse {
+    Html(include_str!("../../static/app.html"))
 }
