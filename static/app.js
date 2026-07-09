@@ -287,9 +287,9 @@
   // ── Chain Graph ──────────────────────────────────────────
   
   window.router.register('/graph', function(main) {
+    main.innerHTML = window.renderLoading();
     let cancelled = false;
     const renderGraph = async () => {
-      main.innerHTML = window.renderLoading();
       try {
         const [status, listeners, sessions, beacons] = await Promise.all([
           apiGet('/api/sliver/status').catch(() => ({connected:false})),
@@ -298,30 +298,73 @@
           apiGet('/api/beacons').catch(() => []),
         ]);
         if (cancelled) return;
+
         const W = 900, H = 500;
-        const COL1 = 150, COL2 = 350, COL3 = 600, SPACING = 80;
-        const nodes = [], edges = [];
-        const rootLabel = status.connected ? (status.profile_name || 'Sliver Server') : 'Sliver (disconnected)';
-        nodes.push({ id:'root', label:rootLabel, x:COL1, y:250, color:status.connected ? '#38bdf8' : '#7895b8', type:'server' });
-        const la = Array.isArray(listeners)?listeners:[];
-        la.forEach((l,i)=>{const y=100+i*SPACING;nodes.push({id:'l-'+l.id,label:l.protocol+':'+l.port,sub:l.bind,x:COL2,y,color:'#34d399',type:'listener'});edges.push({from:'root',to:'l-'+l.id,label:'listener'});});
-        if(!la.length)nodes.push({id:'nl',label:'No listeners',x:COL2,y:250,color:'#7895b8',type:'empty'});
-        const sa=Array.isArray(sessions)?sessions:[],ba=Array.isArray(beacons)?beacons:[];
-        const imps=[...sa.map(s=>({...s,it:'session'})),...ba.map(b=>({...b,it:'beacon'}))];
-        imps.forEach((im,i)=>{const y=60+i*Math.min(SPACING,480/Math.max(imps.length,1));const nid='im-'+i;const sc=(im.status==='Active'||im.status==='active')?'#34d399':'#fb7185';nodes.push({id:nid,label:im.hostname||im.name||'implant-'+i,sub:im.it+' | '+(im.transport||'?'),x:COL3,y,color:sc,type:im.it});const t=(im.transport||'').toLowerCase();const m=la.find(l=>t.includes(l.protocol.toLowerCase()));edges.push({from:m?'l-'+m.id:'root',to:nid,label:'implant'});});
-        if(!imps.length)nodes.push({id:'ni',label:'No implants',x:COL3,y:250,color:'#7895b8',type:'empty'});
-        var nodeMap={};nodes.forEach(function(n){nodeMap[n.id]=n;});
-        var svg='<div class=\"graph-toolbar\"><button class=\"btn btn-ghost btn-sm\" onclick=\"window.router.navigate(\'#/graph\')\">\u27f3 Refresh</button><span style=\"font-size:0.75rem;color:var(--text-dim)\">'+imps.length+' implant(s), '+la.length+' listener(s)</span></div><div class=\"graph-container\"><svg viewBox=\"0 0 900 500\" xmlns=\"http://www.w3.org/2000/svg\"><defs><pattern id=\"g\" width=\"40\" height=\"40\" patternUnits=\"userSpaceOnUse\"><path d=\"M 40 0 L 0 0 0 40\" fill=\"none\" stroke=\"rgba(56,189,248,0.04)\" stroke-width=\"1\"/></pattern></defs><rect width=\"900\" height=\"500\" fill=\"url(#g)\"/>';
-        edges.forEach(function(e){var f=nodeMap[e.from],t=nodeMap[e.to];if(!f||!t)return;svg+='<line x1=\"'+f.x+'\" y1=\"'+f.y+'\" x2=\"'+t.x+'\" y2=\"'+t.y+'\" class=\"graph-edge active\" />';svg+='<text x=\"'+((f.x+t.x)/2)+'\" y=\"'+((f.y+t.y)/2-8)+'\" text-anchor=\"middle\" fill=\"var(--text-dim)\" font-size=\"9\" font-family=\"var(--font-mono)\">'+e.label+'</text>';});
-        nodes.forEach(function(n){var r=n.type==='server'?32:24;var h=escapeHtml(n.label)+' | '+escapeHtml(n.type)+' | '+(n.sub||'');svg+='<g class=\"graph-node\" data-id=\"'+n.id+'\" style=\"cursor:pointer\" onmouseover=\"(function(){var d=document.getElementById(\'gd\');d.style.display=\"block\";d.innerHTML=\"<h4>'+n.label.replace(/"/g,'&quot;')+'</h4><div class=\\'detail-row\\'><span>Type</span><span>'+n.type+'</span></div><div class=\\'detail-row\\'><span>ID</span><span>'+n.id+'</span></div>'+'\"})()\" onmouseout=\"document.getElementById(\'gd\').style.display=\"none\"\">';svg+='<circle cx=\"'+n.x+'\" cy=\"'+n.y+'\" r=\"'+r+'\" fill=\"none\" stroke=\"'+n.color+'\" stroke-width=\"2\" stroke-opacity=\"0.8\" style=\"filter:drop-shadow(0 0 6px '+n.color+'40)\" />';svg+='<circle cx=\"'+n.x+'\" cy=\"'+n.y+'\" r=\"'+(r-4)+'\" fill=\"'+n.color+'15\" stroke=\"none\" />';svg+='<text x=\"'+n.x+'\" y=\"'+(n.y+r+14)+'\" text-anchor=\"middle\" class=\"graph-node-label\" fill=\"'+n.color+'\">'+escapeHtml(n.label)+'</text>';if(n.sub)svg+='<text x=\"'+n.x+'\" y=\"'+(n.y+r+28)+'\" text-anchor=\"middle\" font-size=\"8\" fill=\"var(--text-dim)\" font-family=\"var(--font-mono)\">'+escapeHtml(n.sub)+'</text>';svg+='</g>';});
-        svg+='</svg></div><div id=\"gd\" class=\"graph-details\" style=\"display:none;position:absolute;right:12px;top:12px;background:var(--bg-panel);border:1px solid var(--border-subtle);border-radius:6px;padding:8px 14px;min-width:180px;font-size:0.75rem;z-index:10;\"></div>';
+        const COL1 = 150, COL2 = 350, COL3 = 600;
+
+        const nodes = [{ id:'root', label:status.connected ? (status.profile_name||'Sliver Server') : 'Sliver (disconnected)', x:COL1, y:250, color:status.connected?'#38bdf8':'#7895b8', type:'server' }];
+        const la = Array.isArray(listeners) ? listeners : [];
+        la.forEach((l,i) => nodes.push({ id:'l-'+l.id, label:l.protocol+':'+l.port, sub:l.bind, x:COL2, y:100+i*80, color:'#34d399', type:'listener' }));
+        if (!la.length) nodes.push({ id:'nl', label:'No listeners', x:COL2, y:250, color:'#7895b8', type:'empty' });
+
+        const imps = [];
+        (Array.isArray(sessions)?sessions:[]).forEach(s => imps.push({id:'im-'+imps.length, label:s.hostname||s.name, sub:'session | '+(s.transport||'?'), x:COL3, y:60+imps.length*60, color:s.status==='Active'?'#34d399':'#fb7185', type:'session' }));
+        (Array.isArray(beacons)?beacons:[]).forEach(b => imps.push({id:'im-'+imps.length, label:b.hostname||b.name, sub:'beacon | '+(b.transport||'?'), x:COL3, y:60+imps.length*60, color:b.status==='Active'?'#34d399':'#fb7185', type:'beacon' }));
+        if (!imps.length) nodes.push({ id:'ni', label:'No implants', x:COL3, y:250, color:'#7895b8', type:'empty' });
+
+        var nm = {}; nodes.forEach(function(n){nm[n.id]=n;});
+
+        var svg = '<div class="graph-toolbar"><button class="btn btn-ghost btn-sm" id="g-refresh">\u21bb Refresh</button><span style="font-size:0.75rem;color:var(--text-dim)">' + imps.length + ' implant(s), ' + la.length + ' listener(s)</span></div>';
+        svg += '<div class="graph-container"><svg viewBox="0 0 900 500" xmlns="http://www.w3.org/2000/svg">';
+        svg += '<defs><pattern id="g" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(56,189,248,0.04)" stroke-width="1"/></pattern></defs>';
+        svg += '<rect width="900" height="500" fill="url(#g)"/>';
+
+        // Edges
+        la.forEach(function(l) {
+          var from = nm['root'], to = nm['l-'+l.id];
+          if (from && to) { svg += '<line x1="'+from.x+'" y1="'+from.y+'" x2="'+to.x+'" y2="'+to.y+'" class="graph-edge active" />'; }
+        });
+        imps.forEach(function(im) {
+          var from = nm['root'], to = nm[im.id];
+          if (from && to) { svg += '<line x1="'+from.x+'" y1="'+from.y+'" x2="'+to.x+'" y2="'+to.y+'" class="graph-edge active" />'; }
+        });
+
+        // Nodes
+        nodes.forEach(function(n) {
+          var r = n.type === 'server' ? 32 : 24;
+          svg += '<g class="graph-node" data-id="'+n.id+'">';
+          svg += '<circle cx="'+n.x+'" cy="'+n.y+'" r="'+r+'" fill="none" stroke="'+n.color+'" stroke-width="2" stroke-opacity="0.8" style="filter:drop-shadow(0 0 6px '+n.color+'40)" />';
+          svg += '<circle cx="'+n.x+'" cy="'+n.y+'" r="'+(r-4)+'" fill="'+n.color+'15" stroke="none" />';
+          svg += '<text x="'+n.x+'" y="'+(n.y+r+14)+'" text-anchor="middle" class="graph-node-label" fill="'+n.color+'">'+escapeHtml(n.label)+'</text>';
+          if (n.sub) svg += '<text x="'+n.x+'" y="'+(n.y+r+28)+'" text-anchor="middle" font-size="8" fill="var(--text-dim)" font-family="var(--font-mono)">'+escapeHtml(n.sub)+'</text>';
+          svg += '</g>';
+        });
+
+        svg += '</svg></div><div id="gd" class="graph-details" style="display:none;"></div>';
         main.innerHTML = svg;
+
+        // Hover via event delegation
+        main.querySelector('.graph-container')?.addEventListener('mouseover', function(ev) {
+          var g = ev.target.closest('.graph-node');
+          if (!g) { document.getElementById('gd').style.display = 'none'; return; }
+          var id = g.dataset.id;
+          var n = nm[id];
+          if (!n) return;
+          var d = document.getElementById('gd');
+          d.innerHTML = '<h4>'+escapeHtml(n.label)+'</h4><div class="detail-row"><span>Type</span><span>'+escapeHtml(n.type)+'</span></div><div class="detail-row"><span>ID</span><span>'+escapeHtml(n.id)+'</span></div>' + (n.sub ? '<div class="detail-row"><span>Info</span><span>'+escapeHtml(n.sub)+'</span></div>' : '');
+          d.style.display = 'block';
+        });
+        main.querySelector('.graph-container')?.addEventListener('mouseout', function(ev) {
+          if (ev.target.closest('.graph-node')) return;
+          document.getElementById('gd').style.display = 'none';
+        });
+        document.getElementById('g-refresh')?.addEventListener('click', function() { window.router.navigate('#/graph'); });
       } catch (err) {
         if (!cancelled) main.innerHTML = window.renderError(err.message);
       }
     };
     renderGraph();
-    return () => { cancelled = true; };
+    return function() { cancelled = true; };
   });
 
   // ── Sessions ──────────────────────────────────────────────
