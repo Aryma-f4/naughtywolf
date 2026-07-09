@@ -364,12 +364,22 @@ async fn list_payloads(
 }
 
 async fn generate_payload_handler(
-    _state: State<AppState>,
+    State(state): State<AppState>,
     _user: AuthenticatedUserGuard,
     axum::Json(req): axum::Json<payloads::GeneratePayloadRequest>,
 ) -> Json<payloads::GenerateResponse> {
-    let result = payloads::generate_implant(req).await;
-    Json(result)
+    let mut guard = state.sliver.lock().await;
+    if let Some(conn) = guard.as_mut() {
+        let result = payloads::generate_implant(conn, req).await;
+        Json(result)
+    } else {
+        Json(payloads::GenerateResponse {
+            success: false,
+            message: "Sliver not connected".to_string(),
+            implant_name: None,
+            output_path: None,
+        })
+    }
 }
 
 async fn download_payload_handler(

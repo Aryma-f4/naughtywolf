@@ -1,7 +1,9 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::sliver::connection::SliverConnection;
-use crate::sliver::proto::commonpb;
+use crate::sliver::proto::{clientpb, commonpb};
 
 /// A simplified implant build representation for API responses.
 #[derive(Debug, Clone, Serialize)]
@@ -79,120 +81,65 @@ pub struct GenerateResponse {
     pub output_path: Option<String>,
 }
 
-/// Scan the payloads directory for the generated binary file.
-fn find_output_file(name: &str, _goos: &str, save_str: &str) -> Option<String> {
-    let dir = std::path::Path::new(save_str);
-    if !dir.exists() {
-        return None;
-    }
-    // The binary may have any extension (or none). Match by prefix.
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if fname.starts_with(name) || fname == name {
-                return Some(format!("/api/payloads/download/{}", &fname));
-            }
-        }
-    }
-    None
-}
-
-/// Generate an implant by spawning sliver-server as a child process with `--rc`.
-/// This avoids gRPC "record not found" issues and works with the local sliver-server binary.
+/// Generate an implant via the Sliver gRPC `Generate` RPC.
+/// The config is created without an ID so the server assigns one.
 pub async fn generate_implant(
+    conn: &mut SliverConnection,
     req: GeneratePayloadRequest,
 ) -> GenerateResponse {
-    let proto = match req.protocol.as_str() {
-        "mtls" => format!("--mtls {}:{}", req.lhost, req.lport),
-        "http" => format!("--http {}:{}", req.lhost, req.lport),
-        "https" => format!("--https {}:{}", req.lhost, req.lport),
-        "dns" => format!("--dns {}:{}", req.lhost, req.lport),
-        _ => format!("--mtls {}:{}", req.lhost, req.lport),
-    };
-    let beacon_flag = if req.is_beacon { " --beacon" } else { "" };
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let save_str = cwd.join("payloads");
-    let save_str = save_str.to_string_lossy().to_string();
-    std::fs::create_dir_all(&save_str).ok();
-
-    let cmd = format!(
-        "generate --name {} --os {} --arch {} --format {} {} {}\nexit",
-        req.name, req.goos, req.goarch, req.format, proto, beacon_flag
-    );
-
-    tracing::info!("Running sliver-server generate: {}", &cmd[..cmd.find('\n').unwrap_or(cmd.len())]);
-
-    let bin_raw = std::env::var("SLIVER_SERVER_PATH").unwrap_or_else(|_| "sliver-server".to_string());
-    let parts: Vec<&str> = bin_raw.split_whitespace().collect();
-    let bin_cmd = parts[0];
-    let bin_args: Vec<&str> = parts[1..].iter().map(|s| *s).collect();
-
-    // Write commands to a temp RC file (more reliable than /dev/stdin piping)
-    let rc_path = format!("/tmp/nw_gen_{}.rc", std::process::id());
-    if let Err(e) = std::fs::write(&rc_path, &cmd) {
-        tracing::error!("Failed to write RC file {rc_path}: {e}");
-    }
-
-    let mut command = tokio::process::Command::new(bin_cmd);
-    command
-        .args(&bin_args)
-        .args(["--rc", &rc_path])
-        .current_dir(&save_str)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let result = command.spawn();
-
-    let mut child = match result {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("Failed to spawn {bin_cmd}: {e}. Set SLIVER_SERVER_PATH or install sliver-server");
-            tracing::error!("{msg}");
-            std::fs::remove_file(&rc_path).ok();
-            return GenerateResponse { success: false, message: msg, implant_name: None, output_path: None };
-        }
+    let format = match req.format.as_str() {
+        "shared" => clientpb::OutputFormat::SharedLib,
+        "shellcode" => clientpb::OutputFormat::Shellcode,
+        "service" => clientpb::OutputFormat::Service,
+        _ => clientpb::OutputFormat::Executable,
     };
 
-    // Clean up RC file after spawning
-    std::fs::remove_file(&rc_path).ok();
+    let c2_url = format!("{}://{}:{}", req.protocol, req.lhost, req.lport);
 
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(180),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if output.status.success() {
-                tracing::info!("Payload generated successfully");
-                // Find the generated binary in the payloads directory
-                let out_path = find_output_file(&req.name, &req.goos, &save_str);
-                GenerateResponse {
-                    success: true,
-                    message: format!("Payload '{}' generated", req.name),
-                    implant_name: Some(req.name),
-                    output_path: out_path,
-                }
-            } else {
-                let msg = format!("sliver-server exited with code {}: {}",
-                    output.status.code().unwrap_or(-1),
-                    if !stderr.is_empty() { &stderr[..200.min(stderr.len())] } else { &stdout[..200.min(stdout.len())] }
-                );
-                tracing::error!("{}", msg);
-                GenerateResponse { success: false, message: msg, implant_name: None, output_path: None }
+    // Minimal ImplantConfig — server assigns its own ID
+    let generate_req = clientpb::GenerateReq {
+        name: req.name.clone(),
+        config: Some(clientpb::ImplantConfig {
+            goos: req.goos,
+            goarch: req.goarch,
+            format: format.into(),
+            is_beacon: req.is_beacon,
+            debug: false,
+            obfuscate_symbols: true,
+            sgn_enabled: true,
+            include_http: req.protocol.starts_with("http"),
+            include_mtls: req.protocol == "mtls",
+            include_dns: req.protocol == "dns",
+            c2: vec![clientpb::ImplantC2 {
+                url: c2_url,
+                priority: 1,
+                ..Default::default()
+            }],
+            reconnect_interval: 60,
+            max_connection_errors: 100,
+            ..Default::default()
+        }),
+    };
+
+    match conn.client.generate(tonic::Request::new(generate_req)).await {
+        Ok(response) => {
+            let out = response.into_inner();
+            tracing::info!("Payload generated: {} (build_id: {})", out.implant_name, out.implant_build_id);
+            GenerateResponse {
+                success: true,
+                message: format!("Payload '{}' generated", out.implant_name),
+                implant_name: Some(out.implant_name),
+                output_path: None, // binary stored in sliver server build cache
             }
         }
-        Ok(Err(e)) => {
-            let msg = format!("sliver-server process error: {e}");
-            tracing::error!("{}", msg);
-            GenerateResponse { success: false, message: msg, implant_name: None, output_path: None }
-        }
-        Err(_) => {
-            let msg = "sliver-server timed out after 180s".to_string();
-            tracing::error!("{}", msg);
-            GenerateResponse { success: false, message: msg, implant_name: None, output_path: None }
+        Err(e) => {
+            tracing::error!("Generate failed: {}", e);
+            GenerateResponse {
+                success: false,
+                message: format!("Generate failed: {}", e),
+                implant_name: None,
+                output_path: None,
+            }
         }
     }
 }
