@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::sliver::connection::SliverConnection;
 use crate::sliver::proto::{clientpb, commonpb};
@@ -94,9 +95,11 @@ pub async fn generate_implant(
     };
     let c2_url = format!("{}://{}:{}", req.protocol, req.lhost, req.lport);
 
+    let implant_name = req.name.clone();
     let generate_req = clientpb::GenerateReq {
-        name: req.name.clone(),
+        name: implant_name.clone(),
         config: Some(clientpb::ImplantConfig {
+            id: format!("nw-{}", uuid::Uuid::new_v4()),
             goos: req.goos.clone(),
             goarch: req.goarch.clone(),
             format: format.into(),
