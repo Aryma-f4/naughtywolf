@@ -53,7 +53,7 @@ impl SliverConnection {
         let tls = ClientTlsConfig::new()
             .ca_certificate(ca)
             .identity(identity)
-            .domain_name("operators");
+            .domain_name("multiplayer");
 
         let addr = format!("{}:{}", profile.lhost, profile.lport);
 
