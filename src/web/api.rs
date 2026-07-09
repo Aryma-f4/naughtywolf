@@ -84,6 +84,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/listeners/kill/{id}", axum::routing::post(kill_listener))
         .route("/api/payloads", axum::routing::get(list_payloads))
         .route("/api/payloads/generate", axum::routing::post(generate_payload_handler))
+        .route("/api/payloads/regenerate/{name}", axum::routing::post(regenerate_payload_handler))
         .route("/api/payloads/download/{name}", axum::routing::get(download_payload_handler))
         .route("/api/websites", axum::routing::get(list_websites))
         .route("/api/loot", axum::routing::get(list_loot))
@@ -384,6 +385,27 @@ async fn generate_payload_handler(
         success: true,
         message: format!("Generation started for '{}' — check payloads page shortly", name),
         implant_name: Some(name),
+        output_path: None,
+    })
+}
+
+async fn regenerate_payload_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    Path(name): Path<String>,
+) -> Json<payloads::GenerateResponse> {
+    let sliver = state.sliver.clone();
+    tokio::spawn(async move {
+        let mut guard = sliver.lock().await;
+        if let Some(conn) = guard.as_mut() {
+            let result = payloads::regenerate_implant(conn, name).await;
+            tracing::info!("Regenerate done: {:?}", result);
+        }
+    });
+    Json(payloads::GenerateResponse {
+        success: true,
+        message: "Regeneration started".into(),
+        implant_name: None,
         output_path: None,
     })
 }

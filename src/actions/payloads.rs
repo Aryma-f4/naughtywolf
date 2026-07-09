@@ -155,17 +155,40 @@ pub async fn generate_implant(
     }
 }
 
-/// Search for the generated binary in the save dir, returning the filename.
-fn find_binary(name: &str, dir: &std::path::Path) -> Option<String> {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let fname = e.file_name().to_string_lossy().to_string();
-            if fname.contains(name) || fname.starts_with(name) {
-                return Some(fname);
+/// Regenerate an existing implant build via the `Regenerate` RPC.
+pub async fn regenerate_implant(
+    conn: &mut SliverConnection,
+    implant_name: String,
+) -> GenerateResponse {
+    match conn.client.regenerate(tonic::Request::new(clientpb::RegenerateReq {
+        implant_name,
+    })).await {
+        Ok(response) => {
+            let out = response.into_inner();
+            tracing::info!("Regenerated: {} (build_id: {})", out.implant_name, out.implant_build_id);
+            let mut dl_path = None;
+            if let Some(file) = out.file {
+                let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
+                let _ = std::fs::create_dir_all(&save_dir);
+                let fpath = save_dir.join(&out.implant_name);
+                if std::fs::write(&fpath, &file.data).is_ok() {
+                    dl_path = Some(format!("/api/payloads/download/{}", out.implant_name));
+                }
+            }
+            GenerateResponse {
+                success: true,
+                message: format!("Payload '{}' regenerated", out.implant_name),
+                implant_name: Some(out.implant_name),
+                output_path: dl_path,
             }
         }
+        Err(e) => GenerateResponse {
+            success: false,
+            message: format!("Regenerate failed: {}", e),
+            implant_name: None,
+            output_path: None,
+        },
     }
-    None
 }
 
 /// Scan `./payloads` directory for locally-generated implant files.
