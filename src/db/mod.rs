@@ -7,8 +7,11 @@ use std::time::Duration;
 /// Create a connection pool to the PostgreSQL database
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(5))
+        .max_connections(25)
+        .min_connections(2)
+        .acquire_timeout(Duration::from_secs(10))
+        .idle_timeout(Duration::from_secs(300))
+        .max_lifetime(Duration::from_secs(1800))
         .connect(database_url)
         .await
 }
