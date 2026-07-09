@@ -507,9 +507,10 @@
           `${escapeHtml(b.goos)}/${escapeHtml(b.goarch)}`,
           b.is_beacon ? 'beacon' : 'session',
           fmtNames[b.format] || 'unknown',
+          `<a href="/api/payloads/download/${encodeURIComponent(b.name)}" class="btn btn-ghost btn-sm" target="_blank">Download</a>`,
         ]);
         return rows.length > 0
-          ? window.renderTable(['Name','OS/Arch','Type','Format'], rows)
+          ? window.renderTable(['Name','OS/Arch','Type','Format','Actions'], rows)
           : '<div class="empty-state"><div class="empty-icon">📦</div><h3>No Payloads</h3><p>Generate a payload to see it here.</p></div>';
       } catch { return '<div class="empty-state"><div class="empty-icon">⚠</div><h3>Error</h3><p>Failed to load payloads.</p></div>'; }
     };
@@ -549,7 +550,12 @@
             lhost: document.getElementById('gen-lhost').value,
             lport: parseInt(document.getElementById('gen-lport').value),
           });
-          if (r.success) { msg.textContent = 'Done!'; msg.style.color = 'var(--green)'; showToast(r.message, 'success'); window.router.navigate('#/payloads'); }
+          if (r.success) {
+            msg.innerHTML = 'Done! <a href="'+escapeHtml(r.output_path||'')+'" class="btn btn-sm btn-primary" style="margin-left:8px;text-decoration:none;" target="_blank">📥 Download</a>';
+            msg.style.color = 'var(--green)';
+            showToast(r.message, 'success');
+            window.router.navigate('#/payloads');
+          }
           else { msg.textContent = r.message; msg.style.color = 'var(--red)'; }
         } catch(e) { msg.textContent = e.message; msg.style.color = 'var(--red)'; }
       });

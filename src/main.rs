@@ -115,7 +115,8 @@ async fn main() -> anyhow::Result<()> {
         .merge(web::sse::event_stream_routes())
         .with_state(state)
         .layer(session_layer)
-        .nest_service("/static", ServeDir::new("static"));
+        .nest_service("/static", ServeDir::new("static"))
+        .nest_service("/payloads/files", ServeDir::new("payloads"));
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!("Listening on {}", config.bind);

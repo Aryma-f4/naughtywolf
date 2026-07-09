@@ -84,6 +84,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/listeners/kill/{id}", axum::routing::post(kill_listener))
         .route("/api/payloads", axum::routing::get(list_payloads))
         .route("/api/payloads/generate", axum::routing::post(generate_payload_handler))
+        .route("/api/payloads/download/{name}", axum::routing::get(download_payload_handler))
         .route("/api/websites", axum::routing::get(list_websites))
         .route("/api/loot", axum::routing::get(list_loot))
         .route("/api/creds", axum::routing::get(list_creds))
@@ -369,6 +370,59 @@ async fn generate_payload_handler(
 ) -> Json<payloads::GenerateResponse> {
     let result = payloads::generate_implant(req).await;
     Json(result)
+}
+
+async fn download_payload_handler(
+    Path(name): Path<String>,
+    _user: AuthenticatedUserGuard,
+) -> Result<axum::response::Response<axum::body::Body>, (axum::http::StatusCode, String)> {
+    use axum::body::Body;
+    use axum::response::Response;
+    use tokio::fs;
+
+    // Search ./payloads directory for matching file
+    let save_dir = std::path::Path::new("./payloads");
+    if !save_dir.exists() {
+        return Err((axum::http::StatusCode::NOT_FOUND, "No payloads directory".to_string()));
+    }
+
+    let mut entries = fs::read_dir(save_dir)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut found_path = None;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if fname == name || fname.starts_with(&name) {
+            found_path = Some(entry.path());
+            break;
+        }
+    }
+
+    match found_path {
+        Some(path) => {
+            let data = fs::read(&path)
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let body = Body::from(data);
+            let headers = [
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Disposition", &format!("attachment; filename=\"{}\"", filename)),
+            ];
+            Ok(Response::builder()
+                .status(200)
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
+                .body(body)
+                .unwrap())
+        }
+        None => Err((axum::http::StatusCode::NOT_FOUND, format!("Payload '{}' not found in ./payloads", name))),
+    }
 }
 
 async fn list_websites(

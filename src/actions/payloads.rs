@@ -76,6 +76,25 @@ pub struct GenerateResponse {
     pub success: bool,
     pub message: String,
     pub implant_name: Option<String>,
+    pub output_path: Option<String>,
+}
+
+/// Scan the payloads directory for the generated binary file.
+fn find_output_file(name: &str, _goos: &str, save_dir: &str) -> Option<String> {
+    let dir = std::path::Path::new(save_dir);
+    if !dir.exists() {
+        return None;
+    }
+    // The binary may have any extension (or none). Match by prefix.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if fname.starts_with(name) || fname == name {
+                return Some(format!("/api/payloads/download/{}", &fname));
+            }
+        }
+    }
+    None
 }
 
 /// Generate an implant by spawning sliver-server as a child process with `--rc`.
@@ -127,7 +146,7 @@ pub async fn generate_implant(
             let msg = format!("Failed to spawn {bin_cmd}: {e}. Set SLIVER_SERVER_PATH or install sliver-server");
             tracing::error!("{msg}");
             std::fs::remove_file(&rc_path).ok();
-            return GenerateResponse { success: false, message: msg, implant_name: None };
+            return GenerateResponse { success: false, message: msg, implant_name: None, output_path: None };
         }
     };
 
@@ -145,10 +164,13 @@ pub async fn generate_implant(
             let stderr = String::from_utf8_lossy(&output.stderr);
             if output.status.success() {
                 tracing::info!("Payload generated successfully");
+                // Find the generated binary in the payloads directory
+                let out_path = find_output_file(&req.name, &req.goos, save_dir);
                 GenerateResponse {
                     success: true,
                     message: format!("Payload '{}' generated", req.name),
                     implant_name: Some(req.name),
+                    output_path: out_path,
                 }
             } else {
                 let msg = format!("sliver-server exited with code {}: {}",
@@ -156,18 +178,18 @@ pub async fn generate_implant(
                     if !stderr.is_empty() { &stderr[..200.min(stderr.len())] } else { &stdout[..200.min(stdout.len())] }
                 );
                 tracing::error!("{}", msg);
-                GenerateResponse { success: false, message: msg, implant_name: None }
+                GenerateResponse { success: false, message: msg, implant_name: None, output_path: None }
             }
         }
         Ok(Err(e)) => {
             let msg = format!("sliver-server process error: {e}");
             tracing::error!("{}", msg);
-            GenerateResponse { success: false, message: msg, implant_name: None }
+            GenerateResponse { success: false, message: msg, implant_name: None, output_path: None }
         }
         Err(_) => {
             let msg = "sliver-server timed out after 180s".to_string();
             tracing::error!("{}", msg);
-            GenerateResponse { success: false, message: msg, implant_name: None }
+            GenerateResponse { success: false, message: msg, implant_name: None, output_path: None }
         }
     }
 }
