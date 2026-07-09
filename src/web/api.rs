@@ -81,7 +81,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/sessions", axum::routing::get(list_sessions))
         .route("/api/beacons", axum::routing::get(list_beacons))
         .route("/api/listeners", axum::routing::get(list_listeners).post(create_listener))
-        .route("/api/listeners/kill/:id", axum::routing::post(kill_listener))
+        .route("/api/listeners/kill/{id}", axum::routing::post(kill_listener))
         .route("/api/payloads", axum::routing::get(list_payloads))
         .route("/api/websites", axum::routing::get(list_websites))
         .route("/api/loot", axum::routing::get(list_loot))
