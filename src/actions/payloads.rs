@@ -140,11 +140,8 @@ pub async fn generate_implant(
         clientpb::GenerateStageReq {
             profile: profile_name,
             name: format!("implant-{}", implant_name),
-            aes_encrypt_key: String::new(),
-            aes_encrypt_iv: String::new(),
-            rc4_encrypt_key: String::new(),
-            compress_f: String::new(),
-            compress: String::new(),
+            prepend_size: false,
+            ..Default::default()
         }
     )).await;
 
