@@ -386,7 +386,7 @@ async fn download_payload_handler(
         return Err((axum::http::StatusCode::NOT_FOUND, "No payloads directory".to_string()));
     }
 
-    let entries = fs::read_dir(save_dir)
+    let mut entries = fs::read_dir(save_dir)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

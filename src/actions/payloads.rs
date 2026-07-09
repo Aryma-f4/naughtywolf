@@ -113,7 +113,7 @@ pub async fn generate_implant(
     let cwd = std::env::current_dir().unwrap_or_default();
     let save_str = cwd.join("payloads");
     let save_str = save_str.to_string_lossy().to_string();
-    std::fs::create_dir_all(&save_dir).ok();
+    std::fs::create_dir_all(&save_str).ok();
 
     let cmd = format!(
         "generate --name {} --os {} --arch {} --format {} {} {} --save {}\nexit",
