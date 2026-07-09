@@ -79,99 +79,87 @@ pub struct GenerateResponse {
     pub output_path: Option<String>,
 }
 
-/// Generate an implant via sliver-server CLI with `--rc`.
-/// The process spawns sliver-server non-interactively and runs `generate`.
+/// Generate an implant by calling gen-payload.sh (uses sliver-client + expect).
+/// Runs asynchronously, polls for the binary file in ./payloads.
 pub async fn generate_implant(
     _conn: &mut SliverConnection,
     req: GeneratePayloadRequest,
 ) -> GenerateResponse {
-    let proto = match req.protocol.as_str() {
-        "mtls" => format!("--mtls {}:{}", req.lhost, req.lport),
-        "http" => format!("--http {}:{}", req.lhost, req.lport),
-        "https" => format!("--https {}:{}", req.lhost, req.lport),
-        "dns" => format!("--dns {}:{}", req.lhost, req.lport),
-        _ => format!("--mtls {}:{}", req.lhost, req.lport),
-    };
-    let beacon = if req.is_beacon { " --beacon" } else { "" };
-
     let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
-    let save_str = save_dir.to_string_lossy().to_string();
     std::fs::create_dir_all(&save_dir).ok();
+    let beacon_str = if req.is_beacon { "true" } else { "false" };
+    let port_str = req.lport.to_string();
 
-    let rc_cmd = format!(
-        "generate --name {} --os {} --arch {} --format {} {} {} --save {}\nexit",
-        req.name, req.goos, req.goarch, req.format, proto, beacon, save_str
-    );
+    // Build the gen-payload.sh command
+    let script_path = std::env::var("GEN_PAYLOAD_SCRIPT")
+        .unwrap_or_else(|_| "/opt/naughtywolf/gen-payload.sh".to_string());
 
-    let bin_raw = std::env::var("SLIVER_SERVER_PATH").unwrap_or_else(|_| "sliver-server".to_string());
-    let parts: Vec<&str> = bin_raw.split_whitespace().collect();
-    let (bin_cmd, bin_args) = parts.split_first().unwrap_or((&"sliver-server", &[]));
-
-    let rc_path = format!("/tmp/nw_rc_{}.txt", std::process::id());
-    let _ = std::fs::write(&rc_path, &rc_cmd);
-
-    let output = match tokio::process::Command::new(bin_cmd)
-        .args(bin_args)
-        .args(["--rc", &rc_path])
+    let mut child = match tokio::process::Command::new(&script_path)
+        .args([
+            &req.name, &req.goos, &req.goarch, &req.format,
+            &req.protocol, &req.lhost, &port_str,
+            &beacon_str,
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
     {
-        Ok(c) => {
-            let _ = std::fs::remove_file(&rc_path);
-            match tokio::time::timeout(std::time::Duration::from_secs(300), c.wait_with_output()).await {
-                Ok(r) => r.map_err(|e| e.to_string()),
-                Err(_) => return GenerateResponse {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("Failed to run {script_path}: {e}. Ensure gen-payload.sh exists (set GEN_PAYLOAD_SCRIPT)");
+            tracing::error!("{msg}");
+            return GenerateResponse { success: false, message: msg, implant_name: None, output_path: None };
+        }
+    };
+
+    // Wait with timeout (10 min for compilation)
+    match tokio::time::timeout(std::time::Duration::from_secs(600), child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if output.status.success() && stdout.contains("GEN_DONE") {
+                // Poll for the binary for up to 60s
+                let dl = poll_for_binary(&req.name, &save_dir, 60);
+                GenerateResponse {
+                    success: true,
+                    message: format!("Payload '{}' generated", req.name),
+                    implant_name: Some(req.name),
+                    output_path: dl.map(|f| format!("/api/payloads/download/{}", f)),
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                GenerateResponse {
                     success: false,
-                    message: "Generation timed out after 300s (first compile may take long)".into(),
+                    message: format!("gen-payload.sh failed: {}", stderr.lines().next().unwrap_or("unknown")),
                     implant_name: None, output_path: None,
-                },
+                }
             }
         }
-        Err(e) => {
-            let _ = std::fs::remove_file(&rc_path);
-            return GenerateResponse {
-                success: false,
-                message: format!("Failed to start sliver-server (set SLIVER_SERVER_PATH): {e}"),
-                implant_name: None, output_path: None,
-            };
-        }
-    };
-
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => return GenerateResponse { success: false, message: e, implant_name: None, output_path: None },
-    };
-
-    if output.status.success() {
-        // Scan the save dir for the binary
-        let dl = scan_save_dir(&save_dir).map(|f| format!("/api/payloads/download/{}", f));
-        GenerateResponse {
-            success: true,
-            message: format!("Payload '{}' generated", req.name),
-            implant_name: Some(req.name),
-            output_path: dl,
-        }
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let combined = format!("{}{}", &stdout[..100.min(stdout.len())], &stderr[..200.min(stderr.len())]);
-        GenerateResponse {
-            success: false,
-            message: format!("sliver-server failed: {}", combined),
+        Ok(Err(e)) => GenerateResponse {
+            success: false, message: format!("Process error: {e}"),
             implant_name: None, output_path: None,
-        }
+        },
+        Err(_) => GenerateResponse {
+            success: false, message: "Payload generation timed out (10 min)".into(),
+            implant_name: None, output_path: None,
+        },
     }
 }
 
-/// Scan directory for binary file matching our naming convention.
-fn scan_save_dir(dir: &std::path::Path) -> Option<String> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if !name.starts_with('.') && e.metadata().map(|m| m.is_file()).unwrap_or(false) {
-            return Some(name);
+/// Poll the save directory for the generated binary for up to `timeout_secs` seconds.
+fn poll_for_binary(name: &str, dir: &std::path::Path, timeout_secs: u64) -> Option<String> {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < timeout_secs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let fname = e.file_name().to_string_lossy().to_string();
+                if (fname.contains(name) || fname.starts_with(name))
+                    && e.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
+                {
+                    return Some(fname);
+                }
+            }
         }
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
     None
 }
