@@ -116,8 +116,8 @@ pub async fn generate_implant(
     std::fs::create_dir_all(&save_str).ok();
 
     let cmd = format!(
-        "cd {}\ngenerate --name {} --os {} --arch {} --format {} {} {}\nexit",
-        save_str, req.name, req.goos, req.goarch, req.format, proto, beacon_flag
+        "generate --name {} --os {} --arch {} --format {} {} {}\nexit",
+        req.name, req.goos, req.goarch, req.format, proto, beacon_flag
     );
 
     tracing::info!("Running sliver-server generate: {}", &cmd[..cmd.find('\n').unwrap_or(cmd.len())]);
@@ -137,6 +137,7 @@ pub async fn generate_implant(
     command
         .args(&bin_args)
         .args(["--rc", &rc_path])
+        .current_dir(&save_str)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
