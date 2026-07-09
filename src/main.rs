@@ -23,6 +23,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // Install aws-lc-rs as default TLS provider for rustls (supports ECDSA-SHA512).
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .map_err(|_| anyhow::anyhow!("Failed to install aws-lc-rs CryptoProvider"))?;
+
     // Use clap::Parser::try_parse to detect CLI mode vs server mode.
     // - No args: MissingSubcommand → fall through to server mode
     // - "serve": Ok(Serve) → fall through to server mode

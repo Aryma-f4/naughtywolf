@@ -21,6 +21,7 @@ chrono = { version = "0.4", features = ["serde"] }
 argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 prost = "0.13"
 prost-types = "0.13"
 thiserror = "2"

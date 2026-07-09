@@ -1,5 +1,6 @@
 //! Sliver gRPC connection management -- mTLS + bearer token authentication.
 
+use std::error::Error;
 use std::path::Path;
 
 use tonic::metadata::AsciiMetadataValue;
@@ -47,11 +48,8 @@ impl SliverConnection {
             profile.private_key.as_bytes(),
         );
 
-        // Parse CA certificate
-        let ca = Certificate::from_pem(profile.ca_certificate.as_bytes());
-
         let tls = ClientTlsConfig::new()
-            .ca_certificate(ca)
+            .ca_certificate(Certificate::from_pem(profile.ca_certificate.as_bytes()))
             .identity(identity)
             .domain_name("multiplayer");
 
@@ -61,10 +59,19 @@ impl SliverConnection {
             .map_err(|e| ConnectionError::Address(format!("Invalid address {}: {}", addr, e)))?
             .tls_config(tls)
             .map_err(|e| ConnectionError::Tls(format!("TLS config for {}: {}", addr, e)))?
+            .connect_timeout(std::time::Duration::from_secs(10))
             .connect()
             .await
             .map_err(|e| {
-                ConnectionError::Connect(format!("Failed to connect to {}: {}", addr, e))
+                let err_msg = format!("Failed to connect to {}: {}", addr, e);
+                tracing::error!("{}", err_msg);
+                // Log full error chain
+                let mut source = e.source();
+                while let Some(s) = source {
+                    tracing::error!("  cause: {}", s);
+                    source = s.source();
+                }
+                ConnectionError::Connect(err_msg)
             })?;
 
         let interceptor = AuthInterceptor::new(&profile.token);
