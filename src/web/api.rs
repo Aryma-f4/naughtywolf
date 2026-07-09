@@ -386,7 +386,7 @@ async fn download_payload_handler(
         return Err((axum::http::StatusCode::NOT_FOUND, "No payloads directory".to_string()));
     }
 
-    let mut entries = fs::read_dir(save_dir)
+    let entries = fs::read_dir(save_dir)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -410,7 +410,7 @@ async fn download_payload_handler(
                 .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             let body = Body::from(data);
-            let headers = [
+            let _headers = [
                 ("Content-Type", "application/octet-stream"),
                 ("Content-Disposition", &format!("attachment; filename=\"{}\"", filename)),
             ];

@@ -80,8 +80,8 @@ pub struct GenerateResponse {
 }
 
 /// Scan the payloads directory for the generated binary file.
-fn find_output_file(name: &str, _goos: &str, save_dir: &str) -> Option<String> {
-    let dir = std::path::Path::new(save_dir);
+fn find_output_file(name: &str, _goos: &str, save_str: &str) -> Option<String> {
+    let dir = std::path::Path::new(save_str);
     if !dir.exists() {
         return None;
     }
@@ -110,12 +110,14 @@ pub async fn generate_implant(
         _ => format!("--mtls {}:{}", req.lhost, req.lport),
     };
     let beacon_flag = if req.is_beacon { " --beacon" } else { "" };
-    let save_dir = "./payloads";
-    std::fs::create_dir_all(save_dir).ok();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let save_str = cwd.join("payloads");
+    let save_str = save_str.to_string_lossy().to_string();
+    std::fs::create_dir_all(&save_dir).ok();
 
     let cmd = format!(
         "generate --name {} --os {} --arch {} --format {} {} {} --save {}\nexit",
-        req.name, req.goos, req.goarch, req.format, proto, beacon_flag, save_dir
+        req.name, req.goos, req.goarch, req.format, proto, beacon_flag, save_str
     );
 
     tracing::info!("Running sliver-server generate: {}", &cmd[..cmd.find('\n').unwrap_or(cmd.len())]);
@@ -165,7 +167,7 @@ pub async fn generate_implant(
             if output.status.success() {
                 tracing::info!("Payload generated successfully");
                 // Find the generated binary in the payloads directory
-                let out_path = find_output_file(&req.name, &req.goos, save_dir);
+                let out_path = find_output_file(&req.name, &req.goos, &save_str);
                 GenerateResponse {
                     success: true,
                     message: format!("Payload '{}' generated", req.name),
