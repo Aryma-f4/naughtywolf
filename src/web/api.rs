@@ -365,24 +365,17 @@ async fn list_payloads(
 }
 
 async fn generate_payload_handler(
-    State(state): State<AppState>,
+    _state: State<AppState>,
     _user: AuthenticatedUserGuard,
     axum::Json(req): axum::Json<payloads::GeneratePayloadRequest>,
 ) -> Json<payloads::GenerateResponse> {
     let name = req.name.clone();
-    // Spawn generation in background to prevent HTTP timeout / VPS hang
-    let sliver = state.sliver.clone();
+    // Spawn in background, NO mutex lock — generate_implant doesn't need Sliver conn
     tokio::spawn(async move {
-        let mut guard = sliver.lock().await;
-        if let Some(conn) = guard.as_mut() {
-            let _result = payloads::generate_implant(conn, req).await;
-            tracing::info!("Background generation complete: {:?}", _result.implant_name);
-        } else {
-            tracing::warn!("Background generation skipped: Sliver not connected");
-        }
+        let _result = payloads::generate_implant(req).await;
+        tracing::info!("Background generation complete: {:?}", _result.implant_name);
     });
 
-    // Return immediately — the generation runs in the background
     Json(payloads::GenerateResponse {
         success: true,
         message: format!("Generation started for '{}' — check payloads page in a few minutes", name),

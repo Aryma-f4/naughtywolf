@@ -80,9 +80,8 @@ pub struct GenerateResponse {
 }
 
 /// Generate an implant by calling gen-payload.sh (uses sliver-client + expect).
-/// Runs asynchronously, polls for the binary file in ./payloads.
+/// Does NOT need a SliverConnection — spawns sliver-client as child process.
 pub async fn generate_implant(
-    _conn: &mut SliverConnection,
     req: GeneratePayloadRequest,
 ) -> GenerateResponse {
     let save_dir = std::env::current_dir().unwrap_or_default().join("payloads");
