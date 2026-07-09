@@ -139,8 +139,12 @@ pub async fn generate_implant(
     let gen_result = conn.client.generate_stage(tonic::Request::new(
         clientpb::GenerateStageReq {
             profile: profile_name,
-            name: implant_name,
-            ..Default::default()
+            name: format!("implant-{}", implant_name),
+            aes_encrypt_key: String::new(),
+            aes_encrypt_iv: String::new(),
+            rc4_encrypt_key: String::new(),
+            compress_f: String::new(),
+            compress: String::new(),
         }
     )).await;
 
