@@ -7,7 +7,73 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<div id="app-shell"></div>
+<div class="app-shell">
+    <nav class="side-rail">
+        <div class="brand-block">
+            <h1>NW</h1>
+            <div class="brand-sub">Operator Console</div>
+            <div class="conn-badge offline" id="conn-badge">checking...</div>
+        </div>
+        <div class="nav-section-title">Modules</div>
+        <ul class="nav-list">
+            <li class="nav-link" data-route="/dashboard" onclick="window.router.navigate('#/dashboard')">
+                <span class="glyph">◈</span><span>Dashboard</span>
+            </li>
+            <li class="nav-link" data-route="/graph" onclick="window.router.navigate('#/graph')">
+                <span class="glyph">◉</span><span>Chain Graph</span>
+            </li>
+            <li class="nav-link" data-route="/sessions" onclick="window.router.navigate('#/sessions')">
+                <span class="glyph">⊞</span><span>Sessions</span>
+            </li>
+            <li class="nav-link" data-route="/beacons" onclick="window.router.navigate('#/beacons')">
+                <span class="glyph">◇</span><span>Beacons</span>
+            </li>
+            <li class="nav-link" data-route="/listeners" onclick="window.router.navigate('#/listeners')">
+                <span class="glyph">▽</span><span>Listeners</span>
+            </li>
+            <li class="nav-link" data-route="/payloads" onclick="window.router.navigate('#/payloads')">
+                <span class="glyph">▣</span><span>Payloads</span>
+            </li>
+            <li class="nav-link" data-route="/websites" onclick="window.router.navigate('#/websites')">
+                <span class="glyph">◎</span><span>Websites</span>
+            </li>
+            <li class="nav-link" data-route="/loot" onclick="window.router.navigate('#/loot')">
+                <span class="glyph">♦</span><span>Loot</span>
+            </li>
+            <li class="nav-link" data-route="/creds" onclick="window.router.navigate('#/creds')">
+                <span class="glyph">⚷</span><span>Credentials</span>
+            </li>
+            <li class="nav-link" data-route="/events" onclick="window.router.navigate('#/events')">
+                <span class="glyph">⚡</span><span>Events</span>
+            </li>
+            <li class="nav-link" data-route="/audit" onclick="window.router.navigate('#/audit')">
+                <span class="glyph">☰</span><span>Audit</span>
+            </li>
+        </ul>
+        <div class="nav-section-title">System</div>
+        <ul class="nav-list">
+            <li class="nav-link" data-route="/admin" onclick="window.router.navigate('#/admin')">
+                <span class="glyph">⚙</span><span>Admin</span>
+            </li>
+        </ul>
+        <div class="side-rail-footer">
+            <a href="/logout" style="color:var(--red);font-size:0.75rem;">Logout</a>
+        </div>
+    </nav>
+    <div class="main-panel">
+        <header class="status-strip">
+            <div class="status-strip-left">
+                <span class="page-title" id="page-title">Dashboard</span>
+            </div>
+            <div class="status-strip-right">
+                <span class="user-badge" id="user-badge">—</span>
+            </div>
+        </header>
+        <div class="content-area" id="main-content">
+            <div class="loading"><div class="spinner"></div></div>
+        </div>
+    </div>
+</div>
 <script src="/static/app.js"></script>
 </body>
 </html>

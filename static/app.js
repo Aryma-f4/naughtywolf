@@ -42,7 +42,8 @@
   }
 
   window.addEventListener('hashchange', () => navigate(window.location.hash));
-  window.addEventListener('DOMContentLoaded', () => navigate(window.location.hash || '#/dashboard'));
+  // Init handles first navigation via the async init block below.
+  // window.addEventListener('DOMContentLoaded', () => navigate(window.location.hash || '#/dashboard'));
 
   window.router = { register, navigate: (hash) => { window.location.hash = hash; } };
 
@@ -204,6 +205,111 @@
       }
     })();
 
+    return () => { cancelled = true; };
+  });
+
+  // ── Chain Graph ──────────────────────────────────────────
+  window.router.register('/graph', function(main) {
+    let cancelled = false;
+    const renderGraph = async () => {
+      main.innerHTML = window.renderLoading();
+      try {
+        const [status, listeners, sessions, beacons] = await Promise.all([
+          apiGet('/api/sliver/status').catch(() => ({connected:false})),
+          apiGet('/api/listeners').catch(() => []),
+          apiGet('/api/sessions').catch(() => []),
+          apiGet('/api/beacons').catch(() => []),
+        ]);
+        if (cancelled) return;
+
+        const W = 900, H = 500;
+        const COL1 = 150, COL2 = 350, COL3 = 600, COL4 = 780;
+        const SPACING = 80;
+
+        const nodes = [];
+        const edges = [];
+
+        const rootLabel = status.connected ? (status.profile_name || 'Sliver Server') : 'Sliver (disconnected)';
+        nodes.push({ id: 'root', label: rootLabel, x: COL1, y: 250, color: status.connected ? '#38bdf8' : '#7895b8', type: 'server' });
+
+        const listenArr = Array.isArray(listeners) ? listeners : [];
+        listenArr.forEach((l, i) => {
+          const y = 100 + i * SPACING;
+          const nid = `listener-${l.id}`;
+          nodes.push({ id: nid, label: `${l.protocol}:${l.port}`, sub: l.bind, x: COL2, y, color: '#34d399', type: 'listener' });
+          edges.push({ from: 'root', to: nid, label: 'listener' });
+        });
+        if (listenArr.length === 0) {
+          nodes.push({ id: 'no-listener', label: 'No listeners', x: COL2, y: 250, color: '#7895b8', type: 'empty' });
+        }
+
+        const sessArr = Array.isArray(sessions) ? sessions : [];
+        const beaconArr = Array.isArray(beacons) ? beacons : [];
+        const implants = [
+          ...sessArr.map(s => ({ ...s, implantType: 'session' })),
+          ...beaconArr.map(b => ({ ...b, implantType: 'beacon' })),
+        ];
+        const col3Count = Math.max(implants.length, 1);
+        implants.forEach((im, i) => {
+          const y = 60 + i * Math.min(SPACING, 480 / col3Count);
+          const nid = `implant-${im.id || i}`;
+          const statusColor = (im.status === 'Active' || im.status === 'active') ? '#34d399' : '#fb7185';
+          nodes.push({
+            id: nid,
+            label: im.hostname || im.name || `implant-${i}`,
+            sub: `${im.implantType} | ${im.transport || '?'}`,
+            x: COL3,
+            y,
+            color: statusColor,
+            type: im.implantType,
+          });
+          const transport = (im.transport || '').toLowerCase();
+          const match = listenArr.find(l => transport.includes(l.protocol.toLowerCase()));
+          if (match) {
+            edges.push({ from: `listener-${match.id}`, to: nid, label: 'implant' });
+          } else {
+            edges.push({ from: 'root', to: nid, label: 'implant' });
+          }
+        });
+        if (implants.length === 0) {
+          nodes.push({ id: 'no-implant', label: 'No implants', x: COL3, y: 250, color: '#7895b8', type: 'empty' });
+        }
+
+        let svg = `<div class="graph-toolbar"><button class="btn btn-ghost btn-sm" onclick="window.router.navigate('#/graph')">⟳ Refresh</button><span style="font-size:0.75rem;color:var(--text-dim)">${implants.length} implant(s), ${listenArr.length} listener(s)</span></div>`;
+        svg += `<div class="graph-container"><svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+        svg += `<defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(56,189,248,0.04)" stroke-width="1"/></pattern></defs>`;
+        svg += `<rect width="${W}" height="${H}" fill="url(#grid)" />`;
+
+        edges.forEach(e => {
+          const from = nodes.find(n => n.id === e.from);
+          const to = nodes.find(n => n.id === e.to);
+          if (!from || !to) return;
+          svg += `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" class="graph-edge active" />`;
+          const mx = (from.x + to.x) / 2;
+          const my = (from.y + to.y) / 2 - 8;
+          svg += `<text x="${mx}" y="${my}" text-anchor="middle" fill="var(--text-dim)" font-size="9" font-family="var(--font-mono)">${escapeHtml(e.label)}</text>`;
+        });
+
+        nodes.forEach(n => {
+          const r = n.type === 'server' ? 32 : 24;
+          const glow = n.color;
+          svg += `<g class="graph-node" data-id="${n.id}">`;
+          svg += `<circle cx="${n.x}" cy="${n.y}" r="${r}" fill="none" stroke="${n.color}" stroke-width="2" stroke-opacity="0.8" style="filter:drop-shadow(0 0 6px ${glow}40)" />`;
+          svg += `<circle cx="${n.x}" cy="${n.y}" r="${r-4}" fill="${n.color}15" stroke="none" />`;
+          svg += `<text x="${n.x}" y="${n.y + r + 14}" text-anchor="middle" class="graph-node-label" fill="${n.color}">${escapeHtml(n.label)}</text>`;
+          if (n.sub) {
+            svg += `<text x="${n.x}" y="${n.y + r + 28}" text-anchor="middle" font-size="8" fill="var(--text-dim)" font-family="var(--font-mono)">${escapeHtml(n.sub)}</text>`;
+          }
+          svg += `</g>`;
+        });
+
+        svg += '</svg></div>';
+        main.innerHTML = svg;
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    };
+    renderGraph();
     return () => { cancelled = true; };
   });
 
@@ -457,4 +563,19 @@
     })();
     return () => { cancelled = true; };
   });
+})();
+
+// ── Init ───────────────────────────────────────────────────
+(async function init() {
+  try {
+    const status = await apiGet('/api/sliver/status');
+    const badge = document.getElementById('conn-badge');
+    if (badge && status) {
+      badge.className = status.connected ? 'conn-badge online' : 'conn-badge offline';
+      badge.textContent = status.connected ? (status.profile_name || 'connected') : 'disconnected';
+    }
+  } catch { /* ignore */ }
+
+  // Navigate on init
+  window.router.navigate(window.location.hash || '#/dashboard');
 })();
