@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::actions::{beacons, creds, listeners, loot, payloads, sessions, websites};
+use crate::actions::{beacons, creds, listeners, loot, payloads, sessions, sliver, websites};
 use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
@@ -86,6 +86,9 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/websites", axum::routing::get(list_websites))
         .route("/api/loot", axum::routing::get(list_loot))
         .route("/api/creds", axum::routing::get(list_creds))
+        .route("/api/sliver/connect", axum::routing::post(sliver_connect))
+        .route("/api/sliver/disconnect", axum::routing::post(sliver_disconnect))
+        .route("/api/sliver/status", axum::routing::get(sliver_status))
 }
 
 async fn list_users(
@@ -422,4 +425,34 @@ async fn list_creds(
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
 
     Ok(Json(credentials))
+}
+
+async fn sliver_connect(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    axum::Json(req): axum::Json<sliver::ConnectRequest>,
+) -> Result<axum::Json<sliver::SliverStatusResponse>, (axum::http::StatusCode, String)> {
+    if req.config_path.is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "config_path is required".to_string()));
+    }
+    let status = sliver::connect(&state.sliver, &req.config_path)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(axum::Json(status))
+}
+
+async fn sliver_disconnect(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> axum::Json<sliver::SliverStatusResponse> {
+    let status = sliver::disconnect(&state.sliver).await;
+    axum::Json(status)
+}
+
+async fn sliver_status(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> axum::Json<sliver::SliverStatusResponse> {
+    let status = sliver::status(&state.sliver);
+    axum::Json(status)
 }

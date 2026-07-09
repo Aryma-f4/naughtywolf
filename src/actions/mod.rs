@@ -4,6 +4,7 @@ pub mod listeners;
 pub mod loot;
 pub mod payloads;
 pub mod sessions;
+pub mod sliver;
 pub mod websites;
 
 use crate::audit;
