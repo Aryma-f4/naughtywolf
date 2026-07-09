@@ -45,7 +45,15 @@
   // Init handles first navigation via the async init block below.
   // window.addEventListener('DOMContentLoaded', () => navigate(window.location.hash || '#/dashboard'));
 
-  window.router = { register, navigate: (hash) => { window.location.hash = hash; } };
+  window.router = {
+    register,
+    navigate: (hash) => {
+      window.location.hash = hash;
+      // Ensure rendering happens even if hash didn't change (e.g. page refresh)
+      const path = hash.replace(/^#/, '') || '/dashboard';
+      navigate(path);
+    }
+  };
 
   // ── API Layer ──────────────────────────────────────────────
 

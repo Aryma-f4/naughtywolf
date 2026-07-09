@@ -344,23 +344,24 @@ async fn kill_listener(
 async fn list_payloads(
     State(state): State<AppState>,
     _user: AuthenticatedUserGuard,
-) -> Result<
-    Json<Vec<payloads::ImplantBuildResponse>>,
-    (axum::http::StatusCode, String),
-> {
-    let mut guard = state.sliver.lock().await;
-    let conn = guard.as_mut().ok_or_else(|| {
-        (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Sliver not connected".to_string(),
-        )
-    })?;
+) -> Json<Vec<payloads::ImplantBuildResponse>> {
+    let mut builds = Vec::new();
 
-    let builds = payloads::list_builds(conn)
-        .await
-        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    // Try gRPC if connected
+    if let Ok(mut guard) = state.sliver.try_lock() {
+        if let Some(conn) = guard.as_mut() {
+            if let Ok(server_builds) = payloads::list_builds(conn).await {
+                builds.extend(server_builds);
+            }
+        }
+    }
 
-    Ok(Json(builds))
+    // Scan local payloads directory for CLI-generated files
+    if let Ok(local) = payloads::list_local_payloads().await {
+        builds.extend(local);
+    }
+
+    Json(builds)
 }
 
 async fn generate_payload_handler(

@@ -180,6 +180,46 @@ fn find_binary(name: &str, dir: &std::path::Path) -> Option<String> {
     None
 }
 
+/// Scan `./payloads` directory for locally-generated implant files.
+pub async fn list_local_payloads() -> Result<Vec<ImplantBuildResponse>, String> {
+    let dir = std::path::Path::new("./payloads");
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|e| format!("Failed to read payloads dir: {e}"))?;
+
+    let mut builds = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("Error reading dir entry: {e}"))?
+    {
+        if entry.metadata().await.map(|m| m.is_file()).unwrap_or(false) {
+            let name = entry.file_name().to_string_lossy().trim().to_string();
+            builds.push(ImplantBuildResponse {
+                name,
+                is_beacon: false,
+                goos: "local".into(),
+                goarch: "local".into(),
+                debug: false,
+                format: 2, // EXECUTABLE
+                template_name: "cli-generated".into(),
+                include_mtls: false,
+                include_http: false,
+                include_wg: false,
+                include_dns: false,
+                beacon_interval: 0,
+                beacon_jitter: 0,
+                is_staged: false,
+            });
+        }
+    }
+    Ok(builds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
