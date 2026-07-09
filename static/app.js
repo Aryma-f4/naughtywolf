@@ -128,6 +128,24 @@
 
   window.escapeHtml = escapeHtml;
 
+  // ── Toast / Notification system ──────────────────────────
+
+  const toastContainer = document.createElement('div');
+  toastContainer.style.cssText = 'position:fixed;top:16px;right:16px;z-index:9999;display:flex;flex-direction:column;gap:8px;';
+  document.addEventListener('DOMContentLoaded', () => document.body.appendChild(toastContainer));
+
+  window.showToast = function(msg, type) {
+    type = type || 'info';
+    const el = document.createElement('div');
+    el.style.cssText = `padding:10px 16px;border-radius:6px;font-size:0.8rem;background:var(--bg-panel);border:1px solid;min-width:280px;box-shadow:0 4px 16px rgba(0,0,0,0.4);transition:opacity 0.3s;font-family:var(--font-mono)`;
+    if (type === 'error') el.style.borderColor = 'var(--red)'; el.style.color = 'var(--red)';
+    if (type === 'success') { el.style.borderColor = 'var(--green)'; el.style.color = 'var(--green)'; }
+    if (type === 'info') { el.style.borderColor = 'var(--cyan)'; el.style.color = 'var(--cyan-soft)'; }
+    el.textContent = msg;
+    toastContainer.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 4000);
+  };
+
   // ── Connection badge helper ────────────────────────────────
 
   window.updateConnBadge = async function() {
@@ -208,7 +226,66 @@
     return () => { cancelled = true; };
   });
 
+  // ── Settings / Connect ──────────────────────────────────
+  window.router.register('/settings', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const status = await apiGet('/api/sliver/status').catch(() => ({connected:false}));
+        if (cancelled) return;
+        const connState = status.connected
+          ? `<div class="notice notice-success">Connected — ${escapeHtml(status.profile_name || '')} (${escapeHtml(status.operator || '')}@${escapeHtml(status.lhost || '')})</div>`
+          : '<div class="notice notice-info">Not connected to any Sliver server.</div>';
+        const formHtml = status.connected
+          ? `<button class="btn btn-danger" id="btn-disconnect">Disconnect</button>`
+          : `<div class="field"><label>Config Path</label><input class="input" id="cfg-path" placeholder="/path/to/operator.cfg"></div>
+             <div><button class="btn btn-primary" id="btn-connect">Connect</button></div>`;
+        main.innerHTML = `
+          <div class="panel">
+            <div class="panel-header"><h3>Sliver Connection</h3></div>
+            <div class="panel-body">
+              ${connState}
+              <div style="display:flex;gap:12px;margin-top:12px;">${formHtml}</div>
+              <div id="conn-status" style="margin-top:12px;"></div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-header"><h3>About</h3></div>
+            <div class="panel-body" style="font-size:0.8rem;color:var(--text-muted);line-height:1.8;">
+              NaughtyWolf v0.1.0 — Sliver C2 Web Console<br>
+              Connect to a Sliver server to manage listeners, implants, and payloads.
+            </div>
+          </div>`;
+        document.getElementById('btn-connect')?.addEventListener('click', async () => {
+          const path = document.getElementById('cfg-path')?.value;
+          if (!path) return;
+          const st = document.getElementById('conn-status');
+          st.innerHTML = '<span style="color:var(--cyan)">Connecting...</span>';
+          try {
+            const r = await apiPost('/api/sliver/connect', {config_path: path});
+            showToast('Connected to Sliver server', 'success');
+            window.router.navigate('#/settings');
+          } catch(e) {
+            st.innerHTML = `<span style="color:var(--red)">${escapeHtml(e.message)}</span>`;
+          }
+        });
+        document.getElementById('btn-disconnect')?.addEventListener('click', async () => {
+          try {
+            await apiPost('/api/sliver/disconnect', {});
+            showToast('Disconnected', 'info');
+            window.router.navigate('#/settings');
+          } catch(e) { showToast(e.message, 'error'); }
+        });
+      } catch(e) {
+        if (!cancelled) main.innerHTML = window.renderError(e.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+
   // ── Chain Graph ──────────────────────────────────────────
+  
   window.router.register('/graph', function(main) {
     let cancelled = false;
     const renderGraph = async () => {
@@ -221,89 +298,23 @@
           apiGet('/api/beacons').catch(() => []),
         ]);
         if (cancelled) return;
-
         const W = 900, H = 500;
-        const COL1 = 150, COL2 = 350, COL3 = 600, COL4 = 780;
-        const SPACING = 80;
-
-        const nodes = [];
-        const edges = [];
-
+        const COL1 = 150, COL2 = 350, COL3 = 600, SPACING = 80;
+        const nodes = [], edges = [];
         const rootLabel = status.connected ? (status.profile_name || 'Sliver Server') : 'Sliver (disconnected)';
-        nodes.push({ id: 'root', label: rootLabel, x: COL1, y: 250, color: status.connected ? '#38bdf8' : '#7895b8', type: 'server' });
-
-        const listenArr = Array.isArray(listeners) ? listeners : [];
-        listenArr.forEach((l, i) => {
-          const y = 100 + i * SPACING;
-          const nid = `listener-${l.id}`;
-          nodes.push({ id: nid, label: `${l.protocol}:${l.port}`, sub: l.bind, x: COL2, y, color: '#34d399', type: 'listener' });
-          edges.push({ from: 'root', to: nid, label: 'listener' });
-        });
-        if (listenArr.length === 0) {
-          nodes.push({ id: 'no-listener', label: 'No listeners', x: COL2, y: 250, color: '#7895b8', type: 'empty' });
-        }
-
-        const sessArr = Array.isArray(sessions) ? sessions : [];
-        const beaconArr = Array.isArray(beacons) ? beacons : [];
-        const implants = [
-          ...sessArr.map(s => ({ ...s, implantType: 'session' })),
-          ...beaconArr.map(b => ({ ...b, implantType: 'beacon' })),
-        ];
-        const col3Count = Math.max(implants.length, 1);
-        implants.forEach((im, i) => {
-          const y = 60 + i * Math.min(SPACING, 480 / col3Count);
-          const nid = `implant-${im.id || i}`;
-          const statusColor = (im.status === 'Active' || im.status === 'active') ? '#34d399' : '#fb7185';
-          nodes.push({
-            id: nid,
-            label: im.hostname || im.name || `implant-${i}`,
-            sub: `${im.implantType} | ${im.transport || '?'}`,
-            x: COL3,
-            y,
-            color: statusColor,
-            type: im.implantType,
-          });
-          const transport = (im.transport || '').toLowerCase();
-          const match = listenArr.find(l => transport.includes(l.protocol.toLowerCase()));
-          if (match) {
-            edges.push({ from: `listener-${match.id}`, to: nid, label: 'implant' });
-          } else {
-            edges.push({ from: 'root', to: nid, label: 'implant' });
-          }
-        });
-        if (implants.length === 0) {
-          nodes.push({ id: 'no-implant', label: 'No implants', x: COL3, y: 250, color: '#7895b8', type: 'empty' });
-        }
-
-        let svg = `<div class="graph-toolbar"><button class="btn btn-ghost btn-sm" onclick="window.router.navigate('#/graph')">⟳ Refresh</button><span style="font-size:0.75rem;color:var(--text-dim)">${implants.length} implant(s), ${listenArr.length} listener(s)</span></div>`;
-        svg += `<div class="graph-container"><svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
-        svg += `<defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(56,189,248,0.04)" stroke-width="1"/></pattern></defs>`;
-        svg += `<rect width="${W}" height="${H}" fill="url(#grid)" />`;
-
-        edges.forEach(e => {
-          const from = nodes.find(n => n.id === e.from);
-          const to = nodes.find(n => n.id === e.to);
-          if (!from || !to) return;
-          svg += `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" class="graph-edge active" />`;
-          const mx = (from.x + to.x) / 2;
-          const my = (from.y + to.y) / 2 - 8;
-          svg += `<text x="${mx}" y="${my}" text-anchor="middle" fill="var(--text-dim)" font-size="9" font-family="var(--font-mono)">${escapeHtml(e.label)}</text>`;
-        });
-
-        nodes.forEach(n => {
-          const r = n.type === 'server' ? 32 : 24;
-          const glow = n.color;
-          svg += `<g class="graph-node" data-id="${n.id}">`;
-          svg += `<circle cx="${n.x}" cy="${n.y}" r="${r}" fill="none" stroke="${n.color}" stroke-width="2" stroke-opacity="0.8" style="filter:drop-shadow(0 0 6px ${glow}40)" />`;
-          svg += `<circle cx="${n.x}" cy="${n.y}" r="${r-4}" fill="${n.color}15" stroke="none" />`;
-          svg += `<text x="${n.x}" y="${n.y + r + 14}" text-anchor="middle" class="graph-node-label" fill="${n.color}">${escapeHtml(n.label)}</text>`;
-          if (n.sub) {
-            svg += `<text x="${n.x}" y="${n.y + r + 28}" text-anchor="middle" font-size="8" fill="var(--text-dim)" font-family="var(--font-mono)">${escapeHtml(n.sub)}</text>`;
-          }
-          svg += `</g>`;
-        });
-
-        svg += '</svg></div>';
+        nodes.push({ id:'root', label:rootLabel, x:COL1, y:250, color:status.connected ? '#38bdf8' : '#7895b8', type:'server' });
+        const la = Array.isArray(listeners)?listeners:[];
+        la.forEach((l,i)=>{const y=100+i*SPACING;nodes.push({id:'l-'+l.id,label:l.protocol+':'+l.port,sub:l.bind,x:COL2,y,color:'#34d399',type:'listener'});edges.push({from:'root',to:'l-'+l.id,label:'listener'});});
+        if(!la.length)nodes.push({id:'nl',label:'No listeners',x:COL2,y:250,color:'#7895b8',type:'empty'});
+        const sa=Array.isArray(sessions)?sessions:[],ba=Array.isArray(beacons)?beacons:[];
+        const imps=[...sa.map(s=>({...s,it:'session'})),...ba.map(b=>({...b,it:'beacon'}))];
+        imps.forEach((im,i)=>{const y=60+i*Math.min(SPACING,480/Math.max(imps.length,1));const nid='im-'+i;const sc=(im.status==='Active'||im.status==='active')?'#34d399':'#fb7185';nodes.push({id:nid,label:im.hostname||im.name||'implant-'+i,sub:im.it+' | '+(im.transport||'?'),x:COL3,y,color:sc,type:im.it});const t=(im.transport||'').toLowerCase();const m=la.find(l=>t.includes(l.protocol.toLowerCase()));edges.push({from:m?'l-'+m.id:'root',to:nid,label:'implant'});});
+        if(!imps.length)nodes.push({id:'ni',label:'No implants',x:COL3,y:250,color:'#7895b8',type:'empty'});
+        var nodeMap={};nodes.forEach(function(n){nodeMap[n.id]=n;});
+        var svg='<div class=\"graph-toolbar\"><button class=\"btn btn-ghost btn-sm\" onclick=\"window.router.navigate(\'#/graph\')\">\u27f3 Refresh</button><span style=\"font-size:0.75rem;color:var(--text-dim)\">'+imps.length+' implant(s), '+la.length+' listener(s)</span></div><div class=\"graph-container\"><svg viewBox=\"0 0 900 500\" xmlns=\"http://www.w3.org/2000/svg\"><defs><pattern id=\"g\" width=\"40\" height=\"40\" patternUnits=\"userSpaceOnUse\"><path d=\"M 40 0 L 0 0 0 40\" fill=\"none\" stroke=\"rgba(56,189,248,0.04)\" stroke-width=\"1\"/></pattern></defs><rect width=\"900\" height=\"500\" fill=\"url(#g)\"/>';
+        edges.forEach(function(e){var f=nodeMap[e.from],t=nodeMap[e.to];if(!f||!t)return;svg+='<line x1=\"'+f.x+'\" y1=\"'+f.y+'\" x2=\"'+t.x+'\" y2=\"'+t.y+'\" class=\"graph-edge active\" />';svg+='<text x=\"'+((f.x+t.x)/2)+'\" y=\"'+((f.y+t.y)/2-8)+'\" text-anchor=\"middle\" fill=\"var(--text-dim)\" font-size=\"9\" font-family=\"var(--font-mono)\">'+e.label+'</text>';});
+        nodes.forEach(function(n){var r=n.type==='server'?32:24;var h=escapeHtml(n.label)+' | '+escapeHtml(n.type)+' | '+(n.sub||'');svg+='<g class=\"graph-node\" data-id=\"'+n.id+'\" style=\"cursor:pointer\" onmouseover=\"(function(){var d=document.getElementById(\'gd\');d.style.display=\"block\";d.innerHTML=\"<h4>'+n.label.replace(/"/g,'&quot;')+'</h4><div class=\\'detail-row\\'><span>Type</span><span>'+n.type+'</span></div><div class=\\'detail-row\\'><span>ID</span><span>'+n.id+'</span></div>'+'\"})()\" onmouseout=\"document.getElementById(\'gd\').style.display=\"none\"\">';svg+='<circle cx=\"'+n.x+'\" cy=\"'+n.y+'\" r=\"'+r+'\" fill=\"none\" stroke=\"'+n.color+'\" stroke-width=\"2\" stroke-opacity=\"0.8\" style=\"filter:drop-shadow(0 0 6px '+n.color+'40)\" />';svg+='<circle cx=\"'+n.x+'\" cy=\"'+n.y+'\" r=\"'+(r-4)+'\" fill=\"'+n.color+'15\" stroke=\"none\" />';svg+='<text x=\"'+n.x+'\" y=\"'+(n.y+r+14)+'\" text-anchor=\"middle\" class=\"graph-node-label\" fill=\"'+n.color+'\">'+escapeHtml(n.label)+'</text>';if(n.sub)svg+='<text x=\"'+n.x+'\" y=\"'+(n.y+r+28)+'\" text-anchor=\"middle\" font-size=\"8\" fill=\"var(--text-dim)\" font-family=\"var(--font-mono)\">'+escapeHtml(n.sub)+'</text>';svg+='</g>';});
+        svg+='</svg></div><div id=\"gd\" class=\"graph-details\" style=\"display:none;position:absolute;right:12px;top:12px;background:var(--bg-panel);border:1px solid var(--border-subtle);border-radius:6px;padding:8px 14px;min-width:180px;font-size:0.75rem;z-index:10;\"></div>';
         main.innerHTML = svg;
       } catch (err) {
         if (!cancelled) main.innerHTML = window.renderError(err.message);
@@ -376,26 +387,65 @@
   window.router.register('/listeners', function(main) {
     main.innerHTML = window.renderLoading();
     let cancelled = false;
-    (async () => {
+    const loadListeners = async () => {
       try {
-        const listeners = await apiGet('/api/listeners');
-        if (cancelled) return;
-        if (!listeners || listeners.length === 0) {
-          main.innerHTML = window.renderEmpty('👂', 'No Listeners', 'Connect to Sliver and start a listener job.');
-          return;
-        }
-        const rows = listeners.map(l => [
-          escapeHtml(l.id),
-          escapeHtml(l.protocol),
-          escapeHtml(l.bind),
-          `<span class="badge badge-active">${escapeHtml(l.status)}</span>`,
+        const l = await apiGet('/api/listeners');
+        if (cancelled) return '';
+        if (!l || l.length === 0) return '<div class="empty-state"><div class="empty-icon">👂</div><h3>No Listeners</h3><p>Start a listener to see it here.</p></div>';
+        const rows = l.map(lst => [
+          escapeHtml(lst.id),
+          escapeHtml(lst.protocol),
+          escapeHtml(lst.bind),
+          `<span class="badge badge-active">${escapeHtml(lst.status)}</span>`,
+          `<button class="btn btn-danger btn-sm" data-kill="${lst.id}">Kill</button>`,
         ]);
-        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Active Listeners</h3></div><div class="panel-body">'
-          + window.renderTable(['ID','Protocol','Bind','Status'], rows)
-          + '</div></div>';
-      } catch (err) {
-        if (!cancelled) main.innerHTML = window.renderError(err.message);
-      }
+        const table = window.renderTable(['ID','Protocol','Bind','Status','Actions'], rows);
+        return `<div class="panel"><div class="panel-header"><h3>Active Listeners (${l.length})</h3></div><div class="panel-body">${table}</div></div>`;
+      } catch { return '<div class="empty-state"><div class="empty-icon">⚠</div><h3>Error</h3><p>Failed to load listeners.</p></div>'; }
+    };
+    (async () => {
+      const createForm = `
+<div class="panel" style="margin-bottom:1rem;">
+  <div class="panel-header"><h3>Start Listener</h3></div>
+  <div class="panel-body">
+    <form id="listener-form" class="form-grid">
+      <div class="field"><label>Protocol</label><select class="select" id="lst-proto"><option value="mtls">mTLS</option><option value="http">HTTP</option></select></div>
+      <div class="field"><label>Host</label><input class="input" id="lst-host" value="0.0.0.0"></div>
+      <div class="field"><label>Port</label><input class="input" id="lst-port" type="number" value="8888"></div>
+      <div class="field"><label>Domain</label><input class="input" id="lst-domain" placeholder="optional"></div>
+      <div class="field full" style="grid-column:span 2;"><button type="submit" class="btn btn-primary">Start</button><span id="lst-msg" style="margin-left:12px;font-size:0.8rem;"></span></div>
+    </form>
+  </div>
+</div>`;
+      const tableHtml = await loadListeners();
+      if (cancelled) return;
+      main.innerHTML = createForm + tableHtml;
+      document.getElementById('listener-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const msg = document.getElementById('lst-msg');
+        msg.textContent = 'Starting...'; msg.style.color = 'var(--cyan)';
+        try {
+          const r = await apiPost('/api/listeners', {
+            protocol: document.getElementById('lst-proto').value,
+            host: document.getElementById('lst-host').value,
+            port: parseInt(document.getElementById('lst-port').value),
+            domain: document.getElementById('lst-domain').value || null,
+          });
+          if (r.success) { showToast(r.message, 'success'); window.router.navigate('#/listeners'); }
+          else { msg.textContent = r.message; msg.style.color = 'var(--red)'; }
+        } catch(e) { msg.textContent = e.message; msg.style.color = 'var(--red)'; }
+      });
+      // Kill buttons (delegation)
+      main.addEventListener('click', async (e) => {
+        const btn = e.target.closest('[data-kill]');
+        if (!btn) return;
+        const id = btn.dataset.kill;
+        try {
+          await apiPost('/api/listeners/kill/' + id, {});
+          showToast('Listener ' + id + ' killed', 'info');
+          window.router.navigate('#/listeners');
+        } catch(e) { showToast(e.message, 'error'); }
+      });
     })();
     return () => { cancelled = true; };
   });
@@ -404,10 +454,10 @@
   window.router.register('/payloads', function(main) {
     main.innerHTML = window.renderLoading();
     let cancelled = false;
-    (async () => {
+    const loadPayloads = async () => {
       try {
         const builds = await apiGet('/api/payloads');
-        if (cancelled) return;
+        if (cancelled) return '';
         const fmtNames = ['executable','shared lib','shellcode','service'];
         const rows = (builds || []).map(b => [
           escapeHtml(b.name),
@@ -415,14 +465,51 @@
           b.is_beacon ? 'beacon' : 'session',
           fmtNames[b.format] || 'unknown',
         ]);
-        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Implant Builds</h3></div><div class="panel-body">'
-          + (rows.length > 0
-              ? window.renderTable(['Name','OS/Arch','Type','Format'], rows)
-              : '<div class="empty-state"><div class="empty-icon">📦</div><h3>No Payloads</h3><p>Generate a payload to see it here.</p></div>')
-          + '</div></div>';
-      } catch (err) {
-        if (!cancelled) main.innerHTML = window.renderError(err.message);
-      }
+        return rows.length > 0
+          ? window.renderTable(['Name','OS/Arch','Type','Format'], rows)
+          : '<div class="empty-state"><div class="empty-icon">📦</div><h3>No Payloads</h3><p>Generate a payload to see it here.</p></div>';
+      } catch { return '<div class="empty-state"><div class="empty-icon">⚠</div><h3>Error</h3><p>Failed to load payloads.</p></div>'; }
+    };
+    (async () => {
+      const genForm = `
+<div class="panel" style="margin-bottom:1rem;">
+  <div class="panel-header"><h3>Generate Implant</h3></div>
+  <div class="panel-body">
+    <form id="gen-form" class="form-grid">
+      <div class="field"><label>Name</label><input class="input" id="gen-name" placeholder="myimplant"></div>
+      <div class="field"><label>Protocol</label><select class="select" id="gen-proto"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="mtls">mTLS</option><option value="dns">DNS</option></select></div>
+      <div class="field"><label>OS</label><select class="select" id="gen-os"><option value="linux">Linux</option><option value="windows">Windows</option><option value="darwin">macOS</option></select></div>
+      <div class="field"><label>LHost</label><input class="input" id="gen-lhost" placeholder="0.0.0.0"></div>
+      <div class="field"><label>Arch</label><select class="select" id="gen-arch"><option value="amd64">amd64</option><option value="386">386</option><option value="arm64">arm64</option></select></div>
+      <div class="field"><label>LPort</label><input class="input" id="gen-lport" type="number" value="443"></div>
+      <div class="field"><label>Format</label><select class="select" id="gen-fmt"><option value="exe">EXE</option><option value="shared">Shared</option><option value="shellcode">Shellcode</option><option value="service">Service</option></select></div>
+      <div class="field" style="justify-content:flex-end;"><label><input type="checkbox" id="gen-beacon"> Beacon mode</label></div>
+      <div class="field full" style="grid-column:span 2;"><button type="submit" class="btn btn-primary">Generate</button><span id="gen-msg" style="margin-left:12px;font-size:0.8rem;"></span></div>
+    </form>
+  </div>
+</div>`;
+      const tableContent = await loadPayloads();
+      if (cancelled) return;
+      main.innerHTML = genForm + '<div class="panel"><div class="panel-header"><h3>Implant Builds</h3></div><div class="panel-body">' + tableContent + '</div></div>';
+      document.getElementById('gen-form')?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const msg = document.getElementById('gen-msg');
+        msg.textContent = 'Generating...'; msg.style.color = 'var(--cyan)';
+        try {
+          const r = await apiPost('/api/payloads/generate', {
+            name: document.getElementById('gen-name').value,
+            goos: document.getElementById('gen-os').value,
+            goarch: document.getElementById('gen-arch').value,
+            format: document.getElementById('gen-fmt').value,
+            is_beacon: document.getElementById('gen-beacon').checked,
+            protocol: document.getElementById('gen-proto').value,
+            lhost: document.getElementById('gen-lhost').value,
+            lport: parseInt(document.getElementById('gen-lport').value),
+          });
+          if (r.success) { msg.textContent = 'Done!'; msg.style.color = 'var(--green)'; showToast(r.message, 'success'); window.router.navigate('#/payloads'); }
+          else { msg.textContent = r.message; msg.style.color = 'var(--red)'; }
+        } catch(e) { msg.textContent = e.message; msg.style.color = 'var(--red)'; }
+      });
     })();
     return () => { cancelled = true; };
   });
@@ -579,3 +666,16 @@
   // Navigate on init
   window.router.navigate(window.location.hash || '#/dashboard');
 })();
+
+// ── Auto-refresh connection status every 15s ──────────────
+setInterval(() => {
+  document.getElementById('conn-badge')?.textContent === 'checking...' ? null : null;
+  try {
+    apiGet('/api/sliver/status').then(status => {
+      const badge = document.getElementById('conn-badge');
+      if (!badge) return;
+      badge.className = status.connected ? 'conn-badge online' : 'conn-badge offline';
+      badge.textContent = status.connected ? (status.profile_name || 'connected') : 'disconnected';
+    }).catch(() => {});
+  } catch(e) {}
+}, 15000);
