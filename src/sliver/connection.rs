@@ -50,7 +50,10 @@ impl SliverConnection {
         // Parse CA certificate
         let ca = Certificate::from_pem(profile.ca_certificate.as_bytes());
 
-        let tls = ClientTlsConfig::new().ca_certificate(ca).identity(identity);
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(ca)
+            .identity(identity)
+            .domain_name("operators");
 
         let addr = format!("{}:{}", profile.lhost, profile.lport);
 
