@@ -207,4 +207,202 @@
     return () => { cancelled = true; };
   });
 
+  // ── Sessions ──────────────────────────────────────────────
+  window.router.register('/sessions', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const sessions = await apiGet('/api/sessions');
+        if (cancelled) return;
+        if (!sessions || sessions.length === 0) {
+          main.innerHTML = window.renderEmpty('💻', 'No Sessions', 'Connect to Sliver and wait for implants to check in.');
+          return;
+        }
+        const rows = sessions.map(s => [
+          escapeHtml(s.id),
+          escapeHtml(s.name),
+          escapeHtml(s.hostname),
+          escapeHtml(s.username),
+          escapeHtml(s.transport),
+          `<span class="badge ${s.status === 'Active' ? 'badge-active' : 'badge-dead'}">${escapeHtml(s.status)}</span>`,
+        ]);
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Sessions</h3></div><div class="panel-body">'
+          + window.renderTable(['ID','Name','Hostname','User','Transport','Status'], rows)
+          + '</div></div>';
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+
+  // ── Beacons ──────────────────────────────────────────────
+  window.router.register('/beacons', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const beacons = await apiGet('/api/beacons');
+        if (cancelled) return;
+        if (!beacons || beacons.length === 0) {
+          main.innerHTML = window.renderEmpty('📡', 'No Beacons', 'Connect to Sliver and wait for beacons to check in.');
+          return;
+        }
+        const rows = beacons.map(b => [
+          escapeHtml(b.name),
+          escapeHtml(b.hostname),
+          escapeHtml(b.transport),
+          escapeHtml(b.last_checkin),
+          `<span class="badge ${b.status === 'Active' ? 'badge-active' : 'badge-dead'}">${escapeHtml(b.status)}</span>`,
+        ]);
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Beacons</h3></div><div class="panel-body">'
+          + window.renderTable(['Name','Hostname','Transport','Last Checkin','Status','ID'], rows)
+          + '</div></div>';
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+
+  // ── Listeners ────────────────────────────────────────────
+  window.router.register('/listeners', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const listeners = await apiGet('/api/listeners');
+        if (cancelled) return;
+        if (!listeners || listeners.length === 0) {
+          main.innerHTML = window.renderEmpty('👂', 'No Listeners', 'Connect to Sliver and start a listener job.');
+          return;
+        }
+        const rows = listeners.map(l => [
+          escapeHtml(l.id),
+          escapeHtml(l.protocol),
+          escapeHtml(l.bind),
+          `<span class="badge badge-active">${escapeHtml(l.status)}</span>`,
+        ]);
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Active Listeners</h3></div><div class="panel-body">'
+          + window.renderTable(['ID','Protocol','Bind','Status'], rows)
+          + '</div></div>';
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+
+  // ── Payloads ─────────────────────────────────────────────
+  window.router.register('/payloads', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const builds = await apiGet('/api/payloads');
+        if (cancelled) return;
+        const fmtNames = ['executable','shared lib','shellcode','service'];
+        const rows = (builds || []).map(b => [
+          escapeHtml(b.name),
+          `${escapeHtml(b.goos)}/${escapeHtml(b.goarch)}`,
+          b.is_beacon ? 'beacon' : 'session',
+          fmtNames[b.format] || 'unknown',
+        ]);
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Implant Builds</h3></div><div class="panel-body">'
+          + (rows.length > 0
+              ? window.renderTable(['Name','OS/Arch','Type','Format'], rows)
+              : '<div class="empty-state"><div class="empty-icon">📦</div><h3>No Payloads</h3><p>Generate a payload to see it here.</p></div>')
+          + '</div></div>';
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+
+  // ── Websites ─────────────────────────────────────────────
+  window.router.register('/websites', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const sites = await apiGet('/api/websites');
+        if (cancelled) return;
+        if (!sites || sites.length === 0) {
+          main.innerHTML = window.renderEmpty('🌐', 'No Websites', 'Connect to Sliver and configure websites.');
+          return;
+        }
+        const rows = sites.map(s => [
+          escapeHtml(s.id || s.name),
+          escapeHtml(s.name),
+          String(s.content_count || 0),
+          String(s.total_size || 0) + ' bytes',
+        ]);
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Websites</h3></div><div class="panel-body">'
+          + window.renderTable(['ID','Name','Content Items','Total Size'], rows)
+          + '</div></div>';
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+
+  // ── Loot ─────────────────────────────────────────────────
+  window.router.register('/loot', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const items = await apiGet('/api/loot');
+        if (cancelled) return;
+        if (!items || items.length === 0) {
+          main.innerHTML = window.renderEmpty('💰', 'No Loot', 'Connect to Sliver and collect loot from implants.');
+          return;
+        }
+        const rows = items.map(l => [
+          escapeHtml(l.id || l.name),
+          escapeHtml(l.name),
+          escapeHtml(l.file_type || 'unknown'),
+          String(l.size || 0) + ' bytes',
+        ]);
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Loot</h3></div><div class="panel-body">'
+          + window.renderTable(['ID','Name','File Type','Size'], rows)
+          + '</div></div>';
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
+
+  // ── Credentials ──────────────────────────────────────────
+  window.router.register('/creds', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const creds = await apiGet('/api/creds');
+        if (cancelled) return;
+        if (!creds || creds.length === 0) {
+          main.innerHTML = window.renderEmpty('🔑', 'No Credentials', 'Connect to Sliver to manage collected credentials.');
+          return;
+        }
+        const rows = creds.map(c => [
+          escapeHtml(c.id || c.collection),
+          escapeHtml(c.username || '—'),
+          escapeHtml(c.hash_type || '—'),
+          c.is_cracked ? `<span class="badge badge-active">Yes</span>` : `<span class="badge badge-unknown">No</span>`,
+          escapeHtml(c.collection || '—'),
+        ]);
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Credentials</h3></div><div class="panel-body">'
+          + window.renderTable(['Collection','Username','Hash Type','Cracked','Collection'], rows)
+          + '</div></div>';
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  });
 })();
