@@ -678,6 +678,48 @@ svg { display: block; }
   margin-bottom: 32px;
 }
 
+.login-brand {
+  text-align: center;
+  margin-bottom: 20px;
+}
+
+.login-brand-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  border: 2px solid var(--cyan);
+  border-radius: 12px;
+  color: var(--cyan);
+  font-size: 1.2rem;
+  font-weight: 800;
+  letter-spacing: 1px;
+  background: rgba(56,189,248,0.08);
+  box-shadow: 0 0 20px var(--cyan-glow);
+}
+
+.login-footer {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.login-status {
+  color: var(--green);
+}
+
+.login-card input::placeholder {
+  color: var(--text-dim);
+  opacity: 0.5;
+}
+
 .error-message {
   background: var(--red-glow);
   border: 1px solid var(--red);
