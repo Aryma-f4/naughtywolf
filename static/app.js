@@ -560,26 +560,11 @@
             lport: parseInt(document.getElementById('gen-lport').value),
           });
           if (r.success) {
-            msg.innerHTML = '⚙️ Generating in background (2-3 min)... <span id="poll-status" style="color:var(--cyan)">⏳</span>';
-            msg.style.color = 'var(--green)';
-            showToast(r.message, 'success');
-            // Poll every 10s for 3min to detect new payload file
-            var pollCount = 0;
-            var pollTimer = setInterval(async function() {
-              pollCount++;
-              document.getElementById('poll-status').textContent = '⏳ ' + (pollCount*10) + 's';
-              try {
-                var builds = await apiGet('/api/payloads');
-                var name = document.getElementById('gen-name').value;
-                var found = (builds||[]).find(function(b) { return b.name.indexOf(name) >= 0; });
-                if (found) {
-                  document.getElementById('poll-status').textContent = '✅ Ready!';
-                  clearInterval(pollTimer);
-                  window.router.navigate('#/payloads');
-                }
-              } catch(e) {}
-              if (pollCount > 18) { clearInterval(pollTimer); document.getElementById('poll-status').textContent = '❌ Timeout'; }
-            }, 10000);
+            msg.textContent = '⏳ Generating (2-3 min). Check back or refresh page.';
+            msg.style.color = 'var(--cyan)';
+            showToast('Generation started for ' + document.getElementById('gen-name').value, 'success');
+            btn.disabled = false;
+            btn.textContent = 'Generate';
           } else {
             msg.textContent = r.message; msg.style.color = 'var(--red)'; btn.disabled = false;
           }
