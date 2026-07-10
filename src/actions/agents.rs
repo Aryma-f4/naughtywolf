@@ -263,3 +263,147 @@ pub async fn list_session_tasks(
     let _ = conn;
     Ok(Vec::new())
 }
+
+// ── File Operations ─────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct FileInfo {
+    pub name: String,
+    pub size: i64,
+    pub is_dir: bool,
+    pub mod_time: String,
+    pub mode: String,
+}
+
+#[derive(Serialize)]
+pub struct DirListResponse {
+    pub path: String,
+    pub exists: bool,
+    pub files: Vec<FileInfo>,
+}
+
+/// List directory contents on a session.
+pub async fn list_dir(
+    conn: &mut SliverConnection,
+    session_id: &str,
+    path: &str,
+) -> Result<DirListResponse, String> {
+    let req = sliverpb::LsReq {
+        path: path.to_string(),
+        request: Some(commonpb::Request {
+            r#async: false,
+            timeout: 30,
+            beacon_id: String::new(),
+            session_id: session_id.to_string(),
+        }),
+    };
+    let resp = conn.client.ls(tonic::Request::new(req))
+        .await
+        .map_err(|e| format!("Ls RPC failed: {e}"))?
+        .into_inner();
+
+    let files = resp.files.into_iter().map(|f| FileInfo {
+        name: f.name.clone(),
+        size: f.size,
+        is_dir: f.is_dir,
+        mod_time: ts_to_string(f.mod_time),
+        mode: f.mode.clone(),
+    }).collect();
+
+    Ok(DirListResponse { path: resp.path, exists: resp.exists, files })
+}
+
+#[derive(Serialize)]
+pub struct DownloadResponse {
+    pub file_name: String,
+    pub path: String,
+    pub data: Vec<u8>,
+    pub size: usize,
+}
+
+/// Download a file from a session.
+pub async fn download_file_from_session(
+    conn: &mut SliverConnection,
+    session_id: &str,
+    path: &str,
+) -> Result<DownloadResponse, String> {
+    let req = sliverpb::DownloadReq {
+        path: path.to_string(),
+        start: 0,
+        stop: 0,
+        recurse: false,
+        max_bytes: 50_000_000,
+        max_lines: 0,
+        restricted_to_file: true,
+        request: Some(commonpb::Request {
+            r#async: false,
+            timeout: 120,
+            beacon_id: String::new(),
+            session_id: session_id.to_string(),
+        }),
+    };
+    let resp = conn.client.download(tonic::Request::new(req))
+        .await
+        .map_err(|e| format!("Download RPC failed: {e}"))?
+        .into_inner();
+
+    let size = resp.data.len();
+    let fname = std::path::Path::new(&resp.path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+    Ok(DownloadResponse {
+        file_name: fname,
+        path: resp.path,
+        data: resp.data,
+        size,
+    })
+}
+
+#[derive(Deserialize)]
+pub struct UploadRequest {
+    pub path: String,
+    pub file_name: String,
+    pub data: Vec<u8>,
+    pub overwrite: bool,
+}
+
+#[derive(Serialize)]
+pub struct UploadResponse {
+    pub success: bool,
+    pub path: String,
+    pub message: String,
+}
+
+/// Upload a file to a session.
+pub async fn upload_file_to_session(
+    conn: &mut SliverConnection,
+    session_id: &str,
+    req: UploadRequest,
+) -> Result<UploadResponse, String> {
+    let r = sliverpb::UploadReq {
+        path: req.path,
+        encoder: String::new(),
+        data: req.data,
+        is_ioc: false,
+        file_name: req.file_name,
+        is_directory: false,
+        overwrite: req.overwrite,
+        request: Some(commonpb::Request {
+            r#async: false,
+            timeout: 120,
+            beacon_id: String::new(),
+            session_id: session_id.to_string(),
+        }),
+    };
+    let resp = conn.client.upload(tonic::Request::new(r))
+        .await
+        .map_err(|e| format!("Upload RPC failed: {e}"))?
+        .into_inner();
+
+    Ok(UploadResponse {
+        success: true,
+        path: resp.path.clone(),
+        message: format!("Uploaded to {}", resp.path),
+    })
+}
