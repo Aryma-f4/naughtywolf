@@ -1180,6 +1180,95 @@ window.router.register('/sessions', function(main) {
   window.router.register('/creds', function(main) {
     window.renderCredsPage();
   });
+
+  // ── Modules (Phase 2.4) ─────────────────────────────────
+  window.renderModulesPage = async function() {
+    var main = document.getElementById('main-content');
+    if (!main) return;
+    var html = '<div class="panel">'
+      + '<div class="panel-header"><h3>Sliver Modules</h3>'
+      + '<div style="display:flex;gap:8px;align-items:center">'
+      + '<input class="input" id="mod-search" placeholder="Filter modules" style="font-size:0.8rem;max-width:280px">'
+      + '<button class="btn btn-ghost btn-sm" id="mod-refresh">↻ Refresh</button>'
+      + '</div>'
+      + '</div>'
+      + '<div class="panel-body">'
+      + '<div class="form-grid" style="grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border-subtle)">'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Target Session ID</label><input class="input" id="mod-session" placeholder="session-id"></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Module</label><select class="select" id="mod-name"></select></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Args (JSON)</label><input class="input" id="mod-args" placeholder=\'{"k":"v"}\'></div>'
+      + '<div style="grid-column:span 3;display:flex;gap:8px;align-items:center">'
+      + '<label style="font-size:0.75rem"><input type="checkbox" id="mod-srv"> Run on server (relay)</label>'
+      + '<button type="button" class="btn btn-primary btn-sm" id="mod-exec">Execute</button>'
+      + '<span id="mod-status" style="font-size:0.8rem;color:var(--text-muted)"></span>'
+      + '</div>'
+      + '</div>'
+      + '<div id="mod-out" style="margin-top:8px;font-family:var(--font-mono);font-size:0.8rem;background:var(--bg-app);padding:8px;border-radius:4px;min-height:30px;max-height:240px;overflow-y:auto;white-space:pre-wrap"></div>'
+      + '<div id="mod-list" style="margin-top:12px"></div>'
+      + '</div></div>';
+    main.innerHTML = html;
+
+    function renderModList(items) {
+      var q = (document.getElementById('mod-search')?.value || '').toLowerCase().trim();
+      var filtered = q ? items.filter(function(m) { return m.name.toLowerCase().indexOf(q) >= 0; }) : items;
+      var list = document.getElementById('mod-list');
+      var sel = document.getElementById('mod-name');
+      if (!filtered.length) {
+        list.innerHTML = '<div class="empty-state"><div class="empty-icon">⌘</div><h3>No modules loaded</h3><p>Run <code>sliver-client armory install ...</code> on the server.</p></div>';
+        sel.innerHTML = '<option value="">No modules</option>';
+        return;
+      }
+      var rows = filtered.map(function(m) {
+        var badge = m.server_store ? '<span class="badge badge-active">server</span>' : '<span class="badge badge-unknown">agent</span>';
+        return ['<strong>' + escapeHtml(m.name) + '</strong>', badge];
+      });
+      list.innerHTML = '<h4 style="font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px">Available (' + filtered.length + ')</h4>'
+        + window.renderTable(['Name', 'Source'], rows);
+      sel.innerHTML = '<option value="">Select module...</option>'
+        + filtered.map(function(m) { return '<option value="' + escapeHtml(m.name) + '">' + escapeHtml(m.name) + '</option>'; }).join('');
+    }
+
+    function load() {
+      apiGet('/api/modules').then(function(data) {
+        window.__modData = data || [];
+        renderModList(window.__modData);
+      }).catch(function(e) {
+        document.getElementById('mod-list').innerHTML = '<div class="empty-state"><div class="empty-icon">⚠</div><h3>Error</h3><p>' + escapeHtml(e.message) + '</p></div>';
+      });
+    }
+
+    document.getElementById('mod-search')?.addEventListener('input', function() {
+      renderModList(window.__modData || []);
+    });
+    document.getElementById('mod-refresh')?.addEventListener('click', load);
+
+    document.getElementById('mod-exec')?.addEventListener('click', function() {
+      var sid = document.getElementById('mod-session').value.trim();
+      var mod = document.getElementById('mod-name').value;
+      var argsRaw = document.getElementById('mod-args').value.trim();
+      var srv = document.getElementById('mod-srv').checked;
+      var status = document.getElementById('mod-status');
+      var out = document.getElementById('mod-out');
+      if (!sid) { status.textContent = '⚠ Session ID required'; return; }
+      if (!mod) { status.textContent = '⚠ Select a module'; return; }
+      var body = { server_store: srv ? true : undefined, args: argsRaw || undefined };
+      apiPost('/api/agents/' + encodeURIComponent(sid) + '/modules/' + encodeURIComponent(mod) + '/exec', body)
+        .then(function(r) {
+          status.textContent = '✅ ' + r.message;
+          out.textContent = r.output || '(no output)';
+        })
+        .catch(function(err) {
+          status.textContent = '❌ ' + err.message;
+          out.textContent = '';
+        });
+    });
+
+    load();
+  };
+
+  window.router.register('/modules', function(main) {
+    window.renderModulesPage();
+  });
 })();
 
 // ── Init ───────────────────────────────────────────────────

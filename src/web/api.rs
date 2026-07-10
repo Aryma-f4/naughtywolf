@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::actions::{agents, beacons, creds, hosts, listeners, loot, payloads, sessions, sliver, websites};
+use crate::actions::{agents, beacons, creds, hosts, listeners, loot, modules, payloads, sessions, sliver, websites};
 use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
@@ -104,6 +104,8 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/agents/{id}/fs/ls", axum::routing::post(agent_ls_handler))
         .route("/api/agents/{id}/fs/download", axum::routing::get(agent_download_handler))
         .route("/api/agents/{id}/fs/upload", axum::routing::post(agent_upload_handler))
+        .route("/api/modules", axum::routing::get(list_modules_handler))
+        .route("/api/agents/{id}/modules/{name}/exec", axum::routing::post(exec_module_handler))
 }
 
 async fn list_users(
@@ -890,6 +892,47 @@ async fn agent_upload_handler(
     let resp = agents::upload_file_to_session(conn, &id, req)
         .await
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(resp))
+}
+
+async fn list_modules_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<Json<Vec<modules::ModuleInfo>>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let mods = modules::list_modules(conn).await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(mods))
+}
+
+async fn exec_module_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path((id, name)): Path<(String, String)>,
+    axum::Json(req): axum::Json<modules::ExecModuleRequest>,
+) -> Result<Json<modules::ExecModuleResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let resp = modules::exec_module(conn, &id, &name, req).await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "exec_module",
+        "module",
+        Some(name.clone()),
+        None,
+        "success",
+    ).await;
     Ok(Json(resp))
 }
 
