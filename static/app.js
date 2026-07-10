@@ -524,7 +524,15 @@ window.router.register('/graph', function(main) {
   });
 
   // ── Agent Detail (dynamic route) ─────────────────────────
-  function renderAgentDetail(agentId) {
+  
+  // ── File Browser (added in Phase 2.2) ────────────────────
+  window.apiGetBinary = async function(url) {
+    const res = await fetch(url, { credentials: 'same-origin' });
+    if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+    const blob = await res.blob();
+    return new Uint8Array(await blob.arrayBuffer());
+  };
+function renderAgentDetail(agentId) {
     var main = document.getElementById('main-content');
     if (!main) return;
     main.innerHTML = window.renderLoading();

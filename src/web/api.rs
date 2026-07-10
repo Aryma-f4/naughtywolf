@@ -99,6 +99,9 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/agents/{id}/tasks/shell", axum::routing::post(task_shell_handler))
         .route("/api/agents/{id}/tasks/execute", axum::routing::post(task_execute_handler))
         .route("/api/agents/{id}/tasks", axum::routing::get(list_tasks_handler))
+        .route("/api/agents/{id}/fs/ls", axum::routing::post(agent_ls_handler))
+        .route("/api/agents/{id}/fs/download", axum::routing::get(agent_download_handler))
+        .route("/api/agents/{id}/fs/upload", axum::routing::post(agent_upload_handler))
 }
 
 async fn list_users(
@@ -720,6 +723,69 @@ struct ShellResponse {
     stdout: String,
     stderr: String,
     exit_code: i32,
+}
+
+#[derive(Deserialize)]
+struct LsRequest {
+    path: String,
+}
+
+async fn agent_ls_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<LsRequest>,
+) -> Result<Json<agents::DirListResponse>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let resp = agents::list_dir(conn, &id, &req.path)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(resp))
+}
+
+async fn agent_download_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<(axum::http::StatusCode, [(String, String); 2], Vec<u8>), (axum::http::StatusCode, String)> {
+    let path = params.get("path").ok_or_else(|| {
+        (axum::http::StatusCode::BAD_REQUEST, "path parameter required".to_string())
+    })?;
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let resp = agents::download_file_from_session(conn, &id, path)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok((
+        axum::http::StatusCode::OK,
+        [
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Content-Disposition".to_string(), format!("attachment; filename=\"{}\"", resp.file_name)),
+        ],
+        resp.data,
+    ))
+}
+
+async fn agent_upload_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<agents::UploadRequest>,
+) -> Result<Json<agents::UploadResponse>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let resp = agents::upload_file_to_session(conn, &id, req)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(resp))
 }
 
 async fn shell_exec_handler(
