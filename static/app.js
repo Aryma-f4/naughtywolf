@@ -457,6 +457,61 @@
     })();
     return function() { cancelled = true; };
   });
+
+  // ── Agent Detail (dynamic route) ─────────────────────────
+  function renderAgentDetail(agentId) {
+    var main = document.getElementById('main-content');
+    if (!main) return;
+    main.innerHTML = window.renderLoading();
+    (async function() {
+      try {
+        var agents = await apiGet('/api/agents');
+        var agent = (agents||[]).find(function(a) { return a.id === agentId || a.name === agentId; });
+        if (!agent) { main.innerHTML = window.renderError('Agent not found'); return; }
+        var info = '<div class="panel"><div class="panel-header"><h3>Agent: '+escapeHtml(agent.name)+'</h3></div><div class="panel-body" style="font-size:0.85rem;">'
+          + '<div class="detail-row"><span>ID</span><span>'+escapeHtml(agent.id)+'</span></div>'
+          + '<div class="detail-row"><span>Type</span><span class="badge '+(agent.type==='session'?'badge-active':'badge-unknown')+'">'+escapeHtml(agent.type)+'</span></div>'
+          + '<div class="detail-row"><span>Status</span><span class="badge '+(agent.status==='active'?'badge-active':'badge-dead')+'">'+escapeHtml(agent.status)+'</span></div>'
+          + '<div class="detail-row"><span>Hostname</span><span>'+escapeHtml(agent.hostname)+'</span></div>'
+          + '<div class="detail-row"><span>User</span><span>'+escapeHtml(agent.username)+'</span></div>'
+          + '<div class="detail-row"><span>OS/Arch</span><span>'+escapeHtml(agent.os)+'/'+escapeHtml(agent.arch)+'</span></div>'
+          + '<div class="detail-row"><span>Transport</span><span>'+escapeHtml(agent.transport)+'</span></div>'
+          + '<div class="detail-row"><span>Remote</span><span>'+escapeHtml(agent.remote_addr)+'</span></div>'
+          + '<div class="detail-row"><span>Last Checkin</span><span>'+escapeHtml(agent.last_checkin)+'</span></div>'
+          + '</div></div>';
+        var shell = '<div class="panel"><div class="panel-header"><h3>Shell (VPS)</h3></div><div class="panel-body">'
+          + '<form id="agent-shell-form"><div class="field"><label>Command</label><input class="input" id="agent-shell-cmd" placeholder="ls -la" style="font-family:var(--font-mono)"></div>'
+          + '<button type="submit" class="btn btn-primary btn-sm">Execute</button>'
+          + '<div id="agent-shell-out" style="margin-top:8px;font-family:var(--font-mono);font-size:0.8rem;white-space:pre-wrap;background:var(--bg-app);padding:8px;border-radius:4px;min-height:30px;max-height:300px;overflow-y:auto;"></div></div></div>';
+        main.innerHTML = info + shell;
+        document.getElementById('agent-shell-form')?.addEventListener('submit', async function(e) {
+          e.preventDefault();
+          var cmd = document.getElementById('agent-shell-cmd').value;
+          if (!cmd) return;
+          var out = document.getElementById('agent-shell-out');
+          out.textContent = 'Running: '+cmd+'\n---\n';
+          try {
+            var r = await apiPost('/api/shell/exec', {command: cmd});
+            out.textContent += r.stdout;
+            if (r.stderr) out.textContent += '\nSTDERR:\n'+r.stderr;
+            out.textContent += '\n---\nExit: '+r.exit_code;
+          } catch(e) { out.textContent += '\nError: '+e.message; }
+        });
+      } catch(e) { main.innerHTML = window.renderError(e.message); }
+    })();
+  }
+
+  // Override navigate to handle /agents/<id> routes
+  (function() {
+    var origNav = window.router.navigate;
+    window.router.navigate = function(hash) {
+      var path = hash.replace(/^#/,'')||'/dashboard';
+      var m = path.match(/^\/agents\/(.+)$/);
+      if (m && m[1]) { renderAgentDetail(decodeURIComponent(m[1])); return; }
+      origNav(hash);
+    };
+  })();
+
 window.router.register('/sessions', function(main) {
     main.innerHTML = window.renderLoading();
     let cancelled = false;

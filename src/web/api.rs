@@ -95,6 +95,9 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/sliver/disconnect", axum::routing::post(sliver_disconnect))
         .route("/api/sliver/status", axum::routing::get(sliver_status))
         .route("/api/shell/exec", axum::routing::post(shell_exec_handler))
+        .route("/api/agents/{id}/tasks/shell", axum::routing::post(task_shell_handler))
+        .route("/api/agents/{id}/tasks/execute", axum::routing::post(task_execute_handler))
+        .route("/api/agents/{id}/tasks", axum::routing::get(list_tasks_handler))
 }
 
 async fn list_users(
@@ -606,6 +609,84 @@ async fn sliver_status(
 ) -> axum::Json<sliver::SliverStatusResponse> {
     let status = sliver::status(&state.sliver);
     axum::Json(status)
+}
+
+// ---- Agent Task Execution Handlers ----
+
+async fn task_shell_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<agents::TaskRequest>,
+) -> Result<Json<agents::TaskResponse>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    // Override action to "shell" since this is the shell route
+    let task_req = agents::TaskRequest {
+        action: "shell".to_string(),
+        args: req.args,
+        exec_path: req.exec_path,
+    };
+
+    let resp = agents::exec_task(conn, &id, task_req)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    Ok(Json(resp))
+}
+
+async fn task_execute_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<agents::TaskRequest>,
+) -> Result<Json<agents::TaskResponse>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    // Override action to "execute" since this is the execute route
+    let task_req = agents::TaskRequest {
+        action: "execute".to_string(),
+        args: req.args,
+        exec_path: req.exec_path,
+    };
+
+    let resp = agents::exec_task(conn, &id, task_req)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    Ok(Json(resp))
+}
+
+async fn list_tasks_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<agents::TaskResponse>>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    let tasks = agents::list_session_tasks(conn, &id)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    Ok(Json(tasks))
 }
 
 #[derive(Deserialize)]

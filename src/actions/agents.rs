@@ -1,7 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::sliver::connection::SliverConnection;
-use crate::sliver::proto::commonpb;
+use crate::sliver::proto::{commonpb, sliverpb};
 
 /// Unified representation of a session or beacon agent.
 #[derive(Debug, Serialize)]
@@ -91,4 +92,174 @@ pub async fn list_agents(conn: &mut SliverConnection) -> Result<Vec<AgentRespons
     }
 
     Ok(agents)
+}
+
+/// Request body for executing a task on a Sliver agent (session or beacon).
+#[derive(Debug, Deserialize)]
+pub struct TaskRequest {
+    /// "shell" to run a shell command, or "execute" to run a program
+    pub action: String,
+    /// For "shell": the shell command. For "execute": arguments to the program
+    pub args: Option<String>,
+    /// Path to the executable (required for "execute" action)
+    pub exec_path: Option<String>,
+}
+
+/// Response from executing a task on a Sliver agent.
+#[derive(Debug, Serialize)]
+pub struct TaskResponse {
+    pub success: bool,
+    /// Task ID, if the execution was queued (beacon) or returned by the server
+    pub task_id: Option<String>,
+    /// Combined stdout + stderr output from the command/program
+    pub output: Option<String>,
+    /// Human-readable status message
+    pub message: String,
+}
+
+/// Dispatch a task to a Sliver session via the Execute RPC.
+pub async fn exec_task(
+    conn: &mut SliverConnection,
+    session_id: &str,
+    req: TaskRequest,
+) -> Result<TaskResponse, String> {
+    match req.action.as_str() {
+        "shell" => exec_shell(conn, session_id, req).await,
+        "execute" => exec_program(conn, session_id, req).await,
+        _ => Err(format!(
+            "Unknown action: '{}'. Use 'shell' or 'execute'.",
+            req.action
+        )),
+    }
+}
+
+async fn exec_shell(
+    conn: &mut SliverConnection,
+    session_id: &str,
+    req: TaskRequest,
+) -> Result<TaskResponse, String> {
+    let command = req.args.unwrap_or_default();
+
+    let execute_req = sliverpb::ExecuteReq {
+        path: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), command],
+        output: true,
+        stdout: String::new(),
+        stderr: String::new(),
+        env_inheritance: true,
+        env: HashMap::new(),
+        background: false,
+        p_pid: 0,
+        request: Some(commonpb::Request {
+            r#async: false,
+            timeout: 60,
+            beacon_id: String::new(),
+            session_id: session_id.to_string(),
+        }),
+    };
+
+    let response = conn
+        .client
+        .execute(tonic::Request::new(execute_req))
+        .await
+        .map_err(|e| format!("Execute RPC failed: {e}"))?;
+
+    let exec = response.into_inner();
+
+    let stdout = String::from_utf8_lossy(&exec.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&exec.stderr).to_string();
+
+    let output = if stderr.is_empty() {
+        stdout
+    } else {
+        format!("{}\n{}", stdout, stderr)
+    };
+
+    Ok(TaskResponse {
+        success: exec.status == 0,
+        task_id: exec.response.as_ref().and_then(|r| {
+            if r.task_id.is_empty() {
+                None
+            } else {
+                Some(r.task_id.clone())
+            }
+        }),
+        output: Some(output),
+        message: format!("Shell command exited with status {}", exec.status),
+    })
+}
+
+async fn exec_program(
+    conn: &mut SliverConnection,
+    session_id: &str,
+    req: TaskRequest,
+) -> Result<TaskResponse, String> {
+    let path = req
+        .exec_path
+        .ok_or_else(|| "exec_path is required for 'execute' action".to_string())?;
+    let args: Vec<String> = req
+        .args
+        .map(|a| a.split_whitespace().map(String::from).collect())
+        .unwrap_or_default();
+
+    let execute_req = sliverpb::ExecuteReq {
+        path,
+        args,
+        output: true,
+        stdout: String::new(),
+        stderr: String::new(),
+        env_inheritance: true,
+        env: HashMap::new(),
+        background: false,
+        p_pid: 0,
+        request: Some(commonpb::Request {
+            r#async: false,
+            timeout: 120,
+            beacon_id: String::new(),
+            session_id: session_id.to_string(),
+        }),
+    };
+
+    let response = conn
+        .client
+        .execute(tonic::Request::new(execute_req))
+        .await
+        .map_err(|e| format!("Execute RPC failed: {e}"))?;
+
+    let exec = response.into_inner();
+
+    let stdout = String::from_utf8_lossy(&exec.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&exec.stderr).to_string();
+
+    let output = if stderr.is_empty() {
+        stdout
+    } else {
+        format!("{}\n{}", stdout, stderr)
+    };
+
+    Ok(TaskResponse {
+        success: exec.status == 0,
+        task_id: exec.response.as_ref().and_then(|r| {
+            if r.task_id.is_empty() {
+                None
+            } else {
+                Some(r.task_id.clone())
+            }
+        }),
+        output: Some(output),
+        message: format!("Program exited with status {}", exec.status),
+    })
+}
+
+/// List pending/completed tasks for a session.
+///
+/// Sessions execute commands in real-time and have no stored task history,
+/// so this returns an empty vec. For beacons, use the beacon-specific API
+/// (GetBeaconTasks) instead.
+pub async fn list_session_tasks(
+    conn: &mut SliverConnection,
+    _session_id: &str,
+) -> Result<Vec<TaskResponse>, String> {
+    let _ = conn;
+    Ok(Vec::new())
 }
