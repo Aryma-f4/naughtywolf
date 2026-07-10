@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::actions::{beacons, creds, listeners, loot, payloads, sessions, sliver, websites};
+use crate::actions::{agents, beacons, creds, listeners, loot, payloads, sessions, sliver, websites};
 use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
@@ -80,6 +80,8 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/dashboard/stats", axum::routing::get(dashboard_stats))
         .route("/api/sessions", axum::routing::get(list_sessions))
         .route("/api/beacons", axum::routing::get(list_beacons))
+        .route("/api/agents", axum::routing::get(list_agents_handler))
+        .route("/api/agents/{id}", axum::routing::get(get_agent_handler))
         .route("/api/listeners", axum::routing::get(list_listeners).post(create_listener))
         .route("/api/listeners/kill/{id}", axum::routing::post(kill_listener))
         .route("/api/payloads", axum::routing::get(list_payloads))
@@ -233,6 +235,53 @@ async fn list_beacons(
         .collect();
 
     Ok(Json(response))
+}
+
+async fn list_agents_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<Json<Vec<agents::AgentResponse>>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    let all = agents::list_agents(conn)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    Ok(Json(all))
+}
+
+async fn get_agent_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+) -> Result<Json<agents::AgentResponse>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    let all = agents::list_agents(conn)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    all.into_iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                format!("Agent '{}' not found", id),
+            )
+        })
+        .map(Json)
 }
 
 async fn list_listeners(

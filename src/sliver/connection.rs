@@ -1,6 +1,5 @@
 //! Sliver gRPC connection management -- mTLS + bearer token authentication.
 
-use std::error::Error;
 use std::path::Path;
 
 use tonic::metadata::AsciiMetadataValue;

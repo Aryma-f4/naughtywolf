@@ -423,6 +423,40 @@
     renderGraph();
     return function() { cancelled = true; };
   });
+
+  // ── Agents ────────────────────────────────────────────────
+  window.router.register('/agents', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        const agents = await apiGet('/api/agents');
+        if (cancelled) return;
+        if (!agents || agents.length === 0) {
+          main.innerHTML = window.renderEmpty('⊞', 'No Agents', 'Connect to Sliver and wait for implants to check in.');
+          return;
+        }
+        const rows = agents.map(function(a) {
+          var badge = a.status === 'active' ? '<span class="badge badge-active">Active</span>' : (a.is_dead ? '<span class="badge badge-dead">Dead</span>' : '<span class="badge badge-warning">Stale</span>');
+          return [
+            '<a href="#/agents/'+encodeURIComponent(a.id)+'">'+escapeHtml(a.name)+'</a>',
+            escapeHtml(a.hostname),
+            '<span class="badge '+(a.type==='session'?'badge-active':'badge-unknown')+'">'+escapeHtml(a.type)+'</span>',
+            escapeHtml(a.transport),
+            escapeHtml(a.os+'/'+a.arch),
+            badge,
+            escapeHtml(a.last_checkin),
+          ];
+        });
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Agents ('+agents.length+')</h3></div><div class="panel-body">'
+          + window.renderTable(['Name','Hostname','Type','Transport','OS/Arch','Status','Last Checkin'], rows)
+          + '</div></div>';
+      } catch (err) {
+        if (!cancelled) main.innerHTML = window.renderError(err.message);
+      }
+    })();
+    return function() { cancelled = true; };
+  });
 window.router.register('/sessions', function(main) {
     main.innerHTML = window.renderLoading();
     let cancelled = false;
