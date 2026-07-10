@@ -1043,7 +1043,7 @@ window.router.register('/sessions', function(main) {
   window.renderCredsPage = async function() {
     var main = document.getElementById('main-content');
     if (!main) return;
-    var canEdit = window.__agentCanEdit || false;
+    var canEdit = window.__agentCanEdit !== false; // default true; server enforces RBAC
     var html = '<div class="panel">'
       + '<div class="panel-header"><h3>Credentials</h3>'
       + '<div style="display:flex;gap:8px;align-items:center">'
