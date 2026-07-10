@@ -93,6 +93,15 @@ pub async fn generate_implant(
         _ => clientpb::OutputFormat::Executable,
     };
 
+    // Clean stale build directories to avoid "rename import dir" errors
+    let sliver_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".sliver")
+        .join("slivers");
+    if sliver_dir.exists() {
+        let _ = std::fs::remove_dir_all(&sliver_dir);
+    }
+
     let generate_req = clientpb::GenerateReq {
         name: req.name.clone(),
         config: Some(clientpb::ImplantConfig {
