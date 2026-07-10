@@ -562,7 +562,26 @@ function renderAgentDetail(agentId) {
           + '<button type="submit" class="btn btn-primary btn-sm">Execute</button>'
           + '<div id="agent-shell-out" style="margin-top:8px;font-family:var(--font-mono);font-size:0.8rem;white-space:pre-wrap;background:var(--bg-app);padding:8px;border-radius:4px;min-height:30px;max-height:300px;overflow-y:auto;"></div></div></div>';
         var tasks = '<div class="panel"><div class="panel-header"><h3>Task History</h3></div><div class="panel-body" id="agent-tasks-body"><div class="empty-state"><div class="empty-icon">⊞</div><h3>No tasks recorded</h3></div></div></div>';
-        main.innerHTML = info + shell + tasks;
+        var files = '<div class="panel"><div class="panel-header"><h3>File Browser</h3></div><div class="panel-body">'
+          + '<form id="agent-fs-form" style="display:flex;gap:8px;margin-bottom:8px;">'
+          + '<input class="input" id="agent-fs-path" placeholder="/tmp" value="/tmp" style="font-family:var(--font-mono);flex:1">'
+          + '<button type="submit" class="btn btn-primary btn-sm">List</button>'
+          + '<button type="button" class="btn btn-ghost btn-sm" id="agent-fs-refresh">↻</button>'
+          + '</form>'
+          + '<div id="agent-fs-out" style="font-family:var(--font-mono);font-size:0.8rem;background:var(--bg-app);padding:8px;border-radius:4px;min-height:60px;max-height:280px;overflow-y:auto;"></div>'
+          + '<hr style="border-color:var(--border-subtle);margin:12px 0">'
+          + '<form id="agent-fs-up-form" style="display:flex;gap:8px;align-items:flex-end;">'
+          + '<div style="flex:1"><label style="font-size:0.7rem;color:var(--text-muted)">Upload Path</label>'
+          + '<input class="input" id="agent-fs-up-path" placeholder="/tmp/file.txt" style="font-family:var(--font-mono)"></div>'
+          + '<div style="flex:1"><label style="font-size:0.7rem;color:var(--text-muted)">File Name</label>'
+          + '<input class="input" id="agent-fs-up-name" placeholder="upload.bin" style="font-family:var(--font-mono)"></div>'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Content</label>'
+          + '<input type="file" id="agent-fs-up-file" style="font-family:var(--font-mono)"></div>'
+          + '<button type="submit" class="btn btn-primary btn-sm">Upload</button>'
+          + '</form>'
+          + '<div id="agent-fs-up-status" style="margin-top:6px;font-size:0.8rem;"></div>'
+          + '</div></div>';
+        main.innerHTML = info + shell + files + tasks;
         document.getElementById('agent-refresh')?.addEventListener('click', async function() {
           try {
             var fresh = await apiGet('/api/agents');
@@ -583,6 +602,69 @@ function renderAgentDetail(agentId) {
             out.textContent += '\n---\nExit: '+r.exit_code;
           } catch(e) { out.textContent += '\nError: '+e.message; }
         });
+        // File browser event handlers
+        function listPath(path) {
+          var out = document.getElementById('agent-fs-out');
+          out.textContent = 'Listing ' + path + '...';
+          apiPost('/api/agents/' + encodeURIComponent(agentId) + '/fs/ls', { path: path })
+            .then(function(r) {
+              if (!r || !r.exists) {
+                out.textContent = 'Path does not exist: ' + path;
+                return;
+              }
+              var rows = (r.files || []).map(function(f) {
+                var sizeStr = f.is_dir ? '<dir>' : (f.size != null ? f.size + ' B' : '—');
+                var name = f.name + (f.is_dir ? '/' : '');
+                var dlBtn = f.is_dir ? '' : '<button class="btn btn-ghost btn-sm" data-dl="'+escapeHtml(f.path||name)+'">Download</button>';
+                return ['<strong>' + escapeHtml(name) + '</strong>', sizeStr, escapeHtml(f.mod_time || '—'), escapeHtml(f.mode || '—'), dlBtn];
+              });
+              out.innerHTML = '<div style="margin-bottom:6px;">Path: <strong>' + escapeHtml(r.path) + '</strong> (' + rows.length + ' entries)</div>' +
+                (rows.length ? window.renderTable(['Name','Size','Modified','Mode',''], rows) : '<div class="empty-state">Empty directory</div>');
+              out.querySelectorAll('button[data-dl]').forEach(function(btn) {
+                btn.addEventListener('click', function() {
+                  var p = btn.getAttribute('data-dl');
+                  window.location.href = '/api/agents/' + encodeURIComponent(agentId) + '/fs/download?path=' + encodeURIComponent(p);
+                });
+              });
+            })
+            .catch(function(e) { out.textContent = 'Error: ' + e.message; });
+        }
+
+        document.getElementById('agent-fs-form')?.addEventListener('submit', function(e) {
+          e.preventDefault();
+          var p = document.getElementById('agent-fs-path').value || '/tmp';
+          listPath(p);
+        });
+        document.getElementById('agent-fs-refresh')?.addEventListener('click', function() {
+          var p = document.getElementById('agent-fs-path').value || '/tmp';
+          listPath(p);
+        });
+
+        // Initial load — list /tmp
+        listPath('/tmp');
+
+        document.getElementById('agent-fs-up-form')?.addEventListener('submit', function(e) {
+          e.preventDefault();
+          var f = document.getElementById('agent-fs-up-file');
+          if (!f || !f.files || f.files.length === 0) { alert('Pick a file'); return; }
+          var status = document.getElementById('agent-fs-up-status');
+          status.textContent = 'Reading file...';
+          var fr = new FileReader();
+          fr.onload = async function(ev) {
+            var data = new Uint8Array(ev.target.result);
+            var arr = Array.from(data);
+            var path = document.getElementById('agent-fs-up-path').value;
+            var name = document.getElementById('agent-fs-up-name').value || f.files[0].name;
+            try {
+              var r = await apiPost('/api/agents/' + encodeURIComponent(agentId) + '/fs/upload', {
+                path: path, file_name: name, data: arr, overwrite: false
+              });
+              status.textContent = '✅ Uploaded to ' + r.path;
+            } catch(e) { status.textContent = '❌ ' + e.message; }
+          };
+          fr.readAsArrayBuffer(f.files[0]);
+        });
+
         // Try to fetch task history if the endpoint exists
         try {
           var taskHistory = await apiGet('/api/agents/'+encodeURIComponent(agentId)+'/tasks');
