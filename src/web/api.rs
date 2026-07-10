@@ -90,7 +90,9 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/payloads/download/{name}", axum::routing::get(download_payload_handler))
         .route("/api/websites", axum::routing::get(list_websites))
         .route("/api/loot", axum::routing::get(list_loot))
-        .route("/api/creds", axum::routing::get(list_creds))
+        .route("/api/creds", axum::routing::get(list_creds_handler).post(create_cred_handler))
+        .route("/api/creds/{id}", axum::routing::put(update_cred_handler).delete(delete_cred_handler))
+        .route("/api/creds/{id}/crack", axum::routing::post(crack_cred_handler))
         .route("/api/hosts", axum::routing::get(list_hosts_handler))
         .route("/api/sliver/connect", axum::routing::post(sliver_connect))
         .route("/api/sliver/disconnect", axum::routing::post(sliver_disconnect))
@@ -582,26 +584,129 @@ async fn list_loot(
     Ok(Json(items))
 }
 
-async fn list_creds(
+async fn list_creds_handler(
     State(state): State<AppState>,
     _user: AuthenticatedUserGuard,
-) -> Result<
-    Json<Vec<creds::CredResponse>>,
-    (axum::http::StatusCode, String),
-> {
-    let mut guard = state.sliver.lock().await;
-    let conn = guard.as_mut().ok_or_else(|| {
-        (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Sliver not connected".to_string(),
-        )
-    })?;
+) -> Result<Json<Vec<creds::CredResponse>>, (axum::http::StatusCode, String)> {
+    let mut results = Vec::new();
 
-    let credentials = creds::list_creds(conn)
-        .await
-        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    // Fetch from local DB
+    if let Ok(local) = creds::list_local_creds(&state.pool).await {
+        results.extend(local);
+    }
 
-    Ok(Json(credentials))
+    // Also fetch from Sliver gRPC if connected
+    if let Ok(mut guard) = state.sliver.try_lock() {
+        if let Some(conn) = guard.as_mut() {
+            if let Ok(server_creds) = creds::list_creds(conn).await {
+                results.extend(server_creds);
+            }
+        }
+    }
+
+    Ok(Json(results))
+}
+
+async fn create_cred_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    axum::Json(req): axum::Json<creds::CreateCredRequest>,
+) -> Result<Json<creds::CredResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    let result = creds::create_cred(&state.pool, req).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "create_cred",
+        "credential",
+        Some(result.id.clone()),
+        None,
+        "success",
+    ).await;
+    Ok(Json(result))
+}
+
+async fn update_cred_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<creds::UpdateCredRequest>,
+) -> Result<Json<creds::CredResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    let result = creds::update_cred(&state.pool, &id, req).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "update_cred",
+        "credential",
+        Some(id.clone()),
+        None,
+        "success",
+    ).await;
+    Ok(Json(result))
+}
+
+async fn delete_cred_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Admin role required".to_string()));
+    }
+    creds::delete_cred(&state.pool, &id).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "delete_cred",
+        "credential",
+        Some(id.clone()),
+        None,
+        "success",
+    ).await;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct CrackRequest {
+    plaintext: String,
+}
+
+async fn crack_cred_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<CrackRequest>,
+) -> Result<Json<creds::CredResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    if req.plaintext.is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "plaintext is required".to_string()));
+    }
+    let result = creds::mark_cracked(&state.pool, &id, &req.plaintext).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "crack_cred",
+        "credential",
+        Some(id.clone()),
+        None,
+        "success",
+    ).await;
+    Ok(Json(result))
 }
 
 async fn sliver_connect(

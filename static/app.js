@@ -1039,32 +1039,146 @@ window.router.register('/sessions', function(main) {
   });
 
   // ── Credentials ──────────────────────────────────────────
-  window.router.register('/creds', function(main) {
-    main.innerHTML = window.renderLoading();
-    let cancelled = false;
-    (async () => {
-      try {
-        const creds = await apiGet('/api/creds');
-        if (cancelled) return;
-        if (!creds || creds.length === 0) {
-          main.innerHTML = window.renderEmpty('🔑', 'No Credentials', 'Connect to Sliver to manage collected credentials.');
-          return;
-        }
-        const rows = creds.map(c => [
-          escapeHtml(c.id || c.collection),
-          escapeHtml(c.username || '—'),
-          escapeHtml(c.hash_type || '—'),
-          c.is_cracked ? `<span class="badge badge-active">Yes</span>` : `<span class="badge badge-unknown">No</span>`,
-          escapeHtml(c.collection || '—'),
-        ]);
-        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Credentials</h3></div><div class="panel-body">'
-          + window.renderTable(['Collection','Username','Hash Type','Cracked','Collection'], rows)
-          + '</div></div>';
-      } catch (err) {
-        if (!cancelled) main.innerHTML = window.renderError(err.message);
+  // ── Credentials (Empire-style management UI, Phase 2.3) ─────
+  window.renderCredsPage = async function() {
+    var main = document.getElementById('main-content');
+    if (!main) return;
+    var canEdit = window.__agentCanEdit || false;
+    var html = '<div class="panel">'
+      + '<div class="panel-header"><h3>Credentials</h3>'
+      + '<div style="display:flex;gap:8px;align-items:center">'
+      + '<input class="input" id="cred-search" placeholder="Filter (user, domain, host)" style="font-size:0.8rem;max-width:280px">'
+      + '<select class="select" id="cred-source-filter" style="font-size:0.8rem">'
+      + '<option value="">All sources</option>'
+      + '<option value="manual">Manual</option>'
+      + '<option value="sliver">From Sliver</option>'
+      + '</select>'
+      + '<button class="btn btn-ghost btn-sm" id="cred-refresh">↻ Refresh</button>'
+      + '</div>'
+      + '</div>'
+      + '<div class="panel-body">'
+      + (canEdit
+        ? '<form id="cred-add-form" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border-subtle)">'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Username</label><input class="input" id="cred-add-user" placeholder="admin"></div>'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Domain</label><input class="input" id="cred-add-domain" placeholder="CORP.LOCAL"></div>'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Password</label><input class="input" id="cred-add-pass" placeholder="P@ssw0rd!"></div>'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Host</label><input class="input" id="cred-add-host" placeholder="DC01.corp.local"></div>'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Hash Type</label><input class="input" id="cred-add-hashtype" placeholder="NTLMv1"></div>'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Hash</label><input class="input" id="cred-add-hash" placeholder="aad3b435..."></div>'
+          + '<div style="grid-column:span 3;display:flex;gap:8px;align-items:center">'
+          + '<select class="select" id="cred-add-type" style="font-size:0.8rem"><option value="hash">Hash</option><option value="plaintext">Plaintext</option></select>'
+          + '<select class="select" id="cred-add-source" style="font-size:0.8rem"><option value="manual">manual</option><option value="sliver">sliver</option></select>'
+          + '<input class="input" id="cred-add-notes" placeholder="Notes (optional)" style="flex:1;font-size:0.8rem">'
+          + '<button type="submit" class="btn btn-primary btn-sm">+ Add</button>'
+          + '</div>'
+          + '</form>'
+        : '<div style="margin-bottom:8px;font-size:0.8rem;color:var(--text-muted)">Viewer role: read-only</div>')
+      + '<div id="cred-list"></div>'
+      + '</div></div>';
+    main.innerHTML = html;
+
+    function applyFilters(items) {
+      var q = (document.getElementById('cred-search')?.value || '').toLowerCase().trim();
+      var src = document.getElementById('cred-source-filter')?.value || '';
+      return items.filter(function(c) {
+        var hay = [c.id, c.username, c.collection, c.hash_type, c.plaintext].join(' ').toLowerCase();
+        if (q && hay.indexOf(q) < 0) return false;
+        if (src && c.collection !== src) return false;
+        return true;
+      });
+    }
+
+    function renderList(all) {
+      var filtered = applyFilters(all);
+      var list = document.getElementById('cred-list');
+      if (!filtered.length) {
+        list.innerHTML = '<div class="empty-state"><div class="empty-icon">🔑</div><h3>No credentials</h3><p>Add one above or pull from Sliver.</p></div>';
+        return;
       }
-    })();
-    return () => { cancelled = true; };
+      var rows = filtered.map(function(c) {
+        var status = c.is_cracked
+          ? '<span class="badge badge-active">cracked</span>'
+          : '<span class="badge badge-warning">hash only</span>';
+        var actions = '<button class="btn btn-ghost btn-sm" data-action="crack" data-id="' + escapeHtml(c.id) + '" data-plaintext="' + escapeHtml(c.plaintext) + '">Set plaintext</button>';
+        if (canEdit) {
+          actions += ' <button class="btn btn-ghost btn-sm" data-action="delete" data-id="' + escapeHtml(c.id) + '">Delete</button>';
+        }
+        return [
+          escapeHtml((c.username || '—').split('@')[0]),
+          escapeHtml(c.username || '—'),
+          escapeHtml(c.plaintext || '—'),
+          escapeHtml(c.hash_type || '—'),
+          escapeHtml(c.collection || '—'),
+          status,
+          actions,
+        ];
+      });
+      list.innerHTML = window.renderTable(['User','Username@Domain','Plaintext','Hash Type','Source','Status','Actions'], rows);
+      list.querySelectorAll('button[data-action="delete"]').forEach(function(b) {
+        b.addEventListener('click', async function() {
+          if (!confirm('Delete credential ' + b.dataset.id + '?')) return;
+          try {
+            await fetch('/api/creds/' + encodeURIComponent(b.dataset.id), { method: 'DELETE', credentials: 'same-origin' });
+            showToast('Credential deleted', 'success');
+            load();
+          } catch(e) { showToast(e.message, 'error'); }
+        });
+      });
+      list.querySelectorAll('button[data-action="crack"]').forEach(function(b) {
+        b.addEventListener('click', function() {
+          var pt = prompt('Plaintext password for ' + b.dataset.id + '?', b.dataset.plaintext || '');
+          if (pt == null) return;
+          apiPost('/api/creds/' + encodeURIComponent(b.dataset.id) + '/crack', { plaintext: pt })
+            .then(function() { showToast('Credential marked cracked', 'success'); load(); })
+            .catch(function(e) { showToast(e.message, 'error'); });
+        });
+      });
+    }
+
+    function load() {
+      apiGet('/api/creds').then(function(data) {
+        window.__credData = data || [];
+        renderList(window.__credData);
+      }).catch(function(e) {
+        document.getElementById('cred-list').innerHTML = '<div class="empty-state"><div class="empty-icon">⚠</div><h3>Error</h3><p>' + escapeHtml(e.message) + '</p></div>';
+      });
+    }
+
+    document.getElementById('cred-search')?.addEventListener('input', function() {
+      renderList(window.__credData || []);
+    });
+    document.getElementById('cred-source-filter')?.addEventListener('change', function() {
+      renderList(window.__credData || []);
+    });
+    document.getElementById('cred-refresh')?.addEventListener('click', load);
+
+    if (canEdit) {
+      document.getElementById('cred-add-form')?.addEventListener('submit', function(e) {
+        e.preventDefault();
+        var req = {
+          cred_type: document.getElementById('cred-add-type').value,
+          username: document.getElementById('cred-add-user').value,
+          domain: document.getElementById('cred-add-domain').value,
+          password: document.getElementById('cred-add-pass').value,
+          host: document.getElementById('cred-add-host').value,
+          hash: document.getElementById('cred-add-hash').value,
+          hash_type: document.getElementById('cred-add-hashtype').value,
+          source: document.getElementById('cred-add-source').value,
+          notes: document.getElementById('cred-add-notes').value,
+        };
+        apiPost('/api/creds', req).then(function() {
+          showToast('Credential added', 'success');
+          document.getElementById('cred-add-form').reset();
+          load();
+        }).catch(function(err) { showToast(err.message, 'error'); });
+      });
+    }
+
+    load();
+  };
+
+  window.router.register('/creds', function(main) {
+    window.renderCredsPage();
   });
 })();
 

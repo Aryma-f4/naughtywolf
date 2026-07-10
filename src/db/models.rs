@@ -53,3 +53,23 @@ pub struct UiPreference {
     pub key: String,
     pub value: serde_json::Value,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Credential {
+    pub id: Uuid,
+    pub cred_type: String,
+    pub domain: String,
+    pub username: String,
+    pub password: String,
+    pub host: String,
+    pub os: String,
+    pub sid: String,
+    pub notes: String,
+    pub source: String,
+    pub agent_id: Option<String>,
+    pub is_cracked: bool,
+    pub hash: Option<String>,
+    pub hash_type: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
