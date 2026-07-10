@@ -296,7 +296,30 @@
 
   // ── Chain Graph ──────────────────────────────────────────
   
-    window.router.register('/graph', function(main) {
+    
+  // ── Hosts ─────────────────────────────────────────────────
+  window.router.register('/hosts', function(main) {
+    main.innerHTML = window.renderLoading();
+    let cancelled = false;
+    (async () => {
+      try {
+        var hosts = await apiGet('/api/hosts');
+        if (cancelled) return;
+        if (!hosts || hosts.length === 0) {
+          main.innerHTML = window.renderEmpty('💻', 'No Hosts', 'Connect to Sliver and wait for agents to check in.');
+          return;
+        }
+        var rows = hosts.map(function(h) {
+          return [escapeHtml(h.hostname), escapeHtml(h.os)+'/'+escapeHtml(h.arch), escapeHtml(h.transport), escapeHtml(h.remote_addr), '<span class="badge badge-active">'+h.agent_count+' agent(s)</span>'];
+        });
+        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Hosts ('+hosts.length+')</h3></div><div class="panel-body">'
+          + window.renderTable(['Hostname','OS/Arch','Transport','Remote','Agents'], rows)
+          + '</div></div>';
+      } catch(e) { if (!cancelled) main.innerHTML = window.renderError(e.message); }
+    })();
+    return function() { cancelled = true; };
+  });
+window.router.register('/graph', function(main) {
     main.innerHTML = window.renderLoading();
     let cancelled = false;
     const renderGraph = async () => {
@@ -428,29 +451,71 @@
   window.router.register('/agents', function(main) {
     main.innerHTML = window.renderLoading();
     let cancelled = false;
+    let agents = [];
+    let filters = { hostname: '', type: '', status: '' };
+
+    function renderFilteredTable() {
+      var filtered = agents.filter(function(a) {
+        if (filters.hostname && a.hostname.toLowerCase().indexOf(filters.hostname.toLowerCase()) < 0) return false;
+        if (filters.type && a.type !== filters.type) return false;
+        if (filters.status === 'active' && a.status !== 'active') return false;
+        if (filters.status === 'dead' && !a.is_dead) return false;
+        if (filters.status === 'stale' && (a.status === 'active' || a.is_dead)) return false;
+        return true;
+      });
+      if (filtered.length === 0) {
+        return '<div class="empty-state"><div class="empty-icon">⊞</div><h3>No matching agents</h3><p>Try adjusting your filters.</p></div>';
+      }
+      var rows = filtered.map(function(a) {
+        var badge = a.status === 'active' ? '<span class="badge badge-active">Active</span>' : (a.is_dead ? '<span class="badge badge-dead">Dead</span>' : '<span class="badge badge-warning">Stale</span>');
+        return [
+          '<a href="#/agents/'+encodeURIComponent(a.id)+'">'+escapeHtml(a.name)+'</a>',
+          escapeHtml(a.hostname),
+          '<span class="badge '+(a.type==='session'?'badge-active':'badge-unknown')+'">'+escapeHtml(a.type)+'</span>',
+          escapeHtml(a.transport),
+          escapeHtml(a.os+'/'+a.arch),
+          badge,
+          escapeHtml(a.last_checkin),
+        ];
+      });
+      return '<div style="max-height:600px;overflow-y:auto;">' + window.renderTable(['Name','Hostname','Type','Transport','OS/Arch','Status','Last Checkin'], rows) + '</div>';
+    }
+
+    function renderPage() {
+      main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Agents ('+agents.length+')</h3></div><div class="panel-body">'
+        + '<div class="filter-bar" style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">'
+        + '<input class="input" id="filter-hostname" placeholder="Filter hostname..." style="flex:1;min-width:160px;">'
+        + '<select class="select" id="filter-type"><option value="">All types</option><option value="session">Session</option><option value="beacon">Beacon</option></select>'
+        + '<select class="select" id="filter-status"><option value="">All status</option><option value="active">Active</option><option value="stale">Stale</option><option value="dead">Dead</option></select>'
+        + '</div><div id="agents-table-container">' + renderFilteredTable() + '</div></div></div>';
+
+      document.getElementById('filter-hostname')?.addEventListener('input', function() {
+        filters.hostname = this.value;
+        var container = document.getElementById('agents-table-container');
+        if (container) container.innerHTML = renderFilteredTable();
+      });
+      document.getElementById('filter-type')?.addEventListener('change', function() {
+        filters.type = this.value;
+        var container = document.getElementById('agents-table-container');
+        if (container) container.innerHTML = renderFilteredTable();
+      });
+      document.getElementById('filter-status')?.addEventListener('change', function() {
+        filters.status = this.value;
+        var container = document.getElementById('agents-table-container');
+        if (container) container.innerHTML = renderFilteredTable();
+      });
+    }
+
     (async () => {
       try {
-        const agents = await apiGet('/api/agents');
+        agents = await apiGet('/api/agents');
+        window.__agentData = agents;
         if (cancelled) return;
         if (!agents || agents.length === 0) {
           main.innerHTML = window.renderEmpty('⊞', 'No Agents', 'Connect to Sliver and wait for implants to check in.');
           return;
         }
-        const rows = agents.map(function(a) {
-          var badge = a.status === 'active' ? '<span class="badge badge-active">Active</span>' : (a.is_dead ? '<span class="badge badge-dead">Dead</span>' : '<span class="badge badge-warning">Stale</span>');
-          return [
-            '<a href="#/agents/'+encodeURIComponent(a.id)+'">'+escapeHtml(a.name)+'</a>',
-            escapeHtml(a.hostname),
-            '<span class="badge '+(a.type==='session'?'badge-active':'badge-unknown')+'">'+escapeHtml(a.type)+'</span>',
-            escapeHtml(a.transport),
-            escapeHtml(a.os+'/'+a.arch),
-            badge,
-            escapeHtml(a.last_checkin),
-          ];
-        });
-        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Agents ('+agents.length+')</h3></div><div class="panel-body">'
-          + window.renderTable(['Name','Hostname','Type','Transport','OS/Arch','Status','Last Checkin'], rows)
-          + '</div></div>';
+        renderPage();
       } catch (err) {
         if (!cancelled) main.innerHTML = window.renderError(err.message);
       }
@@ -465,10 +530,13 @@
     main.innerHTML = window.renderLoading();
     (async function() {
       try {
-        var agents = await apiGet('/api/agents');
+        var agents = window.__agentData || await apiGet('/api/agents');
+        window.__agentData = agents;
         var agent = (agents||[]).find(function(a) { return a.id === agentId || a.name === agentId; });
         if (!agent) { main.innerHTML = window.renderError('Agent not found'); return; }
-        var info = '<div class="panel"><div class="panel-header"><h3>Agent: '+escapeHtml(agent.name)+'</h3></div><div class="panel-body" style="font-size:0.85rem;">'
+        var info = '<div class="panel"><div class="panel-header"><h3>Agent: '+escapeHtml(agent.name)+'</h3>'
+          + '<button class="btn btn-ghost btn-sm" id="agent-refresh">↻ Refresh</button></div>'
+          + '<div class="panel-body" style="font-size:0.85rem;">'
           + '<div class="detail-row"><span>ID</span><span>'+escapeHtml(agent.id)+'</span></div>'
           + '<div class="detail-row"><span>Type</span><span class="badge '+(agent.type==='session'?'badge-active':'badge-unknown')+'">'+escapeHtml(agent.type)+'</span></div>'
           + '<div class="detail-row"><span>Status</span><span class="badge '+(agent.status==='active'?'badge-active':'badge-dead')+'">'+escapeHtml(agent.status)+'</span></div>'
@@ -476,6 +544,8 @@
           + '<div class="detail-row"><span>User</span><span>'+escapeHtml(agent.username)+'</span></div>'
           + '<div class="detail-row"><span>OS/Arch</span><span>'+escapeHtml(agent.os)+'/'+escapeHtml(agent.arch)+'</span></div>'
           + '<div class="detail-row"><span>Transport</span><span>'+escapeHtml(agent.transport)+'</span></div>'
+          + '<div class="detail-row"><span>Interval</span><span>'+(agent.interval != null ? escapeHtml(agent.interval)+'s' : '—')+'</span></div>'
+          + '<div class="detail-row"><span>Jitter</span><span>'+(agent.jitter != null ? escapeHtml(agent.jitter)+'s' : '—')+'</span></div>'
           + '<div class="detail-row"><span>Remote</span><span>'+escapeHtml(agent.remote_addr)+'</span></div>'
           + '<div class="detail-row"><span>Last Checkin</span><span>'+escapeHtml(agent.last_checkin)+'</span></div>'
           + '</div></div>';
@@ -483,7 +553,15 @@
           + '<form id="agent-shell-form"><div class="field"><label>Command</label><input class="input" id="agent-shell-cmd" placeholder="ls -la" style="font-family:var(--font-mono)"></div>'
           + '<button type="submit" class="btn btn-primary btn-sm">Execute</button>'
           + '<div id="agent-shell-out" style="margin-top:8px;font-family:var(--font-mono);font-size:0.8rem;white-space:pre-wrap;background:var(--bg-app);padding:8px;border-radius:4px;min-height:30px;max-height:300px;overflow-y:auto;"></div></div></div>';
-        main.innerHTML = info + shell;
+        var tasks = '<div class="panel"><div class="panel-header"><h3>Task History</h3></div><div class="panel-body" id="agent-tasks-body"><div class="empty-state"><div class="empty-icon">⊞</div><h3>No tasks recorded</h3></div></div></div>';
+        main.innerHTML = info + shell + tasks;
+        document.getElementById('agent-refresh')?.addEventListener('click', async function() {
+          try {
+            var fresh = await apiGet('/api/agents');
+            window.__agentData = fresh;
+            renderAgentDetail(agentId);
+          } catch(e) { showToast(e.message, 'error'); }
+        });
         document.getElementById('agent-shell-form')?.addEventListener('submit', async function(e) {
           e.preventDefault();
           var cmd = document.getElementById('agent-shell-cmd').value;
@@ -497,6 +575,22 @@
             out.textContent += '\n---\nExit: '+r.exit_code;
           } catch(e) { out.textContent += '\nError: '+e.message; }
         });
+        // Try to fetch task history if the endpoint exists
+        try {
+          var taskHistory = await apiGet('/api/agents/'+encodeURIComponent(agentId)+'/tasks');
+          if (taskHistory && taskHistory.length > 0) {
+            var tRows = taskHistory.map(function(t) {
+              return [
+                escapeHtml(t.id || '—'),
+                escapeHtml(t.command || '—'),
+                escapeHtml(t.status || '—'),
+                t.exit_code != null ? escapeHtml(String(t.exit_code)) : '—',
+                escapeHtml(t.executed_at || t.created_at || '—'),
+              ];
+            });
+            document.getElementById('agent-tasks-body').innerHTML = window.renderTable(['ID','Command','Status','Exit Code','Executed At'], tRows);
+          }
+        } catch(e) { /* task endpoint not available */ }
       } catch(e) { main.innerHTML = window.renderError(e.message); }
     })();
   }

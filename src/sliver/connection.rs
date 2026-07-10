@@ -10,6 +10,10 @@ use crate::sliver::profiles::SliverCfg;
 use crate::sliver::proto::rpcpb::sliver_rpc_client::SliverRpcClient;
 
 /// An established gRPC connection to a Sliver server.
+///
+/// Channel and the gRPC client handle are Arc-interned by tonic,
+/// so cloning is cheap and safe.
+#[derive(Clone)]
 pub struct SliverConnection {
     pub client: SliverRpcClient<InterceptedService<Channel, AuthInterceptor>>,
     pub profile: SliverCfg,

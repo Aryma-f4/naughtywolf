@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::actions::{agents, beacons, creds, listeners, loot, payloads, sessions, sliver, websites};
+use crate::actions::{agents, beacons, creds, hosts, listeners, loot, payloads, sessions, sliver, websites};
 use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
@@ -91,6 +91,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/websites", axum::routing::get(list_websites))
         .route("/api/loot", axum::routing::get(list_loot))
         .route("/api/creds", axum::routing::get(list_creds))
+        .route("/api/hosts", axum::routing::get(list_hosts_handler))
         .route("/api/sliver/connect", axum::routing::post(sliver_connect))
         .route("/api/sliver/disconnect", axum::routing::post(sliver_disconnect))
         .route("/api/sliver/status", axum::routing::get(sliver_status))
@@ -395,6 +396,25 @@ async fn kill_listener(
     })))
 }
 
+async fn list_hosts_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<Json<Vec<hosts::HostResponse>>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sliver not connected".to_string(),
+        )
+    })?;
+
+    let hosts = hosts::list_hosts(conn)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+
+    Ok(Json(hosts))
+}
+
 async fn list_payloads(
     State(state): State<AppState>,
     _user: AuthenticatedUserGuard,
@@ -589,7 +609,7 @@ async fn sliver_connect(
     if req.config_path.is_empty() {
         return Err((axum::http::StatusCode::BAD_REQUEST, "config_path is required".to_string()));
     }
-    let status = sliver::connect(&state.sliver, &req.config_path)
+    let status = sliver::connect(&state.sliver, &req.config_path, state.event_tx)
         .await
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     Ok(axum::Json(status))
@@ -599,7 +619,7 @@ async fn sliver_disconnect(
     State(state): State<AppState>,
     _user: AuthenticatedUserGuard,
 ) -> axum::Json<sliver::SliverStatusResponse> {
-    let status = sliver::disconnect(&state.sliver).await;
+    let status = sliver::disconnect(&state.sliver, state.event_tx).await;
     axum::Json(status)
 }
 
@@ -734,3 +754,5 @@ async fn shell_exec_handler(
         }),
     }
 }
+
+

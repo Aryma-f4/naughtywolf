@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod beacons;
 pub mod creds;
+pub mod hosts;
 pub mod listeners;
 pub mod loot;
 pub mod payloads;

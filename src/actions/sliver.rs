@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 use serde::{Deserialize, Serialize};
 
 use crate::sliver::connection::SliverConnection;
+use crate::sliver::events::{self, ConnectionInfo, SliverEvent};
 use crate::sliver::profiles::SliverCfg;
 
 #[derive(Serialize)]
@@ -54,9 +55,13 @@ pub fn status(
 }
 
 /// Connect to a Sliver server using a config file path.
+///
+/// Also spawns an event listener and checkin poller, then emits a
+/// `ConnectionChanged(true, ...)` event so SSE clients get notified.
 pub async fn connect(
     conn: &Arc<Mutex<Option<SliverConnection>>>,
     config_path: &str,
+    event_tx: broadcast::Sender<SliverEvent>,
 ) -> Result<SliverStatusResponse, String> {
     let path = Path::new(config_path);
     if !path.exists() {
@@ -69,30 +74,58 @@ pub async fn connect(
         .await
         .map_err(|e| format!("Failed to connect: {e}"))?;
 
+    let profile_name = sliver_cfg.profile_name();
+    let operator = sliver_cfg.operator.clone();
+    let lhost = sliver_cfg.lhost.clone();
+    let lport: u32 = sliver_cfg.lport.into();
+
     let status = SliverStatusResponse {
         connected: true,
-        profile_name: Some(sliver_cfg.profile_name()),
-        operator: Some(sliver_cfg.operator.clone()),
-        lhost: Some(sliver_cfg.lhost.clone()),
-        lport: Some(sliver_cfg.lport.into()),
+        profile_name: Some(profile_name.clone()),
+        operator: Some(operator),
+        lhost: Some(lhost),
+        lport: Some(lport),
     };
+
+    // Spawn the Sliver event stream listener
+    events::spawn_event_listener(connection.clone(), event_tx.clone());
+
+    // Spawn a periodic checkin poller for sessions (heartbeat signal)
+    events::spawn_checkin_poller(connection.clone(), event_tx.clone());
+
+    // Notify SSE clients that we are now connected
+    let _ = event_tx.send(SliverEvent::ConnectionChanged(ConnectionInfo {
+        connected: true,
+        profile_name: profile_name.clone(),
+    }));
 
     let mut guard = conn.lock().await;
     *guard = Some(connection);
 
     tracing::info!(
-        "Connected to Sliver server {}@{}:{} (profile: {})",
+        "Connected to Sliver server {}@{}:{} (profile: {}) — event listener started",
         status.operator.as_deref().unwrap_or("?"),
         status.lhost.as_deref().unwrap_or("?"),
         status.lport.unwrap_or(0),
-        status.profile_name.as_deref().unwrap_or("?"),
+        profile_name,
     );
 
     Ok(status)
 }
 
 /// Disconnect from the current Sliver server.
-pub async fn disconnect(conn: &Arc<Mutex<Option<SliverConnection>>>) -> SliverStatusResponse {
+///
+/// Emits a `ConnectionChanged(false, ...)` event so SSE clients get notified.
+pub async fn disconnect(
+    conn: &Arc<Mutex<Option<SliverConnection>>>,
+    event_tx: broadcast::Sender<SliverEvent>,
+) -> SliverStatusResponse {
+    // Notify SSE clients that we are now disconnected
+    let _ = event_tx.send(SliverEvent::ConnectionChanged(ConnectionInfo {
+        connected: false,
+        profile_name: String::new(),
+    }));
+
     let mut guard = conn.lock().await;
     *guard = None;
     tracing::info!("Disconnected from Sliver server");
@@ -120,7 +153,8 @@ mod tests {
     #[tokio::test]
     async fn test_disconnect_on_empty() {
         let conn: Arc<Mutex<Option<SliverConnection>>> = Arc::new(Mutex::new(None));
-        let s = disconnect(&conn).await;
+        let (tx, _rx) = broadcast::channel(16);
+        let s = disconnect(&conn, tx).await;
         assert!(!s.connected);
     }
 }
