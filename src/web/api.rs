@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::actions::{agents, beacons, creds, hosts, listeners, loot, modules, payloads, pivots, sessions, sliver, stagers, websites};
+use crate::actions::{agents, beacons, creds, hosts, listeners, loot, modules, payloads, pivots, reports, sessions, sliver, stagers, websites};
 use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
@@ -115,6 +115,10 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/pivots/stop", axum::routing::post(stop_pivot_handler))
         .route("/api/agents/{id}/portfwd", axum::routing::post(create_portfwd_handler))
         .route("/api/agents/{id}/socks", axum::routing::post(start_socks_handler))
+        .route("/api/reports/sessions", axum::routing::get(report_sessions_handler))
+        .route("/api/reports/credentials", axum::routing::get(report_credentials_handler))
+        .route("/api/reports/hosts", axum::routing::get(report_hosts_handler))
+        .route("/api/reports/timeline", axum::routing::get(report_timeline_handler))
 }
 
 async fn list_users(
@@ -1140,6 +1144,83 @@ async fn start_socks_handler(
     let resp = pivots::start_socks(conn, req).await
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
     Ok(Json(resp))
+}
+
+/// Helper to render a report as either JSON or CSV based on query param `format`.
+fn format_response<T: serde::Serialize>(
+    q: &reports::ReportQuery,
+    rows: Vec<T>,
+    name: &str,
+) -> (axum::http::StatusCode, [(String, String); 2], Vec<u8>) {
+    if q.format.as_deref() == Some("csv") {
+        let body = reports::to_csv(&rows).unwrap_or_default();
+        let filename = format!("{}.csv", name);
+        (
+            axum::http::StatusCode::OK,
+            [
+                ("Content-Type".to_string(), "text/csv".to_string()),
+                (
+                    "Content-Disposition".to_string(),
+                    format!("attachment; filename=\"{}\"", filename),
+                ),
+            ],
+            body.into_bytes(),
+        )
+    } else {
+        let body = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+        (
+            axum::http::StatusCode::OK,
+            [
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("X-Content-Type-Options".to_string(), "nosniff".to_string()),
+            ],
+            body.into_bytes(),
+        )
+    }
+}
+
+async fn report_sessions_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    axum::extract::Query(q): axum::extract::Query<reports::ReportQuery>,
+) -> Result<(axum::http::StatusCode, [(String, String); 2], Vec<u8>), (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let rows = reports::report_sessions(conn, q.clone()).await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(format_response(&q, rows, "sessions_report"))
+}
+
+async fn report_credentials_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    axum::extract::Query(q): axum::extract::Query<reports::ReportQuery>,
+) -> Result<(axum::http::StatusCode, [(String, String); 2], Vec<u8>), (axum::http::StatusCode, String)> {
+    let rows = reports::report_credentials(&state.pool, q.clone()).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(format_response(&q, rows, "credentials_report"))
+}
+
+async fn report_hosts_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    axum::extract::Query(q): axum::extract::Query<reports::ReportQuery>,
+) -> Result<(axum::http::StatusCode, [(String, String); 2], Vec<u8>), (axum::http::StatusCode, String)> {
+    let rows = reports::report_hosts(&state.pool, q.clone()).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(format_response(&q, rows, "hosts_report"))
+}
+
+async fn report_timeline_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+    axum::extract::Query(q): axum::extract::Query<reports::ReportQuery>,
+) -> Result<(axum::http::StatusCode, [(String, String); 2], Vec<u8>), (axum::http::StatusCode, String)> {
+    let rows = reports::report_timeline(&state.pool, q.clone()).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(format_response(&q, rows, "timeline_report"))
 }
 
 async fn shell_exec_handler(

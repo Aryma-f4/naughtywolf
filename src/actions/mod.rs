@@ -4,6 +4,7 @@ pub mod creds;
 pub mod hosts;
 pub mod modules;
 pub mod pivots;
+pub mod reports;
 pub mod stagers;
 pub mod listeners;
 pub mod loot;

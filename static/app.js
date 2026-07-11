@@ -1520,6 +1520,99 @@ window.router.register('/sessions', function(main) {
   window.router.register('/pivots', function(main) {
     window.renderPivotsPage();
   });
+
+  // ── Reports & Export (Phase 3.2) ────────────────────────
+  window.renderReportsPage = function() {
+    var main = document.getElementById('main-content');
+    if (!main) return;
+    var html = '<div class="panel"><div class="panel-header"><h3>Reports &amp; Export</h3>'
+      + '<div style="display:flex;gap:6px;align-items:center">'
+      + '<input class="input" id="rep-since" placeholder="since (ISO)" style="font-size:0.8rem">'
+      + '<input class="input" id="rep-until" placeholder="until (ISO)" style="font-size:0.8rem">'
+      + '<input class="input" id="rep-limit" type="number" value="500" placeholder="limit" style="width:80px;font-size:0.8rem">'
+      + '</div></div>'
+      + '<div class="panel-body">'
+      // Sessions card
+      + '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">'
+      + '<div class="panel"><div class="panel-header"><h3 style="font-size:0.85rem;text-transform:uppercase">Sessions</h3></div>'
+      + '<div class="panel-body" id="rep-sessions-body" style="font-size:0.85rem">Loading…</div></div>'
+      + '<div class="panel"><div class="panel-header"><h3 style="font-size:0.85rem;text-transform:uppercase">Credentials</h3></div>'
+      + '<div class="panel-body" id="rep-creds-body" style="font-size:0.85rem">Loading…</div></div>'
+      + '<div class="panel"><div class="panel-header"><h3 style="font-size:0.85rem;text-transform:uppercase">Hosts</h3></div>'
+      + '<div class="panel-body" id="rep-hosts-body" style="font-size:0.85rem">Loading…</div></div>'
+      + '<div class="panel"><div class="panel-header"><h3 style="font-size:0.85rem;text-transform:uppercase">Activity Timeline</h3></div>'
+      + '<div class="panel-body" id="rep-timeline-body" style="font-size:0.85rem">Loading…</div></div>'
+      + '</div>'
+      + '<div style="margin-top:12px;display:flex;gap:8px">'
+      + '<button class="btn btn-primary btn-sm" id="rep-generate">Generate Reports</button>'
+      + '<button class="btn btn-ghost btn-sm" id="rep-csv">Export All (CSV)</button>'
+      + '</div>'
+      + '</div></div>';
+    main.innerHTML = html;
+
+    function buildQuery() {
+      return '?since=' + encodeURIComponent(document.getElementById('rep-since').value || '1970-01-01')
+        + '&until=' + encodeURIComponent(document.getElementById('rep-until').value || '9999-12-31')
+        + '&limit=' + encodeURIComponent(document.getElementById('rep-limit').value || '500');
+    }
+
+    function renderRows(target, rows, cols) {
+      var body = document.getElementById(target);
+      if (!rows || !rows.length) {
+        body.innerHTML = '<div style="color:var(--text-muted);padding:8px">No data.</div>';
+        return;
+      }
+      var trs = rows.map(function(r) {
+        var cells = cols.map(function(c) { return '<td>' + escapeHtml(String(r[c] === undefined || r[c] === null ? '—' : r[c])) + '</td>'; });
+        return '<tr>' + cells.join('') + '</tr>';
+      });
+      var hs = cols.map(function(c) { return '<th>' + c + '</th>'; });
+      body.innerHTML = '<table class="data-table"><thead><tr>' + hs.join('') + '</tr></thead><tbody>' + trs.join('') + '</tbody></table>';
+    }
+
+    function loadAll() {
+      var q = buildQuery();
+      apiGet('/api/reports/sessions' + q).then(function(rows) {
+        renderRows('rep-sessions-body', rows, ['id', 'hostname', 'username', 'transport', 'is_dead']);
+      }).catch(function(e) {
+        document.getElementById('rep-sessions-body').innerHTML = '<div style="color:var(--red)">' + escapeHtml(e.message) + '</div>';
+      });
+      apiGet('/api/reports/credentials' + q).then(function(rows) {
+        renderRows('rep-creds-body', rows, ['username', 'domain', 'host', 'is_cracked', 'hash_type']);
+      }).catch(function(e) {
+        document.getElementById('rep-creds-body').innerHTML = '<div style="color:var(--red)">' + escapeHtml(e.message) + '</div>';
+      });
+      apiGet('/api/reports/hosts' + q).then(function(rows) {
+        renderRows('rep-hosts-body', rows, ['hostname', 'agent_count', 'last_seen']);
+      }).catch(function(e) {
+        document.getElementById('rep-hosts-body').innerHTML = '<div style="color:var(--red)">' + escapeHtml(e.message) + '</div>';
+      });
+      apiGet('/api/reports/timeline' + q).then(function(rows) {
+        renderRows('rep-timeline-body', rows, ['created_at', 'action', 'target_type', 'result_status']);
+      }).catch(function(e) {
+        document.getElementById('rep-timeline-body').innerHTML = '<div style="color:var(--red)">' + escapeHtml(e.message) + '</div>';
+      });
+    }
+
+    document.getElementById('rep-generate').addEventListener('click', loadAll);
+    document.getElementById('rep-csv').addEventListener('click', function() {
+      ['sessions', 'credentials', 'hosts', 'timeline'].forEach(function(name) {
+        var url = '/api/reports/' + name + buildQuery() + '&format=csv';
+        var link = document.createElement('a');
+        link.href = url;
+        link.download = name + '.csv';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      });
+    });
+
+    loadAll();
+  };
+
+  window.router.register('/reports', function(main) {
+    window.renderReportsPage();
+  });
 })();
 
 // ── Init ───────────────────────────────────────────────────
