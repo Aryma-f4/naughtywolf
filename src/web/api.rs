@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::actions::{agents, beacons, creds, hosts, listeners, loot, modules, payloads, sessions, sliver, websites};
+use crate::actions::{agents, beacons, creds, hosts, listeners, loot, modules, payloads, sessions, sliver, stagers, websites};
 use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
@@ -106,6 +106,9 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/agents/{id}/fs/upload", axum::routing::post(agent_upload_handler))
         .route("/api/modules", axum::routing::get(list_modules_handler))
         .route("/api/agents/{id}/modules/{name}/exec", axum::routing::post(exec_module_handler))
+        .route("/api/stagers", axum::routing::get(list_stagers_handler).post(create_stager_handler))
+        .route("/api/stagers/{id}", axum::routing::put(update_stager_handler).delete(delete_stager_handler))
+        .route("/api/stagers/{id}/generate", axum::routing::post(generate_stager_handler))
 }
 
 async fn list_users(
@@ -934,6 +937,105 @@ async fn exec_module_handler(
         "success",
     ).await;
     Ok(Json(resp))
+}
+
+async fn list_stagers_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<Json<Vec<stagers::StagerResponse>>, (axum::http::StatusCode, String)> {
+    let rows = stagers::list_stagers(&state.pool).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(rows))
+}
+
+async fn create_stager_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    axum::Json(req): axum::Json<stagers::CreateStagerRequest>,
+) -> Result<Json<stagers::StagerResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    if req.name.is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "name is required".to_string()));
+    }
+    let result = stagers::create_stager(&state.pool, req).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "create_stager",
+        "stager",
+        Some(result.id.clone()),
+        None,
+        "success",
+    ).await;
+    Ok(Json(result))
+}
+
+async fn update_stager_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<stagers::UpdateStagerRequest>,
+) -> Result<Json<stagers::StagerResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    let result = stagers::update_stager(&state.pool, &id, req).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(result))
+}
+
+async fn delete_stager_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Admin role required".to_string()));
+    }
+    stagers::delete_stager(&state.pool, &id).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "delete_stager",
+        "stager",
+        Some(id),
+        None,
+        "success",
+    ).await;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn generate_stager_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<stagers::GenerateFromStagerRequest>,
+) -> Result<Json<payloads::GenerateResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    if req.lhost.is_empty() || req.lport == 0 {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "lhost and lport are required".to_string()));
+    }
+    let result = stagers::generate_from_stager(&state.pool, &id, req).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "generate_stager",
+        "stager",
+        Some(id),
+        None,
+        if result.success { "success" } else { "failed" },
+    ).await;
+    Ok(Json(result))
 }
 
 async fn shell_exec_handler(

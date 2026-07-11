@@ -73,3 +73,19 @@ pub struct Credential {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct StagerTemplate {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub goos: String,
+    pub goarch: String,
+    pub format: i32,
+    pub protocol: String,
+    pub is_beacon: bool,
+    pub obfuscate: bool,
+    pub sample_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

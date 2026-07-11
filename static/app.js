@@ -1269,6 +1269,138 @@ window.router.register('/sessions', function(main) {
   window.router.register('/modules', function(main) {
     window.renderModulesPage();
   });
+
+  // ── Stagers (Phase 2.5) ─────────────────────────────────
+  window.renderStagersPage = async function() {
+    var main = document.getElementById('main-content');
+    if (!main) return;
+    var html = '<div class="panel">'
+      + '<div class="panel-header"><h3>Stager Templates</h3>'
+      + '<div style="display:flex;gap:8px;align-items:center">'
+      + '<input class="input" id="stg-search" placeholder="Filter by name / OS / protocol" style="font-size:0.8rem;max-width:300px">'
+      + '<button class="btn btn-ghost btn-sm" id="stg-refresh">↻ Refresh</button>'
+      + '</div></div>'
+      + '<div class="panel-body">'
+      + '<form id="stg-add-form" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border-subtle)">'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Name</label><input class="input" id="stg-add-name" required></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">OS</label><select class="select" id="stg-add-os"><option>linux</option><option>windows</option><option>darwin</option></select></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Arch</label><select class="select" id="stg-add-arch"><option>amd64</option><option>386</option><option>arm64</option></select></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Format</label><select class="select" id="stg-add-fmt"><option value="2">exe</option><option value="0">shared</option><option value="3">service</option><option value="1">shellcode</option></select></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Protocol</label><select class="select" id="stg-add-proto"><option>mtls</option><option>http</option><option>https</option><option>dns</option></select></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">LHost</label><input class="input" id="stg-add-lhost" placeholder="0.0.0.0"></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">LPort</label><input class="input" id="stg-add-lport" type="number" value="443"></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Note</label><input class="input" id="stg-add-desc"></div>'
+      + '<div style="grid-column:span 4;display:flex;gap:8px;align-items:center">'
+      + '<label style="font-size:0.75rem"><input type="checkbox" id="stg-add-beacon"> Beacon</label>'
+      + '<label style="font-size:0.75rem"><input type="checkbox" id="stg-add-obfuscate" checked> Obfuscate</label>'
+      + '<button type="submit" class="btn btn-primary btn-sm">+ Add Template</button>'
+      + '<span id="stg-add-status" style="font-size:0.8rem;color:var(--text-muted)"></span>'
+      + '</div>'
+      + '</form>'
+      + '<div id="stg-list"></div>'
+      + '</div></div>';
+    main.innerHTML = html;
+
+    var FMT_NAMES = ['shared lib', 'shellcode', 'exe', 'service'];
+
+    function renderStagers(items) {
+      var q = (document.getElementById('stg-search')?.value || '').toLowerCase().trim();
+      var filtered = q ? items.filter(function(s) {
+        return (s.name + ' ' + s.goos + ' ' + s.protocol + ' ' + s.description).toLowerCase().indexOf(q) >= 0;
+      }) : items;
+      var list = document.getElementById('stg-list');
+      if (!filtered.length) {
+        list.innerHTML = '<div class="empty-state"><div class="empty-icon">📋</div><h3>No templates</h3><p>Add one above to get started.</p></div>';
+        return;
+      }
+      var rows = filtered.map(function(s) {
+        var fmtStr = FMT_NAMES[s.format] || 'unknown';
+        var protoBadge = s.protocol === 'mtls' ? 'badge-active' : 'badge-warning';
+        var beaconBadge = s.is_beacon ? '<span class="badge badge-active">beacon</span>' : '';
+        var obfBadge = s.obfuscate ? '<span class="badge badge-active">obfuscate</span>' : '';
+        var generateBtn = '<button class="btn btn-primary btn-sm" data-act="generate" data-id="' + s.id + '" data-name="' + escapeHtml(s.name) + '">Generate</button>';
+        var deleteBtn = '<button class="btn btn-ghost btn-sm" data-act="delete" data-id="' + s.id + '">×</button>';
+        return [
+          '<strong>' + escapeHtml(s.name) + '</strong> ' + beaconBadge,
+          '<span class="badge ' + protoBadge + '">' + escapeHtml(s.protocol) + '</span>',
+          escapeHtml(s.goos) + '/' + escapeHtml(s.goarch),
+          escapeHtml(fmtStr),
+          s.sample_count,
+          generateBtn + ' ' + deleteBtn,
+        ];
+      });
+      list.innerHTML = window.renderTable(['Name','Proto','OS/Arch','Format','Uses','Action'], rows);
+
+      list.querySelectorAll('button[data-act="delete"]').forEach(function(b) {
+        b.addEventListener('click', async function() {
+          if (!confirm('Delete template ' + b.dataset.id + '?')) return;
+          try {
+            await fetch('/api/stagers/' + b.dataset.id, { method: 'DELETE', credentials: 'same-origin' });
+            showToast('Template deleted', 'success');
+            load();
+          } catch(e) { showToast(e.message, 'error'); }
+        });
+      });
+
+      list.querySelectorAll('button[data-act="generate"]').forEach(function(b) {
+        b.addEventListener('click', async function() {
+          var lhost = prompt('LHost (e.g. 10.0.0.1)?', '127.0.0.1');
+          if (!lhost) return;
+          var lport = prompt('LPort (e.g. 443)?', '443');
+          if (!lport) return;
+          b.disabled = true;
+          b.textContent = 'Generating…';
+          try {
+            var r = await apiPost('/api/stagers/' + b.dataset.id + '/generate', { lhost: lhost, lport: parseInt(lport) });
+            if (r.success) {
+              showToast(r.message, 'success');
+              window.location.hash = '#/payloads';
+            } else {
+              showToast(r.message, 'error');
+            }
+          } catch(e) { showToast(e.message, 'error'); }
+          b.disabled = false;
+          b.textContent = 'Generate';
+        });
+      });
+    }
+
+    function load() {
+      apiGet('/api/stagers').then(function(data) {
+        window.__stgData = data || [];
+        renderStagers(window.__stgData);
+      }).catch(function(e) {
+        document.getElementById('stg-list').innerHTML = '<div class="empty-state"><div class="empty-icon">⚠</div><h3>Error</h3><p>' + escapeHtml(e.message) + '</p></div>';
+      });
+    }
+
+    document.getElementById('stg-search')?.addEventListener('input', function() { renderStagers(window.__stgData || []); });
+    document.getElementById('stg-refresh')?.addEventListener('click', load);
+    document.getElementById('stg-add-form')?.addEventListener('submit', function(e) {
+      e.preventDefault();
+      var body = {
+        name: document.getElementById('stg-add-name').value,
+        description: document.getElementById('stg-add-desc').value || undefined,
+        goos: document.getElementById('stg-add-os').value,
+        goarch: document.getElementById('stg-add-arch').value,
+        format: parseInt(document.getElementById('stg-add-fmt').value),
+        protocol: document.getElementById('stg-add-proto').value,
+        is_beacon: document.getElementById('stg-add-beacon').checked || undefined,
+        obfuscate: document.getElementById('stg-add-obfuscate').checked || undefined,
+      };
+      var status = document.getElementById('stg-add-status');
+      status.textContent = 'Adding…';
+      apiPost('/api/stagers', body)
+        .then(function() { status.textContent = '✅ Added'; document.getElementById('stg-add-form').reset(); load(); })
+        .catch(function(e) { status.textContent = '❌ ' + e.message; });
+    });
+
+    load();
+  };
+
+  window.router.register('/stagers', function(main) {
+    window.renderStagersPage();
+  });
 })();
 
 // ── Init ───────────────────────────────────────────────────
