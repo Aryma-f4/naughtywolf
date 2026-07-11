@@ -1401,6 +1401,125 @@ window.router.register('/sessions', function(main) {
   window.router.register('/stagers', function(main) {
     window.renderStagersPage();
   });
+
+  // ── Pivots & Port Forwards (Phase 3.1) ───────────────────
+  window.renderPivotsPage = async function() {
+    var main = document.getElementById('main-content');
+    if (!main) return;
+    var html = '<div class="panel">'
+      + '<div class="panel-header"><h3>Pivots &amp; Port Forwards</h3>'
+      + '<button class="btn btn-ghost btn-sm" id="pv-refresh">↻ Refresh</button>'
+      + '</div>'
+      + '<div class="panel-body">'
+      // Pivot listener creation
+      + '<form id="pv-create-form" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border-subtle)">'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Type</label><select class="select" id="pv-type"><option value="tcp">TCP</option><option value="named-pipe">Named Pipe</option></select></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Bind Address</label><input class="input" id="pv-bind" placeholder="0.0.0.0"></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Port</label><input class="input" id="pv-port" type="number" value="8080"></div>'
+      + '<button type="submit" class="btn btn-primary btn-sm" style="align-self:end">Start Pivot</button>'
+      + '</form>'
+      + '<h4 style="font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;margin-top:12px">Pivot Graph</h4>'
+      + '<div id="pv-graph" style="min-height:180px;background:var(--bg-app);padding:8px;border-radius:4px;font-family:var(--font-mono);font-size:0.85rem"></div>'
+      + '<h4 style="font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;margin-top:18px">Active Pivot Listeners</h4>'
+      + '<div id="pv-list"></div>'
+      // Port forward creation
+      + '<h4 style="font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;margin-top:18px">Port Forward</h4>'
+      + '<form id="pv-fwd-form" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:12px">'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Session ID</label><input class="input" id="fwd-sid" placeholder="agent-session-id"></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Remote Host:Port</label><input class="input" id="fwd-host" placeholder="127.0.0.1:445"></div>'
+      + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Bind Addr</label><input class="input" id="fwd-bind" placeholder="0.0.0.0"></div>'
+      + '<button type="submit" class="btn btn-primary btn-sm" style="align-self:end">Forward</button>'
+      + '</form>'
+      + '</div></div>';
+    main.innerHTML = html;
+
+    function renderGraph(nodes) {
+      var g = document.getElementById('pv-graph');
+      if (!nodes.length) {
+        g.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:30px">No active pivots.</div>';
+        return;
+      }
+      var flat = [];
+      function walk(n, parent) {
+        flat.push({ peer: n.peer_id, name: n.name, host: n.hostname, parent: parent, dead: n.is_dead });
+        n.children.forEach(function(c) { walk(c, n.peer_id); });
+      }
+      nodes.forEach(function(n) { walk(n, null); });
+      var lines = flat.map(function(e) {
+        var prefix = e.parent != null ? '└─ ' : '● ';
+        var color = e.dead ? 'var(--text-dim)' : 'var(--cyan)';
+        var safe = function(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;'); };
+        return '<div style="color:' + color + '">' + prefix + '<strong>[' + safe(e.peer) + ']</strong> ' + safe(e.name) + ' <span style="color:var(--text-muted)">@ ' + safe(e.host) + '</span></div>';
+      }).join('');
+      g.innerHTML = '<div style="font-family:var(--font-mono);font-size:0.8rem;line-height:1.7">' + lines + '</div>';
+    }
+
+    function renderList(items) {
+      var list = document.getElementById('pv-list');
+      if (!items.length) {
+        list.innerHTML = '<div style="color:var(--text-muted);font-size:0.8rem;padding:8px 0">No active pivot listeners.</div>';
+        return;
+      }
+      var rows = items.map(function(p) {
+        return [
+          '<strong>' + escapeHtml(p.bind_address) + '</strong>',
+          escapeHtml(p.protocol),
+          '<button class="btn btn-danger btn-sm" data-stop="' + p.id + '">Stop</button>',
+        ];
+      });
+      list.innerHTML = window.renderTable(['Bind','Proto','Action'], rows);
+      list.querySelectorAll('button[data-stop]').forEach(function(b) {
+        b.addEventListener('click', async function() {
+          try {
+            await apiPost('/api/pivots/stop', { id: parseInt(b.dataset.stop) });
+            showToast('Pivot stopped', 'success');
+            loadAll();
+          } catch(e) { showToast(e.message, 'error'); }
+        });
+      });
+    }
+
+    function loadAll() {
+      apiGet('/api/pivots/graph').then(renderGraph).catch(function(e) {
+        document.getElementById('pv-graph').innerHTML = '<div style="color:var(--red)">' + escapeHtml(e.message) + '</div>';
+      });
+      apiGet('/api/pivots').then(renderList).catch(function() {});
+    }
+
+    document.getElementById('pv-refresh').addEventListener('click', loadAll);
+
+    document.getElementById('pv-create-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var type = document.getElementById('pv-type').value;
+      var bind = document.getElementById('pv-bind').value;
+      var port = parseInt(document.getElementById('pv-port').value || '8080');
+      apiPost('/api/pivots/start', { type: type, bind_address: bind || '0.0.0.0' })
+        .then(function(r) { showToast(r.message, 'success'); loadAll(); })
+        .catch(function(e) { showToast(e.message, 'error'); });
+    });
+
+    document.getElementById('pv-fwd-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var sid = document.getElementById('fwd-sid').value.trim();
+      var hostport = document.getElementById('fwd-host').value.trim();
+      var bind = document.getElementById('fwd-bind').value.trim();
+      if (!sid || !hostport) { showToast('Session ID and host:port required', 'error'); return; }
+      var parts = hostport.split(':');
+      var host = parts[0];
+      var port = parseInt(parts[1] || '0');
+      apiPost('/api/agents/' + encodeURIComponent(sid) + '/portfwd', {
+        session_id: sid, remote_address: host, remote_port: port, bind_address: bind || undefined,
+      })
+        .then(function(r) { showToast(r.message, 'success'); })
+        .catch(function(e) { showToast(e.message, 'error'); });
+    });
+
+    loadAll();
+  };
+
+  window.router.register('/pivots', function(main) {
+    window.renderPivotsPage();
+  });
 })();
 
 // ── Init ───────────────────────────────────────────────────

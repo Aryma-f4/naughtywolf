@@ -3,6 +3,7 @@ pub mod beacons;
 pub mod creds;
 pub mod hosts;
 pub mod modules;
+pub mod pivots;
 pub mod stagers;
 pub mod listeners;
 pub mod loot;

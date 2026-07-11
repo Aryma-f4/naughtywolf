@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::actions::{agents, beacons, creds, hosts, listeners, loot, modules, payloads, sessions, sliver, stagers, websites};
+use crate::actions::{agents, beacons, creds, hosts, listeners, loot, modules, payloads, pivots, sessions, sliver, stagers, websites};
 use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
@@ -109,6 +109,12 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/stagers", axum::routing::get(list_stagers_handler).post(create_stager_handler))
         .route("/api/stagers/{id}", axum::routing::put(update_stager_handler).delete(delete_stager_handler))
         .route("/api/stagers/{id}/generate", axum::routing::post(generate_stager_handler))
+        .route("/api/pivots", axum::routing::get(list_pivots_handler))
+        .route("/api/pivots/graph", axum::routing::get(pivot_graph_handler))
+        .route("/api/pivots/start", axum::routing::post(start_pivot_handler))
+        .route("/api/pivots/stop", axum::routing::post(stop_pivot_handler))
+        .route("/api/agents/{id}/portfwd", axum::routing::post(create_portfwd_handler))
+        .route("/api/agents/{id}/socks", axum::routing::post(start_socks_handler))
 }
 
 async fn list_users(
@@ -1036,6 +1042,104 @@ async fn generate_stager_handler(
         if result.success { "success" } else { "failed" },
     ).await;
     Ok(Json(result))
+}
+
+async fn list_pivots_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<Json<Vec<pivots::PivotListener>>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let p = pivots::list_pivots(conn).await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(p))
+}
+
+async fn pivot_graph_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<Json<Vec<pivots::PivotNode>>, (axum::http::StatusCode, String)> {
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let g = pivots::get_pivot_graph(conn).await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(g))
+}
+
+async fn start_pivot_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    axum::Json(req): axum::Json<pivots::CreatePivotRequest>,
+) -> Result<Json<pivots::CreatePivotResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let resp = pivots::start_pivot(conn, req).await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(resp))
+}
+
+async fn stop_pivot_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    axum::Json(req): axum::Json<pivots::StopPivotRequest>,
+) -> Result<Json<pivots::StopPivotResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let resp = pivots::stop_pivot(conn, req).await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(resp))
+}
+
+async fn create_portfwd_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(mut req): axum::Json<pivots::CreatePortFwdRequest>,
+) -> Result<Json<pivots::CreatePortFwdResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    req.session_id = id.clone();
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let resp = pivots::create_portfwd(conn, req).await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(resp))
+}
+
+async fn start_socks_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(mut req): axum::Json<pivots::StartSocksRequest>,
+) -> Result<Json<pivots::StartSocksResponse>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin && user.0.role != Role::Operator {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Operator or Admin role required".to_string()));
+    }
+    req.session_id = id.clone();
+    let mut guard = state.sliver.lock().await;
+    let conn = guard.as_mut().ok_or_else(|| {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Sliver not connected".to_string())
+    })?;
+    let resp = pivots::start_socks(conn, req).await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(resp))
 }
 
 async fn shell_exec_handler(
