@@ -23,6 +23,22 @@ pub struct DashboardStats {
     pub sessions: u32,
     pub beacons: u32,
     pub jobs: u32,
+    pub first_agent_ts: Option<String>,
+    pub operation_seconds: i64,
+    pub recent_event_count: u32,
+}
+
+#[derive(Serialize)]
+pub struct TopTarget {
+    pub hostname: String,
+    pub agent_count: u32,
+    pub last_seen: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DashboardEnriched {
+    pub stats: DashboardStats,
+    pub top_targets: Vec<TopTarget>,
 }
 
 #[derive(Serialize)]
@@ -150,39 +166,58 @@ async fn list_users(
 async fn dashboard_stats(
     State(state): State<AppState>,
     _user: AuthenticatedUserGuard,
-) -> Result<Json<DashboardStats>, (axum::http::StatusCode, String)> {
-    let mut guard = state.sliver.lock().await;
-    let conn = match guard.as_mut() {
-        Some(c) => c,
-        None => {
-            return Ok(Json(DashboardStats {
-                active_listeners: 0,
-                sessions: 0,
-                beacons: 0,
-                jobs: 0,
-            }));
+) -> Result<Json<DashboardEnriched>, (axum::http::StatusCode, String)> {
+    let mut stats = DashboardStats {
+        active_listeners: 0,
+        sessions: 0,
+        beacons: 0,
+        jobs: 0,
+        first_agent_ts: None,
+        operation_seconds: 0,
+        recent_event_count: 0,
+    };
+
+    // Sliver-backed stats
+    if let Ok(mut guard) = state.sliver.try_lock() {
+        if let Some(conn) = guard.as_mut() {
+            if let Ok(j) = listeners::list_jobs(conn).await { stats.active_listeners = j.len() as u32; stats.jobs = stats.active_listeners; }
+            if let Ok(s) = sessions::list_sessions(conn).await { stats.sessions = s.len() as u32; }
+            if let Ok(b) = beacons::list_beacons(conn).await { stats.beacons = b.len() as u32; }
+
+            // Earliest last_checkin across all sessions/beacons for operation timer
+            // Sessions are kept in-memory by Sliver, not persisted to our DB.
+            // So we compute the operation timer from local audit log instead.
         }
-    };
+    }
 
-    let jobs = match listeners::list_jobs(conn).await {
-        Ok(j) => j.len() as u32,
-        Err(_) => 0,
-    };
-    let sessions = match sessions::list_sessions(conn).await {
-        Ok(s) => s.len() as u32,
-        Err(_) => 0,
-    };
-    let beacons = match beacons::list_beacons(conn).await {
-        Ok(b) => b.len() as u32,
-        Err(_) => 0,
-    };
+    // Operation timer from earliest audit_events row
+    if let Ok((first_ts,)) = sqlx::query_as::<_, (Option<i64>,)>(
+        "SELECT EXTRACT(EPOCH FROM MIN(created_at))::bigint FROM audit_events"
+    ).fetch_one(&state.pool).await {
+        if let Some(ts) = first_ts {
+            stats.first_agent_ts = Some(ts_to_string(ts));
+            stats.operation_seconds = chrono::Utc::now().timestamp().max(ts) - ts;
+        }
+    }
 
-    Ok(Json(DashboardStats {
-        active_listeners: jobs,
-        sessions,
-        beacons,
-        jobs,
-    }))
+    // DB-backed stats
+    if let Ok((c,)) = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM audit_events WHERE created_at > now() - interval '1 hour'"
+    ).fetch_one(&state.pool).await {
+        stats.recent_event_count = c as u32;
+    }
+
+    // Top targets: group by hostname in credentials
+    let top_rows: Result<Vec<(String, i64, Option<String>)>, _> = sqlx::query_as(
+        "SELECT host, COUNT(*)::bigint, MAX(created_at)::text
+         FROM credentials WHERE host != '' GROUP BY host
+         ORDER BY COUNT(*) DESC, MAX(created_at) DESC LIMIT 5",
+    ).fetch_all(&state.pool).await;
+    let top_targets = top_rows.unwrap_or_default().into_iter().map(|r| TopTarget {
+        hostname: r.0, agent_count: r.1 as u32, last_seen: r.2,
+    }).collect();
+
+    Ok(Json(DashboardEnriched { stats, top_targets }))
 }
 
 async fn list_sessions(

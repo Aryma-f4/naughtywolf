@@ -178,15 +178,28 @@
     main.innerHTML = window.renderLoading();
     let cancelled = false;
 
+    function fmtDuration(s) {
+      s = Number(s) || 0;
+      var d = Math.floor(s / 86400);
+      var h = Math.floor((s % 86400) / 3600);
+      var m = Math.floor((s % 3600) / 60);
+      var sec = s % 60;
+      if (d > 0) return d + 'd ' + h + 'h';
+      if (h > 0) return h + 'h ' + m + 'm';
+      if (m > 0) return m + 'm ' + sec + 's';
+      return sec + 's';
+    }
+
     (async () => {
       try {
-        const stats = await apiGet('/api/dashboard/stats')
-          .catch(() => ({ active_listeners: 0, sessions: 0, beacons: 0, jobs: 0 }));
-
+        const data = await apiGet('/api/dashboard/stats')
+          .catch(() => ({ stats: { active_listeners: 0, sessions: 0, beacons: 0, jobs: 0, recent_event_count: 0, operation_seconds: 0, first_agent_ts: null }, top_targets: [] }));
+        const stats = data.stats || {};
+        const targets = data.top_targets || [];
         if (cancelled) return;
 
-        // Metric cards
-        const metrics = `
+        // Live ops header strip
+        const headerStrip = `
           <div class="metric-grid">
             <div class="metric-card">
               <div class="metric-label">Listeners</div>
@@ -201,8 +214,48 @@
               <div class="metric-value">${stats.beacons || 0}</div>
             </div>
             <div class="metric-card">
-              <div class="metric-label">Jobs</div>
-              <div class="metric-value">${stats.jobs || 0}</div>
+              <div class="metric-label">Events (1h)</div>
+              <div class="metric-value">${stats.recent_event_count || 0}</div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-label">Operation</div>
+              <div class="metric-value" style="font-size:1.1rem">${fmtDuration(stats.operation_seconds)}</div>
+              <div class="metric-label" style="margin-top:4px">${escapeHtml(stats.first_agent_ts || '—')}</div>
+            </div>
+          </div>`;
+
+        // Top targets panel
+        var targetsRows;
+        if (!targets.length) {
+          targetsRows = '<div style="color:var(--text-muted);padding:8px 0;font-size:0.85rem">No credential data yet — collect creds from sessions to populate.</div>';
+        } else {
+          targetsRows = window.renderTable(
+            ['Host', 'Creds', 'Last seen'],
+            targets.map(function(t) {
+              return [
+                '<strong>' + escapeHtml(t.hostname) + '</strong>',
+                String(t.agent_count || 0),
+                escapeHtml(t.last_seen || '—'),
+              ];
+            })
+          );
+        }
+        const targetsPanel = `
+          <div class="panel">
+            <div class="panel-header"><h3>Top Targets</h3></div>
+            <div class="panel-body">${targetsRows}</div>
+          </div>`;
+
+        // Live operations strip with quick actions
+        const opStrip = `
+          <div class="panel">
+            <div class="panel-header"><h3>Live Operations</h3></div>
+            <div class="panel-body" style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-ghost btn-sm" id="dash-refresh">↻ Refresh</button>
+              <a href="#/graph" class="btn btn-ghost btn-sm">View Chain Graph</a>
+              <a href="#/agents" class="btn btn-ghost btn-sm">Manage Agents</a>
+              <a href="#/listeners" class="btn btn-ghost btn-sm">Listeners</a>
+              <a href="#/reports" class="btn btn-ghost btn-sm">Reports</a>
             </div>
           </div>`;
 
@@ -227,7 +280,36 @@
             </div>
           </div>`;
 
-        main.innerHTML = metrics + graphPreview + eventPanel;
+        main.innerHTML = headerStrip + opStrip
+          + '<div style="display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-top:8px">'
+          + '<div>' + targetsPanel + '</div>'
+          + '<div>' + graphPreview + '</div>'
+          + '</div>'
+          + eventPanel;
+
+        document.getElementById('dash-refresh')?.addEventListener('click', function() {
+          window.router.navigate('#/dashboard');
+        });
+        // Auto-refresh every 30 seconds (silent, no spinner)
+        var refreshTimer = setInterval(function() {
+          if (cancelled) return;
+          apiGet('/api/dashboard/stats').then(function(d) {
+            var s = (d && d.stats) || {};
+            var valEl = function(label, val) {
+              var els = document.querySelectorAll('.metric-label');
+              for (var i = 0; i < els.length; i++) {
+                if (els[i].textContent === label && els[i].nextElementSibling) {
+                  els[i].nextElementSibling.textContent = val;
+                  return;
+                }
+              }
+            };
+            valEl('Listeners', String(s.active_listeners || 0));
+            valEl('Sessions', String(s.sessions || 0));
+            valEl('Beacons', String(s.beacons || 0));
+            valEl('Events (1h)', String(s.recent_event_count || 0));
+          }).catch(function(){});
+        }, 30000);
       } catch (err) {
         if (!cancelled) main.innerHTML = window.renderError(err.message);
       }
