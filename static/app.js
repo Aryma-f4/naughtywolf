@@ -88,6 +88,25 @@
     return res.json();
   };
 
+  window.apiPut = async function(path, body) {
+    const res = await fetch(path, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+      credentials: 'same-origin',
+    });
+    if (res.redirected || res.status === 401) {
+      window.location.href = '/login';
+      throw new Error('Unauthorized');
+    }
+    if (res.status === 204) return null;
+    if (!res.ok) {
+      const text = await res.text().catch(() => 'Unknown error');
+      throw new Error(`API ${res.status}: ${text.slice(0, 200)}`);
+    }
+    return res.json().catch(() => null);
+  };
+
   window.apiDelete = async function(path) {
     const res = await fetch(path, {
       method: 'DELETE',
@@ -1070,31 +1089,144 @@ window.router.register('/sessions', function(main) {
   });
 
   // ── Admin ────────────────────────────────────────────────
-  window.router.register('/admin', function(main) {
-    main.innerHTML = window.renderLoading();
-    let cancelled = false;
-    (async () => {
+  // ── Admin (Phase 3.4) ────────────────────────────────────
+  window.renderAdminPage = async function() {
+    var main = document.getElementById('main-content');
+    if (!main) return;
+    main.innerHTML = '<div class="panel"><div class="panel-header"><h3>Administration</h3>'
+      + '<button class="btn btn-ghost btn-sm" id="adm-refresh">↻ Refresh</button>'
+      + '</div>'
+      + '<div class="panel-body" id="adm-body">Loading…</div></div>';
+    var body = document.getElementById('adm-body');
+
+    function statusBadge(s) {
+      if (s === 'ok') return '<span class="badge badge-active">ok</span>';
+      if (s === 'degraded') return '<span class="badge badge-warning">degraded</span>';
+      return '<span class="badge badge-dead">down</span>';
+    }
+
+    async function load() {
       try {
-        const users = await apiGet('/api/users');
-        if (cancelled) return;
-        if (!users || users.length === 0) {
-          main.innerHTML = window.renderEmpty('⚙️', 'No Users', 'Create users from the CLI.');
-          return;
-        }
-        const rows = users.map(u => [
-          escapeHtml(u.username),
-          `<span class="badge ${u.role === 'admin' ? 'badge-active' : 'badge-unknown'}">${escapeHtml(u.role)}</span>`,
-          u.disabled ? `<span class="badge badge-dead">Disabled</span>` : `<span class="badge badge-active">Active</span>`,
-          escapeHtml(u.created_at || '—'),
+        var [h, m, users, settings] = await Promise.all([
+          apiGet('/api/health').catch(function() { return null; }),
+          apiGet('/api/meta').catch(function() { return null; }),
+          apiGet('/api/users').catch(function() { return []; }),
+          apiGet('/api/admin/settings').catch(function() { return []; }),
         ]);
-        main.innerHTML = '<div class="panel"><div class="panel-header"><h3>User Management</h3></div><div class="panel-body">'
-          + window.renderTable(['Username','Role','Status','Created'], rows)
-          + '</div></div>';
-      } catch (err) {
-        if (!cancelled) main.innerHTML = window.renderError(err.message);
+
+        var html = '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px">'
+          + '<div class="metric-card"><div class="metric-label">DB</div><div class="metric-value" style="font-size:1.1rem">' + (h && h.db_ok ? '<span class="badge badge-active">ok</span>' : '<span class="badge badge-dead">down</span>') + '</div></div>'
+          + '<div class="metric-card"><div class="metric-label">Sliver</div><div class="metric-value" style="font-size:1.1rem">' + (h && h.sliver_connected ? '<span class="badge badge-active">ok</span>' : '<span class="badge badge-dead">off</span>') + '</div></div>'
+          + '<div class="metric-card"><div class="metric-label">Status</div><div class="metric-value" style="font-size:1.1rem">' + (h ? statusBadge(h.status) : '<span class="badge badge-unknown">?</span>') + '</div></div>'
+          + '</div>';
+
+        html += '<div class="panel" style="margin-top:12px"><div class="panel-header"><h3>Server Info</h3></div><div class="panel-body" style="font-family:var(--font-mono);font-size:0.8rem">';
+        if (m) {
+          html += '<div class="detail-row"><span>Version</span><span>' + escapeHtml(m.version || '?') + ' (' + escapeHtml(m.build || '') + ')</span></div>'
+            + '<div class="detail-row"><span>OS/Arch</span><span>' + escapeHtml(m.goos || '?') + '/' + escapeHtml(m.arch || '?') + '</span></div>'
+            + '<div class="detail-row"><span>Started</span><span>' + escapeHtml(m.started_at || '?') + '</span></div>';
+        } else {
+          html += '<div style="color:var(--text-muted)">meta unavailable</div>';
+        }
+        html += '</div></div>';
+
+        var userRows;
+        if (!users.length) {
+          userRows = '<div style="color:var(--text-muted);font-size:0.85rem;padding:8px 0">No users.</div>';
+        } else {
+          userRows = window.renderTable(['Username','Role','Status','Created','Actions'], users.map(function(u) {
+            var status = u.disabled ? '<span class="badge badge-dead">disabled</span>' : '<span class="badge badge-active">active</span>';
+            return [
+              '<strong>' + escapeHtml(u.username) + '</strong>',
+              '<select class="select" data-role="' + u.id + '" data-username="' + escapeHtml(u.username) + '" style="font-size:0.75rem">'
+                + ['admin','operator','viewer'].map(function(r) { return '<option' + (u.role === r ? ' selected' : '') + '>' + r + '</option>'; }).join('')
+                + '</select>',
+              status,
+              escapeHtml(u.created_at || '—'),
+              '<button class="btn btn-ghost btn-sm" data-toggle="' + u.id + '" data-disabled="' + (u.disabled ? '1' : '0') + '">' + (u.disabled ? 'Enable' : 'Disable') + '</button>',
+            ];
+          }));
+        }
+        html += '<div class="panel"><div class="panel-header"><h3>User Management</h3></div><div class="panel-body">' + userRows + '</div></div>';
+
+        var settingRows;
+        if (!settings.length) {
+          settingRows = '<div style="color:var(--text-muted);font-size:0.85rem;padding:8px 0">No settings configured.</div>';
+        } else {
+          settingRows = window.renderTable(
+            ['Key', 'Value', 'Description', 'Updated'],
+            settings.map(function(s) {
+              return [
+                '<code>' + escapeHtml(s.key) + '</code>',
+                '<code style="font-size:0.7rem">' + escapeHtml(JSON.stringify(s.value || {})) + '</code>',
+                escapeHtml(s.description || ''),
+                escapeHtml(s.updated_at || ''),
+              ];
+            })
+          );
+        }
+        var settingForm = '<form id="adm-set-form" style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:6px;margin-top:12px;align-items:end">'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Key</label><input class="input" id="adm-set-key" placeholder="alert_email"></div>'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Value (JSON)</label><input class="input" id="adm-set-val" placeholder=\'"on"\'></div>'
+          + '<div><label style="font-size:0.7rem;color:var(--text-muted)">Description</label><input class="input" id="adm-set-desc"></div>'
+          + '<button type="submit" class="btn btn-primary btn-sm">Save</button>'
+          + '</form>';
+        html += '<div class="panel"><div class="panel-header"><h3>Server Settings</h3></div><div class="panel-body">' + settingRows + settingForm + '</div></div>';
+
+        body.innerHTML = html;
+
+        // Wire up role + disabled toggles
+        body.querySelectorAll('select[data-role]').forEach(function(s) {
+          s.addEventListener('change', async function() {
+            try {
+              var id = s.dataset.role;
+              var role = s.value;
+              var userRow = users.find(function(u) { return u.id === id; });
+              await apiPut('/api/admin/users/' + id, { role: role, disabled: userRow ? userRow.disabled : false });
+              showToast('Role updated', 'success');
+              load();
+            } catch(e) { showToast(e.message, 'error'); }
+          });
+        });
+        body.querySelectorAll('button[data-toggle]').forEach(function(b) {
+          b.addEventListener('click', async function() {
+            try {
+              var id = b.dataset.toggle;
+              var disabled = b.dataset.disabled !== '1';
+              await apiPut('/api/admin/users/' + id, { disabled: disabled });
+              showToast(disabled ? 'User disabled' : 'User enabled', 'success');
+              load();
+            } catch(e) { showToast(e.message, 'error'); }
+          });
+        });
+        var sf = document.getElementById('adm-set-form');
+        if (sf) {
+          sf.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            var k = document.getElementById('adm-set-key').value.trim();
+            var v = document.getElementById('adm-set-val').value.trim();
+            var d = document.getElementById('adm-set-desc').value.trim();
+            if (!k) return;
+            var parsed;
+            try { parsed = JSON.parse(v); } catch(_) { parsed = v; }
+            try {
+              await apiPut('/api/admin/settings/' + encodeURIComponent(k), { value: parsed, description: d });
+              showToast('Setting saved', 'success');
+              load();
+            } catch(e) { showToast(e.message, 'error'); }
+          });
+        }
+      } catch(e) {
+        body.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠</div><h3>Error</h3><p>' + escapeHtml(e.message) + '</p></div>';
       }
-    })();
-    return () => { cancelled = true; };
+    }
+
+    document.getElementById('adm-refresh').addEventListener('click', load);
+    load();
+  };
+
+  window.router.register('/admin', function(main) {
+    window.renderAdminPage();
   });
 
   // ── Audit ────────────────────────────────────────────────

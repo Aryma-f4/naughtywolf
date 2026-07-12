@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod agents;
 pub mod beacons;
 pub mod creds;

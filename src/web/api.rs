@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::actions::{agents, beacons, creds, hosts, listeners, loot, modules, payloads, pivots, reports, sessions, sliver, stagers, websites};
+use crate::actions::{admin, agents, beacons, creds, hosts, listeners, loot, modules, payloads, pivots, reports, sessions, sliver, stagers, websites};
 use crate::auth::{middleware::AuthenticatedUserGuard, rbac::Role};
 use crate::db;
 use crate::web::routes::AppState;
@@ -135,6 +135,11 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/reports/credentials", axum::routing::get(report_credentials_handler))
         .route("/api/reports/hosts", axum::routing::get(report_hosts_handler))
         .route("/api/reports/timeline", axum::routing::get(report_timeline_handler))
+        .route("/api/admin/users/{id}", axum::routing::put(admin_update_user_handler).delete(admin_delete_user_handler))
+        .route("/api/admin/settings", axum::routing::get(admin_list_settings_handler))
+        .route("/api/admin/settings/{key}", axum::routing::put(admin_upsert_setting_handler))
+        .route("/api/health", axum::routing::get(health_handler))
+        .route("/api/meta", axum::routing::get(meta_handler))
 }
 
 async fn list_users(
@@ -1246,6 +1251,107 @@ async fn report_hosts_handler(
     let rows = reports::report_hosts(&state.pool, q.clone()).await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(format_response(&q, rows, "hosts_report"))
+}
+
+async fn admin_update_user_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+    axum::Json(req): axum::Json<admin::UpdateUserRequest>,
+) -> Result<Json<admin::UserAdmin>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Admin only".to_string()));
+    }
+    let updated = admin::update_user(&state.pool, &id, req).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "update_user",
+        "user",
+        Some(id.clone()),
+        None,
+        "success",
+    ).await;
+    Ok(Json(updated))
+}
+
+async fn admin_delete_user_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Admin only".to_string()));
+    }
+    admin::delete_user(&state.pool, &id).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    crate::actions::audit_action(
+        &state.pool,
+        &user.0,
+        None,
+        "delete_user",
+        "user",
+        Some(id.clone()),
+        None,
+        "success",
+    ).await;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn admin_list_settings_handler(
+    State(state): State<AppState>,
+    _user: AuthenticatedUserGuard,
+) -> Result<Json<Vec<admin::SettingEntry>>, (axum::http::StatusCode, String)> {
+    let rows = admin::list_settings(&state.pool).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(rows))
+}
+
+async fn admin_upsert_setting_handler(
+    State(state): State<AppState>,
+    user: AuthenticatedUserGuard,
+    Path(key): Path<String>,
+    axum::Json(req): axum::Json<admin::UpsertSettingRequest>,
+) -> Result<Json<admin::SettingEntry>, (axum::http::StatusCode, String)> {
+    if user.0.role != Role::Admin {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Admin only".to_string()));
+    }
+    let updated = admin::upsert_setting(&state.pool, &key, req, user.0.id).await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(updated))
+}
+
+async fn health_handler(
+    State(state): State<AppState>,
+) -> Result<Json<admin::HealthReport>, (axum::http::StatusCode, String)> {
+    let db_ok = admin::db_ok(&state.pool).await;
+    let (sliver_connected, sessions, listeners) = {
+        let mut s = 0;
+        let mut l = 0;
+        let mut connected = false;
+        if let Ok(mut guard) = state.sliver.try_lock() {
+            if let Some(c) = guard.as_mut() {
+                connected = true;
+                if let Ok(se) = sessions::list_sessions(c).await { s = se.len() as u32; }
+                if let Ok(li) = listeners::list_jobs(c).await { l = li.len() as u32; }
+            }
+        }
+        (connected, s, l)
+    };
+    Ok(Json(admin::HealthReport {
+        status: if db_ok && sliver_connected { "ok" } else if db_ok { "degraded" } else { "down" }.to_string(),
+        db_ok,
+        sliver_connected,
+        active_sessions: sessions,
+        active_listeners: listeners,
+        uptime_seconds: 0,
+    }))
+}
+
+async fn meta_handler() -> Json<admin::MetaInfo> {
+    Json(admin::build_meta())
 }
 
 async fn report_timeline_handler(
