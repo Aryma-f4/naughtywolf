@@ -2,6 +2,9 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 
+pub mod models;
+pub mod repositories;
+
 /// Create a SQLite connection pool with foreign-key constraints enabled.
 pub async fn create_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let options = SqliteConnectOptions::from_str(database_url)?.foreign_keys(true);
