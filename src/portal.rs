@@ -7,9 +7,49 @@ use axum::{
 use tower_sessions::Session;
 use uuid::Uuid;
 
+use crate::{
+    AppError,
+    auth::{AuthenticatedUser, rbac::Role},
+    db::{models::Operation, repositories::Repository},
+};
+
 pub mod templates;
 
 pub const CSRF_TOKEN_KEY: &str = "login_csrf_token";
+
+#[derive(Default, Debug, PartialEq)]
+pub struct DashboardSummary {
+    pub operation_count: i64,
+    pub asset_count: i64,
+    pub run_count: i64,
+    pub evidence_count: i64,
+    pub audit_count: i64,
+}
+
+pub async fn visible_operations(
+    repo: &Repository,
+    user: &AuthenticatedUser,
+) -> Result<Vec<Operation>, AppError> {
+    repo.list_operations_visible_to(&user.id, user.role == Role::Admin)
+        .await
+}
+
+pub async fn dashboard_summary(
+    repo: &Repository,
+    user: &AuthenticatedUser,
+) -> Result<DashboardSummary, AppError> {
+    let is_admin = user.role == Role::Admin;
+
+    Ok(DashboardSummary {
+        operation_count: repo.count_operations_visible_to(&user.id, is_admin).await?,
+        asset_count: repo.count_assets_visible_to(&user.id, is_admin).await?,
+        run_count: repo.count_check_runs_visible_to(&user.id, is_admin).await?,
+        evidence_count: repo.count_evidence_visible_to(&user.id, is_admin).await?,
+        audit_count: repo
+            .count_audit_events_visible_to(&user.id, is_admin)
+            .await?,
+    })
+}
 
 pub fn public_router() -> Router {
     Router::new()

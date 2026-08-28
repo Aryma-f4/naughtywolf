@@ -134,3 +134,277 @@ async fn check_run_is_queued_then_finished_with_its_result() {
     );
     assert!(finished.finished_at.is_some());
 }
+
+#[tokio::test]
+async fn scoped_portal_reads_exclude_records_without_membership() {
+    let repo = test_repository().await;
+    let allowed = repo
+        .create_operation("Allowed", "Portal fixture")
+        .await
+        .unwrap();
+    let hidden = repo
+        .create_operation("Hidden", "Portal fixture")
+        .await
+        .unwrap();
+    let allowed_asset = repo
+        .create_asset(&allowed.id, "allowed-host", "host", "lab", "10.0.0.1")
+        .await
+        .unwrap();
+    let hidden_asset = repo
+        .create_asset(&hidden.id, "hidden-host", "host", "lab", "10.0.0.2")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, ?)")
+        .bind("operator")
+        .bind("operator")
+        .bind("not-a-real-password-hash")
+        .bind("operator")
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    repo.add_member(&allowed.id, "operator").await.unwrap();
+    repo.ensure_builtin_check("portal-test", "Portal test", "operator", 30, 4_096)
+        .await
+        .unwrap();
+    let allowed_run = repo
+        .create_run(
+            "portal-test",
+            &allowed_asset.id,
+            &allowed.id,
+            Some("operator"),
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    let hidden_run = repo
+        .create_run(
+            "portal-test",
+            &hidden_asset.id,
+            &hidden.id,
+            Some("operator"),
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    let allowed_evidence = repo
+        .create_evidence(
+            &allowed_run.id,
+            "allowed.json",
+            "application/json",
+            0,
+            "allowed",
+        )
+        .await
+        .unwrap();
+    let hidden_evidence = repo
+        .create_evidence(
+            &hidden_run.id,
+            "hidden.json",
+            "application/json",
+            0,
+            "hidden",
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_id, operation_id, action, target_type, target_id, parameter_summary, outcome, correlation_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("allowed-audit")
+    .bind("operator")
+    .bind(&allowed.id)
+    .bind("operation.viewed")
+    .bind("operation")
+    .bind(&allowed.id)
+    .bind(Option::<&str>::None)
+    .bind("success")
+    .bind("allowed-correlation")
+    .execute(&repo.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_id, operation_id, action, target_type, target_id, parameter_summary, outcome, correlation_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("hidden-audit")
+    .bind("operator")
+    .bind(&hidden.id)
+    .bind("operation.viewed")
+    .bind("operation")
+    .bind(&hidden.id)
+    .bind(Option::<&str>::None)
+    .bind("success")
+    .bind("hidden-correlation")
+    .execute(&repo.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        repo.list_operations_visible_to("operator", false)
+            .await
+            .unwrap()
+            .iter()
+            .map(|item| &item.id)
+            .collect::<Vec<_>>(),
+        vec![&allowed.id]
+    );
+    assert_eq!(
+        repo.list_assets_visible_to("operator", false)
+            .await
+            .unwrap()
+            .iter()
+            .map(|item| &item.id)
+            .collect::<Vec<_>>(),
+        vec![&allowed_asset.id]
+    );
+    assert_eq!(
+        repo.list_check_runs_visible_to("operator", false)
+            .await
+            .unwrap()
+            .iter()
+            .map(|item| &item.id)
+            .collect::<Vec<_>>(),
+        vec![&allowed_run.id]
+    );
+    assert_eq!(
+        repo.list_evidence_visible_to("operator", false)
+            .await
+            .unwrap()
+            .iter()
+            .map(|item| &item.id)
+            .collect::<Vec<_>>(),
+        vec![&allowed_evidence.id]
+    );
+    assert_eq!(
+        repo.list_audit_events_visible_to("operator", false)
+            .await
+            .unwrap()
+            .iter()
+            .map(|item| &item.id)
+            .collect::<Vec<_>>(),
+        vec!["allowed-audit"]
+    );
+    assert_eq!(
+        repo.count_operations_visible_to("operator", false)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        repo.count_assets_visible_to("operator", false)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        repo.count_check_runs_visible_to("operator", false)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        repo.count_evidence_visible_to("operator", false)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        repo.count_audit_events_visible_to("operator", false)
+            .await
+            .unwrap(),
+        1
+    );
+
+    assert_ne!(allowed_evidence.id, hidden_evidence.id);
+}
+
+#[tokio::test]
+async fn admin_scoped_portal_counts_include_all_operations() {
+    let repo = test_repository().await;
+    let first = repo
+        .create_operation("First", "Portal fixture")
+        .await
+        .unwrap();
+    let second = repo
+        .create_operation("Second", "Portal fixture")
+        .await
+        .unwrap();
+    let first_asset = repo
+        .create_asset(&first.id, "first-host", "host", "lab", "10.0.0.1")
+        .await
+        .unwrap();
+    let second_asset = repo
+        .create_asset(&second.id, "second-host", "host", "lab", "10.0.0.2")
+        .await
+        .unwrap();
+    repo.ensure_builtin_check(
+        "portal-admin-test",
+        "Portal admin test",
+        "operator",
+        30,
+        4_096,
+    )
+    .await
+    .unwrap();
+    let first_run = repo
+        .create_run(
+            "portal-admin-test",
+            &first_asset.id,
+            &first.id,
+            None,
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    let second_run = repo
+        .create_run(
+            "portal-admin-test",
+            &second_asset.id,
+            &second.id,
+            None,
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    repo.create_evidence(&first_run.id, "first.json", "application/json", 0, "first")
+        .await
+        .unwrap();
+    repo.create_evidence(
+        &second_run.id,
+        "second.json",
+        "application/json",
+        0,
+        "second",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        repo.count_operations_visible_to("admin", true)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        repo.count_assets_visible_to("admin", true).await.unwrap(),
+        2
+    );
+    assert_eq!(
+        repo.count_check_runs_visible_to("admin", true)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        repo.count_evidence_visible_to("admin", true).await.unwrap(),
+        2
+    );
+    assert_eq!(
+        repo.count_audit_events_visible_to("admin", true)
+            .await
+            .unwrap(),
+        0
+    );
+}

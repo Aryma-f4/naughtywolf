@@ -4,7 +4,9 @@ use uuid::Uuid;
 
 use crate::{
     audit::AuditEntry,
-    db::models::{Asset, AssetStatus, CheckRun, Evidence, Operation, OperationStatus, RunState},
+    db::models::{
+        Asset, AssetStatus, AuditEvent, CheckRun, Evidence, Operation, OperationStatus, RunState,
+    },
     error::AppError,
 };
 
@@ -68,6 +70,235 @@ impl Repository {
             .fetch_all(&self.pool)
             .await
             .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_operations_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<Operation>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, Operation>("SELECT * FROM operations ORDER BY updated_at DESC, id")
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            sqlx::query_as::<_, Operation>(
+                "SELECT operations.* FROM operations \
+                 JOIN operation_members ON operation_members.operation_id = operations.id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY operations.updated_at DESC, operations.id",
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_assets_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<Asset>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, Asset>("SELECT * FROM assets ORDER BY updated_at DESC, id")
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            sqlx::query_as::<_, Asset>(
+                "SELECT assets.* FROM assets \
+                 JOIN operation_members ON operation_members.operation_id = assets.operation_id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY assets.updated_at DESC, assets.id",
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_check_runs_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<CheckRun>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, CheckRun>("SELECT * FROM check_runs ORDER BY created_at DESC, id")
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            sqlx::query_as::<_, CheckRun>(
+                "SELECT check_runs.* FROM check_runs \
+                 JOIN operation_members ON operation_members.operation_id = check_runs.operation_id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY check_runs.created_at DESC, check_runs.id",
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_evidence_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<Evidence>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, Evidence>("SELECT * FROM evidence ORDER BY created_at DESC, id")
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            sqlx::query_as::<_, Evidence>(
+                "SELECT evidence.* FROM evidence \
+                 JOIN check_runs ON check_runs.id = evidence.check_run_id \
+                 JOIN operation_members ON operation_members.operation_id = check_runs.operation_id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY evidence.created_at DESC, evidence.id",
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_audit_events_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<AuditEvent>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, AuditEvent>(
+                "SELECT * FROM audit_events ORDER BY created_at DESC, id",
+            )
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, AuditEvent>(
+                "SELECT audit_events.* FROM audit_events \
+                 JOIN operation_members ON operation_members.operation_id = audit_events.operation_id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY audit_events.created_at DESC, audit_events.id",
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn count_operations_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<i64, AppError> {
+        let query = if is_admin {
+            sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+                .fetch_one(&self.pool)
+                .await
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM operations \
+                 JOIN operation_members ON operation_members.operation_id = operations.id \
+                 WHERE operation_members.user_id = ?",
+            )
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn count_assets_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<i64, AppError> {
+        let query = if is_admin {
+            sqlx::query_scalar("SELECT COUNT(*) FROM assets")
+                .fetch_one(&self.pool)
+                .await
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM assets \
+                 JOIN operation_members ON operation_members.operation_id = assets.operation_id \
+                 WHERE operation_members.user_id = ?",
+            )
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn count_check_runs_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<i64, AppError> {
+        let query = if is_admin {
+            sqlx::query_scalar("SELECT COUNT(*) FROM check_runs")
+                .fetch_one(&self.pool)
+                .await
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM check_runs \
+                 JOIN operation_members ON operation_members.operation_id = check_runs.operation_id \
+                 WHERE operation_members.user_id = ?",
+            )
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn count_evidence_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<i64, AppError> {
+        let query = if is_admin {
+            sqlx::query_scalar("SELECT COUNT(*) FROM evidence")
+                .fetch_one(&self.pool)
+                .await
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM evidence \
+                 JOIN check_runs ON check_runs.id = evidence.check_run_id \
+                 JOIN operation_members ON operation_members.operation_id = check_runs.operation_id \
+                 WHERE operation_members.user_id = ?",
+            )
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn count_audit_events_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<i64, AppError> {
+        let query = if is_admin {
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+                .fetch_one(&self.pool)
+                .await
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_events \
+                 JOIN operation_members ON operation_members.operation_id = audit_events.operation_id \
+                 WHERE operation_members.user_id = ?",
+            )
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
     }
 
     pub async fn find_operation(&self, operation_id: &str) -> Result<Option<Operation>, AppError> {
