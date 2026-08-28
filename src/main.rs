@@ -2,7 +2,7 @@ use axum::{
     Form, Router,
     extract::State,
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
+    response::{IntoResponse, Redirect},
     routing::post,
 };
 use clap::Parser;
@@ -89,14 +89,7 @@ async fn login_handler(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     if expected_csrf_token.as_deref() != Some(form.csrf_token.as_str()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html(portal::templates::login_page(
-                Some("Invalid username or password"),
-                "",
-            )),
-        )
-            .into_response();
+        return login_failure_response(&session, StatusCode::BAD_REQUEST).await;
     }
 
     match authenticate(&repository, &form.username, &form.password).await {
@@ -104,30 +97,52 @@ async fn login_handler(
             Ok(()) => Redirect::to("/").into_response(),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         },
-        Ok(None) => (
-            StatusCode::UNAUTHORIZED,
-            Html(portal::templates::login_page(
-                Some("Invalid username or password"),
-                &form.csrf_token,
-            )),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Html(portal::templates::login_page(
-                Some("Invalid username or password"),
-                &form.csrf_token,
-            )),
-        )
-            .into_response(),
+        Ok(None) => login_failure_response(&session, StatusCode::UNAUTHORIZED).await,
+        Err(_) => login_failure_response(&session, StatusCode::INTERNAL_SERVER_ERROR).await,
+    }
+}
+
+async fn login_failure_response(
+    session: &tower_sessions::Session,
+    status: StatusCode,
+) -> axum::response::Response {
+    match portal::login_page_with_new_csrf(session, Some("Invalid username or password")).await {
+        Ok(page) => (status, page).into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::public_router;
-    use axum::{body::to_bytes, http::Request};
+    use super::{login_handler, public_router};
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        routing::post,
+    };
+    use naughtywolf::{db, db::repositories::Repository};
     use tower::ServiceExt;
+    use tower_sessions::{MemoryStore, SessionManagerLayer};
+
+    async fn csrf_test_app() -> Router {
+        let pool = db::create_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+
+        Router::<Repository>::new()
+            .route("/login", post(login_handler))
+            .with_state(Repository { pool })
+            .merge(public_router())
+            .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false))
+    }
+
+    fn csrf_token(body: &str) -> String {
+        body.split("name=\"csrf_token\" value=\"")
+            .nth(1)
+            .and_then(|remainder| remainder.split('\"').next())
+            .unwrap()
+            .to_owned()
+    }
 
     #[tokio::test]
     async fn root_route_serves_the_local_landing_page() {
@@ -159,5 +174,79 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn csrf_mismatch_issues_a_replacement_token_that_can_be_submitted() {
+        let app = csrf_test_app().await;
+        let login_page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (parts, body) = login_page.into_parts();
+        let cookie = parts
+            .headers
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let initial_token = csrf_token(
+            &String::from_utf8(to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap(),
+        );
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "username=missing-user&password=wrong&csrf_token={initial_token}-mismatch"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let replacement_token = csrf_token(
+            &String::from_utf8(
+                to_bytes(rejected.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap(),
+        );
+        assert!(!replacement_token.is_empty());
+        assert_ne!(replacement_token, initial_token);
+
+        let retry = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "username=missing-user&password=wrong&csrf_token={replacement_token}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(retry.status(), StatusCode::UNAUTHORIZED);
     }
 }

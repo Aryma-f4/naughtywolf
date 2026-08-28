@@ -27,18 +27,31 @@ async fn landing_page() -> axum::response::Html<String> {
     axum::response::Html(templates::public_landing())
 }
 
-async fn login_page(session: Option<Extension<Session>>) -> axum::response::Html<String> {
-    let csrf_token = Uuid::new_v4().to_string();
-    if let Some(Extension(session)) = session {
-        if session.insert(CSRF_TOKEN_KEY, &csrf_token).await.is_err() {
-            return axum::response::Html(templates::login_page(
-                Some("Invalid username or password"),
-                "",
-            ));
-        }
+async fn login_page(
+    session: Option<Extension<Session>>,
+) -> Result<axum::response::Html<String>, axum::http::StatusCode> {
+    match session {
+        Some(Extension(session)) => login_page_with_new_csrf(&session, None).await,
+        None => Ok(axum::response::Html(templates::login_page(
+            None,
+            &Uuid::new_v4().to_string(),
+        ))),
     }
+}
 
-    axum::response::Html(templates::login_page(None, &csrf_token))
+pub async fn login_page_with_new_csrf(
+    session: &Session,
+    error: Option<&str>,
+) -> Result<axum::response::Html<String>, axum::http::StatusCode> {
+    let csrf_token = Uuid::new_v4().to_string();
+    session
+        .insert(CSRF_TOKEN_KEY, &csrf_token)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(axum::response::Html(templates::login_page(
+        error,
+        &csrf_token,
+    )))
 }
 
 pub async fn stylesheet() -> Response {
