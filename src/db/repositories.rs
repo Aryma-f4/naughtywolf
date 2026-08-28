@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::{
-    db::models::{Asset, AssetStatus, CheckRun, CheckRunState, Operation, OperationStatus},
+    db::models::{Asset, AssetStatus, CheckRun, Operation, OperationStatus, RunState},
     error::AppError,
 };
 
@@ -154,7 +154,7 @@ impl Repository {
         .bind(asset_id)
         .bind(operation_id)
         .bind(requested_by)
-        .bind(CheckRunState::Queued)
+        .bind(RunState::Queued)
         .bind(input_json)
         .execute(&self.pool)
         .await
@@ -167,20 +167,88 @@ impl Repository {
             .map_err(|_| AppError::Internal)
     }
 
+    pub async fn ensure_builtin_check(
+        &self,
+        id: &str,
+        name: &str,
+        required_role: &str,
+        timeout_seconds: i64,
+        output_limit_bytes: i64,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT INTO checks \
+             (id, name, description, version, required_role, input_schema, result_schema, timeout_seconds, output_limit_bytes) \
+             VALUES (?, ?, ?, '1', ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(name)
+        .bind("Built-in, non-destructive in-process check")
+        .bind(required_role)
+        .bind(r#"{"type":"object","additionalProperties":false}"#)
+        .bind(r#"{"type":"object"}"#)
+        .bind(timeout_seconds)
+        .bind(output_limit_bytes)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        Ok(())
+    }
+
+    pub async fn start_run(&self, run_id: &str) -> Result<CheckRun, AppError> {
+        let update = sqlx::query(
+            "UPDATE check_runs \
+             SET state = ?, started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ? AND state = ?",
+        )
+        .bind(RunState::Running)
+        .bind(run_id)
+        .bind(RunState::Queued)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        if update.rows_affected() == 0 {
+            return Err(AppError::Conflict(
+                "check run cannot transition to running".to_owned(),
+            ));
+        }
+
+        sqlx::query_as::<_, CheckRun>("SELECT * FROM check_runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
     pub async fn finish_run(
         &self,
         run_id: &str,
-        state: CheckRunState,
+        state: RunState,
         result_json: Option<&Value>,
         error_summary: Option<&str>,
         output_truncated: bool,
     ) -> Result<CheckRun, AppError> {
         if !matches!(
             state,
-            CheckRunState::Succeeded | CheckRunState::Failed | CheckRunState::Cancelled
+            RunState::Succeeded | RunState::Failed | RunState::Cancelled
         ) {
             return Err(AppError::Validation(
                 "a check run must finish in a terminal state".to_owned(),
+            ));
+        }
+
+        let existing_state =
+            sqlx::query_scalar::<_, RunState>("SELECT state FROM check_runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| AppError::Internal)?
+                .ok_or(AppError::NotFound)?;
+        if existing_state == RunState::Queued {
+            self.start_run(run_id).await?;
+        } else if existing_state != RunState::Running {
+            return Err(AppError::Conflict(
+                "check run is already in a terminal state".to_owned(),
             ));
         }
 
@@ -192,13 +260,14 @@ impl Repository {
             "UPDATE check_runs \
              SET state = ?, result_json = ?, error_summary = ?, output_truncated = ?, \
                  finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE id = ?",
+             WHERE id = ? AND state = ?",
         )
         .bind(state)
         .bind(result_json)
         .bind(error_summary)
         .bind(output_truncated)
         .bind(run_id)
+        .bind(RunState::Running)
         .execute(&self.pool)
         .await
         .map_err(|_| AppError::Internal)?;

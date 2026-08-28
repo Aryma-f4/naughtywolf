@@ -19,13 +19,29 @@ pub enum AssetStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
-pub enum CheckRunState {
+#[serde(rename_all = "lowercase")]
+pub enum RunState {
     Queued,
     Running,
     Succeeded,
     Failed,
     Cancelled,
 }
+
+impl RunState {
+    pub fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Queued, Self::Running)
+                | (
+                    Self::Running,
+                    Self::Succeeded | Self::Failed | Self::Cancelled
+                )
+        )
+    }
+}
+
+pub type CheckRunState = RunState;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
 pub struct Operation {
@@ -61,7 +77,7 @@ pub struct CheckRun {
     pub asset_id: String,
     pub operation_id: String,
     pub requested_by: Option<String>,
-    pub state: CheckRunState,
+    pub state: RunState,
     #[sqlx(json)]
     pub input_json: Value,
     #[sqlx(json(nullable))]
