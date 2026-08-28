@@ -3,6 +3,7 @@ use naughtywolf::{
     db::{self, repositories::Repository},
     evidence::EvidenceStore,
 };
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 async fn test_repository() -> Repository {
@@ -74,6 +75,76 @@ async fn evidence_rejects_bytes_larger_than_the_run_catalog_limit_before_writing
     assert!(result.is_err());
     assert_eq!(repo.count_evidence().await.unwrap(), 0);
     assert!(!directory.path().join(run_id).exists());
+}
+
+#[tokio::test]
+async fn evidence_rejects_a_preexisting_generated_output_file() {
+    let (store, repo, directory, run_id) = test_store().await;
+    let digest = hex::encode(Sha256::digest(b"finding"));
+    let output_path = directory
+        .path()
+        .join(&run_id)
+        .join(format!("{}.json", &digest[..16]));
+    tokio::fs::create_dir_all(output_path.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&output_path, b"attacker-controlled bytes")
+        .await
+        .unwrap();
+
+    let result = store.write(&run_id, b"finding", "application/json").await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        tokio::fs::read(output_path).await.unwrap(),
+        b"attacker-controlled bytes"
+    );
+    assert_eq!(repo.count_evidence().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn evidence_rejects_a_symlinked_run_directory() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let (store, repo, directory, run_id) = test_store().await;
+        let outside = TempDir::new().unwrap();
+        symlink(outside.path(), directory.path().join(&run_id)).unwrap();
+
+        let result = store.write(&run_id, b"finding", "application/json").await;
+
+        assert!(result.is_err());
+        assert_eq!(repo.count_evidence().await.unwrap(), 0);
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "evidence write escaped into the symlink target"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn evidence_root_is_owner_only_after_creation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_store, repo, directory, run_id) = test_store().await;
+    let evidence_root = directory.path().join("generated-evidence-root");
+    let store = EvidenceStore::new(repo, &evidence_root);
+
+    store
+        .write(&run_id, b"finding", "application/json")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::metadata(evidence_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
 }
 
 #[tokio::test]

@@ -69,32 +69,31 @@ impl EvidenceStore {
             return Ok(existing);
         }
 
-        let run_directory = self.evidence_dir.join(run_id);
         let full_path = self.evidence_dir.join(&relative_path);
         ensure_path_is_within_root(&self.evidence_dir, &full_path)?;
-        fs::create_dir_all(&run_directory)
-            .await
-            .map_err(|_| AppError::Internal)?;
-        set_owner_only_directory_permissions(&run_directory).await?;
+        ensure_safe_directory(&self.evidence_dir).await?;
+        let run_directory = self.evidence_dir.join(run_id);
+        ensure_safe_directory(&run_directory).await?;
+        reject_existing_path(&full_path).await?;
 
-        let mut created_file = false;
-        match fs::OpenOptions::new()
+        // `create_new` maps to exclusive creation. In particular, an existing
+        // final symlink is rejected rather than followed on supported platforms.
+        let created_file = match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&full_path)
             .await
         {
             Ok(mut file) => {
-                created_file = true;
                 file.write_all(bytes)
                     .await
                     .map_err(|_| AppError::Internal)?;
                 file.flush().await.map_err(|_| AppError::Internal)?;
                 set_owner_only_file_permissions(&full_path).await?;
+                true
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(AppError::Internal),
-        }
+        };
 
         match self
             .repository
@@ -160,6 +159,47 @@ fn ensure_path_is_within_root(root: &Path, path: &Path) -> Result<(), AppError> 
         ));
     }
     Ok(())
+}
+
+async fn ensure_safe_directory(path: &Path) -> Result<(), AppError> {
+    reject_symlink_path(path).await?;
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(AppError::Validation(
+                "evidence directory is not a safe directory".to_owned(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .await
+                .map_err(|_| AppError::Internal)?;
+        }
+        Err(_) => return Err(AppError::Internal),
+    }
+    reject_symlink_path(path).await?;
+    set_owner_only_directory_permissions(path).await
+}
+
+async fn reject_existing_path(path: &Path) -> Result<(), AppError> {
+    match fs::symlink_metadata(path).await {
+        Ok(_) => Err(AppError::Validation(
+            "generated evidence path already exists".to_owned(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(AppError::Internal),
+    }
+}
+
+async fn reject_symlink_path(path: &Path) -> Result<(), AppError> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(AppError::Validation(
+            "evidence path contains a symlink".to_owned(),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(AppError::Internal),
+    }
 }
 
 async fn set_owner_only_directory_permissions(path: &Path) -> Result<(), AppError> {
