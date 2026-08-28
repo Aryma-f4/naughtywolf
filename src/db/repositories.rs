@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::{
-    db::models::{Asset, CheckRun, CheckRunState, Operation},
+    db::models::{Asset, AssetStatus, CheckRun, CheckRunState, Operation, OperationStatus},
     error::AppError,
 };
 
@@ -67,6 +67,61 @@ impl Repository {
             .fetch_all(&self.pool)
             .await
             .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn find_operation(&self, operation_id: &str) -> Result<Option<Operation>, AppError> {
+        sqlx::query_as::<_, Operation>("SELECT * FROM operations WHERE id = ?")
+            .bind(operation_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn find_asset(&self, asset_id: &str) -> Result<Option<Asset>, AppError> {
+        sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE id = ?")
+            .bind(asset_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn is_operation_member(
+        &self,
+        operation_id: &str,
+        user_id: &str,
+    ) -> Result<bool, AppError> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM operation_members WHERE operation_id = ? AND user_id = ?)",
+        )
+        .bind(operation_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|exists| exists != 0)
+        .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn require_active_operation(&self, operation_id: &str) -> Result<(), AppError> {
+        let operation = self
+            .find_operation(operation_id)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        if operation.status != OperationStatus::Active {
+            return Err(AppError::Conflict(
+                "new runs require an active operation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn require_active_asset(&self, asset_id: &str) -> Result<(), AppError> {
+        let asset = self.find_asset(asset_id).await?.ok_or(AppError::NotFound)?;
+        if asset.status != AssetStatus::Active {
+            return Err(AppError::Conflict(
+                "new runs require an active asset".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn add_member(&self, operation_id: &str, user_id: &str) -> Result<(), AppError> {
