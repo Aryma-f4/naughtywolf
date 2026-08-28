@@ -1,0 +1,120 @@
+:root {
+  --surface: #f5f7fa;
+  --panel: #ffffff;
+  --text: #19212b;
+  --muted: #586575;
+  --accent: #2457a5;
+  --accent-contrast: #ffffff;
+  --danger: #b42318;
+  --border: #c9d1db;
+  --focus: #f79009;
+  --radius: 0.75rem;
+  --content-width: 68rem;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  min-width: 320px;
+  margin: 0;
+  color: var(--text);
+  background: var(--surface);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+
+.public-page,
+.login-page {
+  width: min(calc(100% - 2rem), var(--content-width));
+  margin: 0 auto;
+  padding: clamp(2rem, 8vw, 6rem) 0;
+}
+
+.public-page { max-width: 44rem; }
+
+.eyebrow {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+h1 { line-height: 1.15; }
+
+.button,
+button,
+input,
+.dock-link {
+  min-height: 44px;
+}
+
+.button,
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.625rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--accent-contrast);
+  background: var(--accent);
+  font: inherit;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.login-page {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding-block: 1rem;
+}
+
+.login-page form {
+  display: grid;
+  width: min(100%, 26rem);
+  gap: 0.75rem;
+  padding: clamp(1rem, 5vw, 2rem);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: 0 0.5rem 2rem rgb(25 33 43 / 8%);
+}
+
+label { font-weight: 700; }
+
+input {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  color: var(--text);
+  background: var(--panel);
+  font: inherit;
+}
+
+.form-error {
+  margin: 0;
+  padding: 0.75rem;
+  border-left: 0.25rem solid var(--danger);
+  color: var(--danger);
+  background: #fff0ef;
+}
+
+.dock-link {
+  display: inline-flex;
+  align-items: center;
+  padding-inline: 0.75rem;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

@@ -7,5 +7,6 @@ pub mod db;
 pub mod error;
 pub mod evidence;
 pub mod policy;
+pub mod portal;
 
 pub use error::AppError;
