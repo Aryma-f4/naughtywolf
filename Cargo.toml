@@ -22,8 +22,10 @@ argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 moka = { version = "0.12", features = ["sync"] }
-tower-sessions = { version = "0.14", features = ["memory-store"] }
+tower-sessions = { version = "0.14", features = ["memory-store", "signed"] }
 tower-sessions-sqlx-store = { version = "0.15", features = ["sqlite"] }
+time = "0.3"
+cookie = { version = "0.18", features = ["key-expansion"] }
 rpassword = "7"
 async-trait = "0.1"
 dirs = "5"

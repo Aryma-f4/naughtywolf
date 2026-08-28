@@ -5,10 +5,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use tower_sessions::Session;
-use uuid::Uuid;
 
 use super::AuthenticatedUser;
 use super::rbac::Role;
+use crate::error::AppError;
 
 const SESSION_USER_ID_KEY: &str = "user_id";
 const SESSION_USERNAME_KEY: &str = "username";
@@ -19,31 +19,20 @@ pub struct AuthSession {
 }
 
 impl AuthSession {
-    pub async fn login(&self, user_id: Uuid, username: &str, role: &Role) {
-        if self
-            .session
-            .insert(SESSION_USER_ID_KEY, user_id)
+    pub async fn login(&self, user: &AuthenticatedUser) -> Result<(), AppError> {
+        self.session
+            .insert(SESSION_USER_ID_KEY, user.id.clone())
             .await
-            .is_err()
-        {
-            tracing::warn!("Failed to insert user_id into session for user '{username}'");
-        }
-        if self
-            .session
-            .insert(SESSION_USERNAME_KEY, username.to_string())
+            .map_err(|_| AppError::Internal)?;
+        self.session
+            .insert(SESSION_USERNAME_KEY, user.username.clone())
             .await
-            .is_err()
-        {
-            tracing::warn!("Failed to insert username into session for user '{username}'");
-        }
-        if self
-            .session
-            .insert(SESSION_ROLE_KEY, role.to_string())
+            .map_err(|_| AppError::Internal)?;
+        self.session
+            .insert(SESSION_ROLE_KEY, user.role.to_string())
             .await
-            .is_err()
-        {
-            tracing::warn!("Failed to insert role into session for user '{username}'");
-        }
+            .map_err(|_| AppError::Internal)?;
+        Ok(())
     }
 
     pub async fn logout(&self) {
@@ -51,7 +40,7 @@ impl AuthSession {
     }
 
     pub async fn authenticated_user(&self) -> Option<AuthenticatedUser> {
-        let id: Uuid = self.session.get(SESSION_USER_ID_KEY).await.ok()??;
+        let id: String = self.session.get(SESSION_USER_ID_KEY).await.ok()??;
         let username: String = self.session.get(SESSION_USERNAME_KEY).await.ok()??;
         let role_str: Option<String> = self.session.get(SESSION_ROLE_KEY).await.ok()?;
         let role = role_str.as_deref()?.parse::<Role>().ok()?;

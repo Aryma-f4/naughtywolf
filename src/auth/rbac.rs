@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Role {
     Admin,
     Operator,
@@ -23,6 +23,10 @@ impl FromStr for Role {
 }
 
 impl Role {
+    pub fn allows(self, required: Self) -> bool {
+        self.can_perform(&required)
+    }
+
     pub fn can_perform(&self, required: &Role) -> bool {
         match (self, required) {
             (Role::Admin, _) => true,

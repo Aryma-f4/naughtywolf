@@ -1,10 +1,9 @@
-pub mod profiles;
 pub mod users;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "naughtywolf", about = "NaughtyWolf — Sliver Web GUI")]
+#[command(name = "naughtywolf", about = "NaughtyWolf local lab platform")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -14,8 +13,6 @@ pub struct Cli {
 pub enum Commands {
     /// User management (local-only)
     User(users::UserCli),
-    /// Sliver profile management
-    Profile(profiles::ProfileCli),
     /// Start the web server (default)
     Serve,
 

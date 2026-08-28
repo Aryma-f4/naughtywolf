@@ -360,7 +360,13 @@ version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ddef33a339a91ea89fb53151bd0a4689cfce27055c291dfa69945475d22c747"
 dependencies = [
+ "base64",
+ "hkdf",
+ "hmac",
  "percent-encoding",
+ "rand 0.8.6",
+ "sha2",
+ "subtle",
  "time",
  "version_check",
 ]
@@ -1220,6 +1226,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "cookie",
  "dirs",
  "dotenvy",
  "futures",
@@ -1232,6 +1239,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-stream",
  "tower",
