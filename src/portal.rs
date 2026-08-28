@@ -1,15 +1,20 @@
 use axum::{
     Extension, Router,
+    extract::State,
     http::header,
-    response::{IntoResponse, Response},
-    routing::get,
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, post},
 };
 use tower_sessions::Session;
 use uuid::Uuid;
 
 use crate::{
     AppError,
-    auth::{AuthenticatedUser, rbac::Role},
+    auth::{
+        AuthenticatedUser,
+        middleware::{AuthSession, AuthenticatedUserGuard},
+        rbac::Role,
+    },
     db::{models::Operation, repositories::Repository},
 };
 
@@ -61,6 +66,95 @@ pub fn public_router() -> Router {
         )
         .route("/static/admin.css", get(stylesheet))
         .route("/static/admin.js", get(script))
+}
+
+/// Routes that always resolve the current local identity before rendering.
+/// The binary supplies the repository state and session layer when composing
+/// this router with the public routes.
+pub fn authenticated_router() -> Router<Repository> {
+    Router::new()
+        .route("/dashboard", get(dashboard))
+        .route("/operations", get(operations))
+        .route("/inventory", get(inventory))
+        .route("/checks", get(checks))
+        .route("/audit", get(audit))
+        .route("/evidence", get(evidence))
+        .route("/reports", get(reports))
+        .route("/admin", get(admin))
+        .route("/logout", post(logout))
+}
+
+async fn dashboard(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    let summary = dashboard_summary(&repository, &user).await?;
+    Ok(Html(templates::dashboard_page(&user, &summary)))
+}
+
+async fn operations(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    let operations = visible_operations(&repository, &user).await?;
+    Ok(Html(templates::operations_page(&user, &operations)))
+}
+
+async fn inventory(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
+    Html(templates::empty_page(
+        "Inventory",
+        &user,
+        "inventory",
+        "No scoped inventory yet",
+    ))
+}
+
+async fn checks(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
+    Html(templates::empty_page(
+        "Checks",
+        &user,
+        "checks",
+        "No scoped checks yet",
+    ))
+}
+
+async fn audit(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
+    Html(templates::empty_page(
+        "Audit",
+        &user,
+        "audit",
+        "No scoped audit records yet",
+    ))
+}
+
+async fn evidence(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
+    Html(templates::empty_page(
+        "Evidence",
+        &user,
+        "evidence",
+        "No scoped evidence yet",
+    ))
+}
+
+async fn reports(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
+    Html(templates::empty_page(
+        "Reports",
+        &user,
+        "reports",
+        "No scoped reports yet",
+    ))
+}
+
+async fn admin(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Admin)?;
+    Ok(Html(templates::admin_page(&user)))
+}
+
+async fn logout(session: Session) -> Redirect {
+    AuthSession { session }.logout().await;
+    Redirect::to("/login")
 }
 
 async fn landing_page() -> axum::response::Html<String> {

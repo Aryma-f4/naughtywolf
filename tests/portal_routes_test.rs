@@ -1,13 +1,18 @@
 use axum::{
+    Router,
     body::{Body, to_bytes},
-    http::Request,
+    extract::Extension,
+    http::{Request, StatusCode},
+    response::Response,
+    routing::post,
 };
 use naughtywolf::{
-    auth::{AuthenticatedUser, rbac::Role},
+    auth::{AuthenticatedUser, middleware::AuthSession, rbac::Role},
     db::{self, repositories::Repository},
     portal::{DashboardSummary, dashboard_summary, public_router, templates, visible_operations},
 };
 use tower::ServiceExt;
+use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
 
 async fn test_repository() -> Repository {
     let pool = db::create_pool("sqlite::memory:").await.unwrap();
@@ -31,6 +36,58 @@ async fn create_user(repo: &Repository, id: &str, role: Role) -> AuthenticatedUs
         username,
         role,
     }
+}
+
+async fn authenticated_app(repository: Repository) -> Router {
+    Router::<Repository>::new()
+        .merge(naughtywolf::portal::authenticated_router())
+        .with_state(repository)
+        .merge(public_router())
+        .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false))
+}
+
+async fn test_login(session: Session, Extension(user): Extension<AuthenticatedUser>) -> StatusCode {
+    AuthSession { session }.login(&user).await.unwrap();
+    StatusCode::NO_CONTENT
+}
+
+async fn app_with_logged_in_user(
+    role: Role,
+) -> impl tower::Service<Request<Body>, Response = Response, Error = std::convert::Infallible> + Clone
+{
+    let repository = test_repository().await;
+    let user = create_user(&repository, "logged-in", role).await;
+    let app = Router::<Repository>::new()
+        .route("/test/login", post(test_login))
+        .merge(naughtywolf::portal::authenticated_router())
+        .with_state(repository)
+        .merge(public_router())
+        .layer(Extension(user))
+        .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false));
+    let login_response = app
+        .clone()
+        .oneshot(Request::post("/test/login").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let cookie = login_response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    tower::ServiceBuilder::new()
+        .map_request(move |mut request: Request<Body>| {
+            request
+                .headers_mut()
+                .insert("cookie", cookie.parse().unwrap());
+            request
+        })
+        .service(app)
 }
 
 #[tokio::test]
@@ -106,4 +163,26 @@ async fn empty_database_produces_zero_dashboard_summary() {
         dashboard_summary(&repo, &viewer).await.unwrap(),
         DashboardSummary::default()
     );
+}
+
+#[tokio::test]
+async fn anonymous_dashboard_request_is_rejected() {
+    let response = authenticated_app(test_repository().await)
+        .await
+        .oneshot(Request::get("/dashboard").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn viewer_cannot_open_admin_page_even_if_they_request_its_url() {
+    let app = app_with_logged_in_user(Role::Viewer).await;
+    let response = app
+        .oneshot(Request::get("/admin").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }

@@ -58,6 +58,7 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
         .with_signed(Key::derive_from(&config.session_secret_bytes()));
     let app = Router::<Repository>::new()
         .route("/login", post(login_handler))
+        .merge(portal::authenticated_router())
         .with_state(Repository { pool })
         .merge(public_router())
         .layer(session_layer);
