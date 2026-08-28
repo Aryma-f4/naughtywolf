@@ -60,17 +60,25 @@ impl EvidenceStore {
         let relative_path = PathBuf::from(run_id).join(filename);
         validate_generated_relative_path(&relative_path)?;
         let storage_path = relative_path.to_string_lossy().into_owned();
+        let full_path = self.evidence_dir.join(&relative_path);
+        ensure_path_is_within_root(&self.evidence_dir, &full_path)?;
 
         if let Some(existing) = self
             .repository
             .find_evidence_for_run_at_path(run_id, &storage_path)
             .await?
         {
+            self.validate_existing_evidence(
+                &existing,
+                run_id,
+                &relative_path,
+                &sha256,
+                bytes.len() as i64,
+            )
+            .await?;
             return Ok(existing);
         }
 
-        let full_path = self.evidence_dir.join(&relative_path);
-        ensure_path_is_within_root(&self.evidence_dir, &full_path)?;
         ensure_safe_directory(&self.evidence_dir).await?;
         let run_directory = self.evidence_dir.join(run_id);
         ensure_safe_directory(&run_directory).await?;
@@ -114,6 +122,33 @@ impl EvidenceStore {
                 Err(error)
             }
         }
+    }
+
+    async fn validate_existing_evidence(
+        &self,
+        evidence: &Evidence,
+        run_id: &str,
+        expected_relative_path: &Path,
+        expected_sha256: &str,
+        expected_byte_len: i64,
+    ) -> Result<(), AppError> {
+        let recorded_relative_path = PathBuf::from(&evidence.storage_path);
+        validate_generated_relative_path(&recorded_relative_path)?;
+        if evidence.check_run_id != run_id
+            || recorded_relative_path != expected_relative_path
+            || evidence.sha256 != expected_sha256
+            || evidence.byte_len != expected_byte_len
+        {
+            return Err(AppError::Validation(
+                "stored evidence metadata does not match the requested output".to_owned(),
+            ));
+        }
+
+        let full_path = self.evidence_dir.join(&recorded_relative_path);
+        ensure_path_is_within_root(&self.evidence_dir, &full_path)?;
+        require_safe_directory(&self.evidence_dir).await?;
+        require_safe_directory(&self.evidence_dir.join(run_id)).await?;
+        validate_existing_file(&full_path, evidence).await
     }
 
     /// Persist the already-bounded JSON representation of a completed check result.
@@ -179,6 +214,43 @@ async fn ensure_safe_directory(path: &Path) -> Result<(), AppError> {
     }
     reject_symlink_path(path).await?;
     set_owner_only_directory_permissions(path).await
+}
+
+async fn require_safe_directory(path: &Path) -> Result<(), AppError> {
+    reject_symlink_path(path).await?;
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if !metadata.is_dir() => Err(AppError::Validation(
+            "evidence directory is not a safe directory".to_owned(),
+        )),
+        Ok(_) => set_owner_only_directory_permissions(path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(AppError::Validation(
+            "evidence directory is missing".to_owned(),
+        )),
+        Err(_) => Err(AppError::Internal),
+    }
+}
+
+async fn validate_existing_file(path: &Path, evidence: &Evidence) -> Result<(), AppError> {
+    let metadata = fs::symlink_metadata(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::Validation("stored evidence file is missing".to_owned())
+        } else {
+            AppError::Internal
+        }
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() != evidence.byte_len as u64 {
+        return Err(AppError::Validation(
+            "stored evidence file does not match its metadata".to_owned(),
+        ));
+    }
+
+    let bytes = fs::read(path).await.map_err(|_| AppError::Internal)?;
+    if hex::encode(Sha256::digest(&bytes)) != evidence.sha256 {
+        return Err(AppError::Validation(
+            "stored evidence file does not match its checksum".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn reject_existing_path(path: &Path) -> Result<(), AppError> {

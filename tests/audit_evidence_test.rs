@@ -125,6 +125,65 @@ async fn evidence_rejects_a_symlinked_run_directory() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cached_evidence_is_rejected_when_its_run_directory_becomes_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let (store, repo, directory, run_id) = test_store().await;
+    store
+        .write(&run_id, b"finding", "application/json")
+        .await
+        .unwrap();
+    let run_directory = directory.path().join(&run_id);
+    let outside = TempDir::new().unwrap();
+    std::fs::remove_dir_all(&run_directory).unwrap();
+    symlink(outside.path(), &run_directory).unwrap();
+
+    let result = store.write(&run_id, b"finding", "application/json").await;
+
+    assert!(result.is_err());
+    assert_eq!(repo.count_evidence().await.unwrap(), 1);
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cached_evidence_is_rejected_when_its_output_becomes_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let (store, repo, directory, run_id) = test_store().await;
+    let evidence = store
+        .write(&run_id, b"finding", "application/json")
+        .await
+        .unwrap();
+    let output_path = directory.path().join(&evidence.storage_path);
+    let outside = TempDir::new().unwrap();
+    std::fs::remove_file(&output_path).unwrap();
+    symlink(outside.path().join("replacement"), &output_path).unwrap();
+
+    let result = store.write(&run_id, b"finding", "application/json").await;
+
+    assert!(result.is_err());
+    assert_eq!(repo.count_evidence().await.unwrap(), 1);
+    assert!(!outside.path().join("replacement").exists());
+}
+
+#[tokio::test]
+async fn cached_evidence_is_rejected_when_its_regular_file_is_replaced() {
+    let (store, _repo, directory, run_id) = test_store().await;
+    let evidence = store
+        .write(&run_id, b"finding", "application/json")
+        .await
+        .unwrap();
+    let output_path = directory.path().join(&evidence.storage_path);
+    tokio::fs::write(&output_path, b"changed").await.unwrap();
+
+    let result = store.write(&run_id, b"finding", "application/json").await;
+
+    assert!(result.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn evidence_root_is_owner_only_after_creation() {
     use std::os::unix::fs::PermissionsExt;
 
