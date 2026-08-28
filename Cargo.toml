@@ -9,7 +9,7 @@ axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -20,27 +20,21 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }
-tonic = { version = "0.12", features = ["tls", "tls-roots"] }
-rustls = { version = "0.23", features = ["aws-lc-rs"] }
-prost = "0.13"
-prost-types = "0.13"
 thiserror = "2"
 moka = { version = "0.12", features = ["sync"] }
 tower-sessions = { version = "0.14", features = ["memory-store"] }
-tower-sessions-sqlx-store = { version = "0.15", features = ["postgres"] }
+tower-sessions-sqlx-store = { version = "0.15", features = ["sqlite"] }
 rpassword = "7"
 async-trait = "0.1"
 dirs = "5"
 anyhow = "1"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
-
-[build-dependencies]
-tonic-build = "0.12"
-prost-build = "0.13"
 
 [lib]
 name = "naughtywolf"
