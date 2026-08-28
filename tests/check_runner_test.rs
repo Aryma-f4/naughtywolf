@@ -4,8 +4,8 @@ use naughtywolf::{
     AppError,
     auth::{AuthenticatedUser, rbac::Role},
     checks::{
-        AssetRecordReviewInput, CancellationToken, CheckFinding, CheckInput, CheckResult,
-        ExecutionKind, RunState, Runner, catalog,
+        AssetRecordReviewInput, CheckFinding, CheckInput, CheckResult, ExecutionKind, RunState,
+        Runner, catalog,
     },
     db::{self, models::CheckRun, repositories::Repository},
 };
@@ -115,6 +115,20 @@ fn check_results_drop_oversized_findings_within_the_output_bound() {
 
     assert!(result.output_truncated);
     assert!(serde_json::to_vec(&result).unwrap().len() <= 256);
+}
+
+#[test]
+fn check_results_use_a_bounded_fallback_when_metadata_exceeds_a_tiny_limit() {
+    let mut result = CheckResult::failed("x".repeat(10_000));
+    result.run_id = Some("y".repeat(10_000));
+
+    let result = result.truncate(2);
+    let encoded = serde_json::to_vec(&result).unwrap();
+
+    assert_eq!(result.state, RunState::Failed);
+    assert_eq!(result.error.as_deref(), Some("check output exceeded limit"));
+    assert!(result.output_truncated);
+    assert_eq!(encoded, b"{}");
 }
 
 #[tokio::test]
@@ -239,22 +253,83 @@ async fn unauthorized_runner_does_not_create_a_run() {
 }
 
 #[tokio::test]
-async fn cancellation_is_persisted_and_never_reported_as_success() {
+async fn cancelling_one_run_does_not_cancel_an_unrelated_concurrent_run() {
     let fixture = runner_fixture(Role::Operator).await;
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-    let result = Runner::with_cancellation(fixture.repo.clone(), fixture.user, cancellation)
-        .start(fixture.asset, "asset-record-review", asset_record_input())
-        .await
-        .unwrap();
+    let runner = Runner::with_execution_delay(
+        fixture.repo.clone(),
+        fixture.user,
+        Duration::from_millis(100),
+    );
+    let first_task = tokio::spawn({
+        let runner = runner.clone();
+        let asset = fixture.asset.clone();
+        async move {
+            runner
+                .start(asset, "asset-record-review", asset_record_input())
+                .await
+                .unwrap()
+        }
+    });
+    let first_run_id = wait_for_running_run(&fixture.repo, None).await;
+    let second_task = tokio::spawn({
+        let runner = runner.clone();
+        let asset = fixture.asset;
+        async move {
+            runner
+                .start(asset, "asset-record-review", asset_record_input())
+                .await
+                .unwrap()
+        }
+    });
+    let second_run_id = wait_for_running_run(&fixture.repo, Some(&first_run_id)).await;
 
+    runner.cancel(&first_run_id).unwrap();
+    let first = first_task.await.unwrap();
+    let second = second_task.await.unwrap();
+
+    assert_eq!(first.run_id.as_deref(), Some(first_run_id.as_str()));
+    assert_eq!(first.state, RunState::Cancelled);
+    assert_eq!(second.run_id.as_deref(), Some(second_run_id.as_str()));
+    assert_eq!(second.state, RunState::Succeeded);
+    let states: Vec<RunState> =
+        sqlx::query_scalar("SELECT state FROM check_runs WHERE id IN (?, ?) ORDER BY state")
+            .bind(&first_run_id)
+            .bind(&second_run_id)
+            .fetch_all(&fixture.repo.pool)
+            .await
+            .unwrap();
+    assert_eq!(states, vec![RunState::Cancelled, RunState::Succeeded]);
+}
+
+#[tokio::test]
+async fn cancellation_remains_observable_when_it_precedes_the_waiter() {
+    let runner = Runner::with_timeout(Duration::from_millis(20));
+
+    let result = runner.run_cancel_before_wait_for_test("race-run").await;
+
+    assert_eq!(result.run_id.as_deref(), Some("race-run"));
     assert_eq!(result.state, RunState::Cancelled);
-    let persisted_state: RunState = sqlx::query_scalar("SELECT state FROM check_runs WHERE id = ?")
-        .bind(result.run_id.as_deref().unwrap())
-        .fetch_one(&fixture.repo.pool)
-        .await
-        .unwrap();
-    assert_eq!(persisted_state, RunState::Cancelled);
+}
+
+async fn wait_for_running_run(repo: &Repository, excluded_id: Option<&str>) -> String {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let run_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM check_runs \
+                 WHERE state = 'running' AND id != ? ORDER BY created_at, id LIMIT 1",
+            )
+            .bind(excluded_id.unwrap_or(""))
+            .fetch_optional(&repo.pool)
+            .await
+            .unwrap();
+            if let Some(run_id) = run_id {
+                return run_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run did not reach running state")
 }
 
 #[tokio::test]

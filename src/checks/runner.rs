@@ -1,13 +1,15 @@
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    collections::{HashMap, hash_map::Entry},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use serde::{
+    Deserialize, Serialize, Serializer,
+    ser::{SerializeMap, SerializeStruct},
+};
+use tokio::sync::watch;
+use uuid::Uuid;
 
 use crate::{
     auth::AuthenticatedUser,
@@ -20,37 +22,41 @@ use crate::{
     policy::authorize_asset_run,
 };
 
-#[derive(Clone, Default)]
-pub struct CancellationToken {
-    inner: Arc<CancellationState>,
+#[derive(Clone)]
+struct CancellationToken {
+    sender: watch::Sender<bool>,
 }
 
-#[derive(Default)]
-struct CancellationState {
-    cancelled: AtomicBool,
-    notify: Notify,
+impl Default for CancellationToken {
+    fn default() -> Self {
+        let (sender, _) = watch::channel(false);
+        Self { sender }
+    }
 }
 
 impl CancellationToken {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
-    pub fn cancel(&self) {
-        self.inner.cancelled.store(true, Ordering::Release);
-        self.inner.notify.notify_waiters();
+    fn cancel(&self) {
+        self.sender.send_replace(true);
     }
 
-    pub fn is_cancelled(&self) -> bool {
-        self.inner.cancelled.load(Ordering::Acquire)
+    fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
     }
 
     async fn cancelled(&self) {
-        let notified = self.inner.notify.notified();
-        if self.is_cancelled() {
-            return;
+        let mut receiver = self.sender.subscribe();
+        loop {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
         }
-        notified.await;
     }
 }
 
@@ -70,13 +76,34 @@ pub struct CheckFinding {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CheckResult {
     pub run_id: Option<String>,
     pub state: RunState,
     pub findings: Vec<CheckFinding>,
     pub error: Option<String>,
     pub output_truncated: bool,
+    #[serde(skip)]
+    bounded_fallback: bool,
+}
+
+impl Serialize for CheckResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.bounded_fallback {
+            return serializer.serialize_map(Some(0))?.end();
+        }
+
+        let mut state = serializer.serialize_struct("CheckResult", 5)?;
+        state.serialize_field("run_id", &self.run_id)?;
+        state.serialize_field("state", &self.state)?;
+        state.serialize_field("findings", &self.findings)?;
+        state.serialize_field("error", &self.error)?;
+        state.serialize_field("output_truncated", &self.output_truncated)?;
+        state.end()
+    }
 }
 
 impl CheckResult {
@@ -87,6 +114,7 @@ impl CheckResult {
             findings,
             error: None,
             output_truncated: false,
+            bounded_fallback: false,
         }
     }
 
@@ -97,6 +125,7 @@ impl CheckResult {
             findings: Vec::new(),
             error: Some(error.into()),
             output_truncated: false,
+            bounded_fallback: false,
         }
     }
 
@@ -107,6 +136,7 @@ impl CheckResult {
             findings: Vec::new(),
             error: Some("check cancelled".to_owned()),
             output_truncated: false,
+            bounded_fallback: false,
         }
     }
 
@@ -120,7 +150,12 @@ impl CheckResult {
             self.findings.pop();
         }
         if serialized_len(&self) > max_output_bytes {
-            self.error = None;
+            self.run_id = None;
+            self.state = RunState::Failed;
+            self.error = Some("check output exceeded limit".to_owned());
+        }
+        if serialized_len(&self) > max_output_bytes {
+            self.bounded_fallback = true;
         }
         self
     }
@@ -134,30 +169,38 @@ fn serialized_len(result: &CheckResult) -> usize {
 pub struct Runner {
     repository: Option<Repository>,
     user: Option<AuthenticatedUser>,
-    cancellation: CancellationToken,
+    cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     test_timeout: Option<Duration>,
+    execution_delay: Option<Duration>,
 }
 
 impl Runner {
     pub fn new(repository: Repository, user: AuthenticatedUser) -> Self {
-        Self::with_cancellation(repository, user, CancellationToken::new())
-    }
-
-    pub fn with_cancellation(
-        repository: Repository,
-        user: AuthenticatedUser,
-        cancellation: CancellationToken,
-    ) -> Self {
         Self {
             repository: Some(repository),
             user: Some(user),
-            cancellation,
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
             test_timeout: None,
+            execution_delay: None,
         }
     }
 
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation.clone()
+    #[doc(hidden)]
+    pub fn with_execution_delay(
+        repository: Repository,
+        user: AuthenticatedUser,
+        delay: Duration,
+    ) -> Self {
+        let mut runner = Self::new(repository, user);
+        runner.execution_delay = Some(delay);
+        runner
+    }
+
+    pub fn cancel(&self, run_id: &str) -> Result<(), AppError> {
+        let cancellations = self.cancellations.lock().map_err(|_| AppError::Internal)?;
+        let cancellation = cancellations.get(run_id).ok_or(AppError::NotFound)?;
+        cancellation.cancel();
+        Ok(())
     }
 
     pub async fn start(
@@ -200,10 +243,13 @@ impl Runner {
                 &input_json,
             )
             .await?;
+        let cancellation = self.register_run(&run.id)?;
         repository.start_run(&run.id).await?;
 
-        let mut result = self.execute(definition, asset, input).await;
-        if self.cancellation.is_cancelled() {
+        let mut result = self
+            .execute(definition, asset, input, cancellation.token())
+            .await;
+        if cancellation.finalize()? {
             result = CheckResult::cancelled();
         }
         result.run_id = Some(run.id.clone());
@@ -227,11 +273,17 @@ impl Runner {
         definition: &CheckDefinition,
         asset: Asset,
         input: CheckInput,
+        cancellation: &CancellationToken,
     ) -> CheckResult {
-        let work = run_check(definition.id, asset, input);
+        let work = async {
+            if let Some(delay) = self.execution_delay {
+                tokio::time::sleep(delay).await;
+            }
+            run_check(definition.id, asset, input).await
+        };
         tokio::select! {
             biased;
-            _ = self.cancellation.cancelled() => CheckResult::cancelled(),
+            _ = cancellation.cancelled() => CheckResult::cancelled(),
             outcome = tokio::time::timeout(definition.timeout, work) => match outcome {
                 Ok(Ok(result)) => result,
                 Ok(Err(message)) => CheckResult::failed(message),
@@ -244,13 +296,44 @@ impl Runner {
         Self {
             repository: None,
             user: None,
-            cancellation: CancellationToken::new(),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
             test_timeout: Some(timeout),
+            execution_delay: None,
         }
     }
 
     #[doc(hidden)]
     pub async fn run_for_test(&self, check_id: &str) -> CheckResult {
+        let run_id = Uuid::new_v4().to_string();
+        self.run_test_check(&run_id, check_id).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_cancel_before_wait_for_test(&self, run_id: &str) -> CheckResult {
+        let cancellation = match self.register_run(run_id) {
+            Ok(cancellation) => cancellation,
+            Err(_) => return CheckResult::failed("test run registration failed"),
+        };
+        if self.cancel(run_id).is_err() {
+            return CheckResult::failed("test run cancellation failed");
+        }
+        let mut result =
+            tokio::time::timeout(Duration::from_millis(20), cancellation.token().cancelled())
+                .await
+                .map_or_else(
+                    |_| CheckResult::failed("cancellation was not retained"),
+                    |_| CheckResult::cancelled(),
+                );
+        let _ = cancellation.finalize();
+        result.run_id = Some(run_id.to_owned());
+        result
+    }
+
+    async fn run_test_check(&self, run_id: &str, check_id: &str) -> CheckResult {
+        let cancellation = match self.register_run(run_id) {
+            Ok(cancellation) => cancellation,
+            Err(_) => return CheckResult::failed("test run registration failed"),
+        };
         let timeout = self.test_timeout.unwrap_or(Duration::from_secs(5));
         let work = async {
             match check_id {
@@ -262,11 +345,64 @@ impl Runner {
 
         tokio::select! {
             biased;
-            _ = self.cancellation.cancelled() => CheckResult::cancelled(),
+            _ = cancellation.token().cancelled() => CheckResult::cancelled(),
             outcome = tokio::time::timeout(timeout, work) => match outcome {
                 Ok(result) => result,
                 Err(_) => CheckResult::failed("check timed out"),
             },
+        }
+    }
+
+    fn register_run(&self, run_id: &str) -> Result<RunCancellation, AppError> {
+        let token = CancellationToken::new();
+        let mut cancellations = self.cancellations.lock().map_err(|_| AppError::Internal)?;
+        match cancellations.entry(run_id.to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(token.clone());
+            }
+            Entry::Occupied(_) => {
+                return Err(AppError::Conflict(
+                    "check run is already registered".to_owned(),
+                ));
+            }
+        }
+        Ok(RunCancellation {
+            run_id: run_id.to_owned(),
+            token,
+            cancellations: self.cancellations.clone(),
+            active: true,
+        })
+    }
+}
+
+struct RunCancellation {
+    run_id: String,
+    token: CancellationToken,
+    cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    active: bool,
+}
+
+impl RunCancellation {
+    fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    fn finalize(mut self) -> Result<bool, AppError> {
+        let mut cancellations = self.cancellations.lock().map_err(|_| AppError::Internal)?;
+        let cancelled = self.token.is_cancelled();
+        cancellations.remove(&self.run_id);
+        self.active = false;
+        Ok(cancelled)
+    }
+}
+
+impl Drop for RunCancellation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut cancellations) = self.cancellations.lock() {
+            cancellations.remove(&self.run_id);
         }
     }
 }
