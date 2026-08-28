@@ -3,7 +3,8 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::{
-    db::models::{Asset, AssetStatus, CheckRun, Operation, OperationStatus, RunState},
+    audit::AuditEntry,
+    db::models::{Asset, AssetStatus, CheckRun, Evidence, Operation, OperationStatus, RunState},
     error::AppError,
 };
 
@@ -175,6 +176,11 @@ impl Repository {
         timeout_seconds: i64,
         output_limit_bytes: i64,
     ) -> Result<(), AppError> {
+        if output_limit_bytes < 2 {
+            return Err(AppError::Validation(
+                "catalog output limit must be at least 2 bytes".to_owned(),
+            ));
+        }
         sqlx::query(
             "INSERT INTO checks \
              (id, name, description, version, required_role, input_schema, result_schema, timeout_seconds, output_limit_bytes) \
@@ -193,6 +199,117 @@ impl Repository {
         .await
         .map_err(|_| AppError::Internal)?;
         Ok(())
+    }
+
+    pub async fn output_limit_for_run(&self, run_id: &str) -> Result<i64, AppError> {
+        sqlx::query_scalar(
+            "SELECT checks.output_limit_bytes \
+             FROM check_runs JOIN checks ON checks.id = check_runs.check_id \
+             WHERE check_runs.id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?
+        .ok_or(AppError::NotFound)
+    }
+
+    pub async fn find_evidence_for_run_at_path(
+        &self,
+        run_id: &str,
+        storage_path: &str,
+    ) -> Result<Option<Evidence>, AppError> {
+        sqlx::query_as::<_, Evidence>(
+            "SELECT * FROM evidence WHERE check_run_id = ? AND storage_path = ?",
+        )
+        .bind(run_id)
+        .bind(storage_path)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn create_evidence(
+        &self,
+        run_id: &str,
+        storage_path: &str,
+        content_type: &str,
+        byte_len: i64,
+        sha256: &str,
+    ) -> Result<Evidence, AppError> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO evidence (id, check_run_id, storage_path, content_type, byte_len, sha256) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(run_id)
+        .bind(storage_path)
+        .bind(content_type)
+        .bind(byte_len)
+        .bind(sha256)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+
+        sqlx::query_as::<_, Evidence>("SELECT * FROM evidence WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn count_evidence(&self) -> Result<i64, AppError> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM evidence")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn rename_operation_with_audit(
+        &self,
+        operation_id: &str,
+        name: &str,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<Operation, AppError> {
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        let update = sqlx::query(
+            "UPDATE operations \
+             SET name = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?",
+        )
+        .bind(name)
+        .bind(operation_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        if update.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "operation.renamed",
+            "operation",
+            operation_id,
+            "success",
+            correlation_id,
+        )
+        .for_operation(operation_id);
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+
+        self.find_operation(operation_id)
+            .await?
+            .ok_or(AppError::NotFound)
+    }
+
+    pub async fn count_audit_events(&self) -> Result<i64, AppError> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
     }
 
     pub async fn start_run(&self, run_id: &str) -> Result<CheckRun, AppError> {
@@ -281,4 +398,28 @@ impl Repository {
             .await
             .map_err(|_| AppError::Internal)
     }
+}
+
+async fn insert_audit(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    entry: &AuditEntry,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_id, operation_id, action, target_type, target_id, parameter_summary, outcome, correlation_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&entry.actor_id)
+    .bind(&entry.operation_id)
+    .bind(&entry.action)
+    .bind(&entry.target_type)
+    .bind(&entry.target_id)
+    .bind(&entry.parameter_summary)
+    .bind(&entry.outcome)
+    .bind(&entry.correlation_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| AppError::Internal)?;
+    Ok(())
 }

@@ -141,6 +141,7 @@ impl CheckResult {
     }
 
     pub fn truncate(mut self, max_output_bytes: usize) -> Self {
+        let max_output_bytes = max_output_bytes.max(2);
         if serialized_len(&self) <= max_output_bytes {
             return self;
         }
