@@ -1,4 +1,5 @@
 use sqlx::Row;
+use std::time::Duration;
 
 #[tokio::test]
 async fn migration_creates_the_core_schema() {
@@ -54,6 +55,21 @@ async fn pool_enforces_asset_operation_foreign_keys() {
         .unwrap()
         .get(0);
     assert_eq!(foreign_keys_enabled, 1);
+}
+
+#[tokio::test]
+async fn in_memory_pool_does_not_open_an_isolated_second_database() {
+    let pool = naughtywolf::db::create_pool("sqlite::memory:")
+        .await
+        .unwrap();
+    let _first_connection = pool.acquire().await.unwrap();
+
+    let second_acquisition = tokio::time::timeout(Duration::from_millis(100), pool.acquire()).await;
+
+    assert!(
+        second_acquisition.is_err(),
+        "a second connection would point at a separate in-memory SQLite database"
+    );
 }
 
 #[test]
