@@ -187,3 +187,118 @@ above are green.
 - The old PostgreSQL/Sliver integration tests prevent the broad filtered cargo
   command from compiling. They require a separate cleanup task rather than
   reintroducing the removed C2 surface here.
+
+## Fix round 1 -- review corrections
+
+### Finding 1: obsolete integration targets blocked `cargo test auth::`
+
+The failing targets were inspected before removal. `tests/db_migration_test.rs`
+and `tests/cli_user_test.rs` imported PostgreSQL APIs that are no longer
+enabled; `tests/integration_test.rs` exercised the retired Sliver/web router.
+SQLite migration coverage already exists in `tests/config_db_test.rs`, and the
+current local-user behavior is covered by `tests/auth_test.rs` plus the CLI
+smoke test below. The three obsolete target files were retired; no C2 module,
+route, or dependency was restored.
+
+GREEN command:
+
+```text
+cargo test auth::
+running 7 auth unit tests: all passed
+running 4 auth integration tests: 0 run (filter), target compiled successfully
+running config_db_test and repository_test: target compilation succeeded
+test result: ok
+```
+
+### Finding 2: a post-login disable did not invalidate authorization
+
+RED regression test added before changing the extractor:
+
+```text
+cargo test --test auth_test user_disabled_after_login_cannot_use_an_existing_session
+assertion `left == right` failed
+left: 204
+right: 401
+```
+
+The regression uses a real in-memory SQLite users table and a real
+`SqliteStore`: it logs in an enabled user, captures the issued cookie, marks
+the account disabled in the database, and requests a protected route with the
+old cookie.
+
+The extractor now reloads the enabled identity by session user ID on every
+request. A missing or disabled row deletes the session and returns 401; a
+database failure returns the existing sanitized `AppError` response. Returning
+the fresh identity also means role and username changes are observed on the
+next request instead of trusting stale session fields.
+
+GREEN command:
+
+```text
+cargo test --test auth_test user_disabled_after_login_cannot_use_an_existing_session
+running 1 test
+test user_disabled_after_login_cannot_use_an_existing_session ... ok
+test result: ok. 1 passed; 0 failed
+```
+
+### Finding 3: local CLI commands unnecessarily required a session secret
+
+RED smoke command was run from a temporary working directory, preventing the
+repository `.env` file from supplying a value:
+
+```text
+env -u NAUGHTYWOLF_SESSION_SECRET ... naughtywolf user create ...
+Error: Missing required environment variable: NAUGHTYWOLF_SESSION_SECRET
+```
+
+`Config::database_url_from_env` now provides the minimal database-only
+configuration used before dispatch. `main.rs` creates and migrates the SQLite
+pool from that value, while only the `serve` branch calls `Config::from_env`
+and therefore requires/uses the signed-session secret.
+
+GREEN smoke command, again from a clean temporary working directory:
+
+```text
+env -u NAUGHTYWOLF_SESSION_SECRET ... naughtywolf user create --username no-secret --password-stdin
+User 'no-secret' created with role 'operator' (id: ...)
+sqlite3 ... "SELECT username, disabled FROM users WHERE username = 'no-secret'"
+no-secret|0
+```
+
+### Fix-round verification
+
+```text
+cargo test --test auth_test
+running 4 tests
+test result: ok. 4 passed; 0 failed
+
+cargo test auth::
+test result: ok; auth unit tests passed and all remaining test targets compiled
+```
+
+### Files changed in this correction
+
+- `src/auth/mod.rs`: added fresh enabled-user lookup by database ID.
+- `src/auth/middleware.rs`: revalidates the session identity against SQLite on
+  every protected request and deletes stale sessions.
+- `src/config.rs`, `src/main.rs`: separate CLI database configuration from the
+  server/session configuration.
+- `tests/auth_test.rs`: added the post-login disable regression and protected
+  route fixture.
+- `tests/db_migration_test.rs`, `tests/cli_user_test.rs`,
+  `tests/integration_test.rs`: deleted obsolete PostgreSQL/Sliver-only test
+  targets that prevented the required filtered test command from compiling.
+
+### Fix-round self-review and concerns
+
+- The extractor’s database lookup is parameterized and checks `disabled = 0`;
+  it does not trust the stored session role or username for authorization.
+- The session is explicitly deleted when a user is disabled or removed, so the
+  next request cannot reuse the stale cookie.
+- `serve` continues to enforce the 32-byte session-secret requirement before
+  deriving the signing key; local CLI commands neither read nor need it.
+- No C2 behavior was restored. The retired tests were exclusively obsolete
+  PostgreSQL/Sliver coverage; current SQLite migration tests remain.
+- Remaining concern: every protected request now performs one SQLite lookup,
+  which is the deliberate security tradeoff requested for immediate disable
+  enforcement.

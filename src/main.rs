@@ -22,14 +22,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = Config::from_env()?;
-    let pool = db::create_pool(&config.database_url).await?;
+    let database_url = Config::database_url_from_env();
+    let pool = db::create_pool(&database_url).await?;
     db::run_migrations(&pool).await?;
 
     match cli.command {
         Commands::User(user) => user.execute(&pool).await?,
         Commands::Migrate => tracing::info!("SQLite database migrations applied"),
-        Commands::Serve => serve(config, pool).await?,
+        Commands::Serve => serve(Config::from_env()?, pool).await?,
     }
 
     Ok(())

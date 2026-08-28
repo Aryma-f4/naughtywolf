@@ -12,10 +12,15 @@ pub struct Config {
 }
 
 impl Config {
+    /// Database-only configuration used by local CLI commands.
+    pub fn database_url_from_env() -> String {
+        env::var("NAUGHTYWOLF_DATABASE_URL")
+            .unwrap_or_else(|_| "sqlite:naughtywolf.db?mode=rwc".to_string())
+    }
+
     pub fn from_env() -> Result<Self, ConfigError> {
         Ok(Config {
-            database_url: env::var("NAUGHTYWOLF_DATABASE_URL")
-                .unwrap_or_else(|_| "sqlite:naughtywolf.db?mode=rwc".to_string()),
+            database_url: Self::database_url_from_env(),
             bind: env::var("NAUGHTYWOLF_BIND")
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
                 .parse()

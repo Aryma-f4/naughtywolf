@@ -1,5 +1,5 @@
 use axum::{
-    extract::FromRequestParts,
+    extract::{FromRef, FromRequestParts},
     http::StatusCode,
     http::request::Parts,
     response::{IntoResponse, Response},
@@ -7,7 +7,8 @@ use axum::{
 use tower_sessions::Session;
 
 use super::AuthenticatedUser;
-use super::rbac::Role;
+use super::{enabled_user_by_id, rbac::Role};
+use crate::db::repositories::Repository;
 use crate::error::AppError;
 
 const SESSION_USER_ID_KEY: &str = "user_id";
@@ -54,6 +55,7 @@ pub struct AuthenticatedUserGuard(pub AuthenticatedUser);
 
 impl<S> FromRequestParts<S> for AuthenticatedUserGuard
 where
+    Repository: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = Response;
@@ -64,7 +66,14 @@ where
             .map_err(|e| e.into_response())?;
         let auth = AuthSession { session };
         match auth.authenticated_user().await {
-            Some(user) => Ok(AuthenticatedUserGuard(user)),
+            Some(user) => match enabled_user_by_id(&Repository::from_ref(state), &user.id).await {
+                Ok(Some(user)) => Ok(AuthenticatedUserGuard(user)),
+                Ok(None) => {
+                    auth.logout().await;
+                    Err((StatusCode::UNAUTHORIZED, "Not authenticated").into_response())
+                }
+                Err(error) => Err(error.into_response()),
+            },
             None => Err((StatusCode::UNAUTHORIZED, "Not authenticated").into_response()),
         }
     }

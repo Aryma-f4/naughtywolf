@@ -2,12 +2,12 @@ use axum::{
     Router,
     extract::{Form, State},
     http::{Request, StatusCode},
-    routing::post,
+    routing::{get, post},
 };
 use naughtywolf::{
     auth::{
         authenticate,
-        middleware::AuthSession,
+        middleware::{AuthSession, AuthenticatedUserGuard},
         password::{hash_password, verify_password},
         rbac::Role,
     },
@@ -39,18 +39,22 @@ async fn login_handler(
     }
 }
 
-async fn test_app_with_disabled_user() -> Router {
+async fn protected_handler(_: AuthenticatedUserGuard) -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn test_app_with_user(disabled: bool) -> (Router, sqlx::SqlitePool) {
     let pool = db::create_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     let password_hash = hash_password("secret").unwrap();
     sqlx::query(
         "INSERT INTO users (id, username, password_hash, role, disabled) VALUES (?, ?, ?, ?, ?)",
     )
-    .bind("disabled-user")
-    .bind("disabled")
+    .bind("test-user")
+    .bind("test-user")
     .bind(password_hash)
     .bind("operator")
-    .bind(true)
+    .bind(disabled)
     .execute(&pool)
     .await
     .unwrap();
@@ -59,10 +63,13 @@ async fn test_app_with_disabled_user() -> Router {
     session_store.migrate().await.unwrap();
     let session_layer = SessionManagerLayer::new(session_store).with_secure(false);
 
-    Router::new()
+    let app = Router::new()
         .route("/login", post(login_handler))
-        .with_state(Repository { pool })
-        .layer(session_layer)
+        .route("/protected", get(protected_handler))
+        .with_state(Repository { pool: pool.clone() })
+        .layer(session_layer);
+
+    (app, pool)
 }
 
 async fn login(app: Router, username: &str, password: &str) -> axum::response::Response {
@@ -74,6 +81,19 @@ async fn login(app: Router, username: &str, password: &str) -> axum::response::R
             .body(axum::body::Body::from(format!(
                 "username={username}&password={password}"
             )))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn protected(app: Router, cookie: &str) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method("GET")
+            .uri("/protected")
+            .header("cookie", cookie)
+            .body(axum::body::Body::empty())
             .unwrap(),
     )
     .await
@@ -94,9 +114,36 @@ fn hashed_password_verifies_only_the_original_secret() {
 
 #[tokio::test]
 async fn disabled_user_cannot_start_a_session() {
-    let app = test_app_with_disabled_user().await;
+    let (app, _) = test_app_with_user(true).await;
     assert_eq!(
-        login(app, "disabled", "secret").await.status(),
+        login(app, "test-user", "secret").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn user_disabled_after_login_cannot_use_an_existing_session() {
+    let (app, pool) = test_app_with_user(false).await;
+    let login_response = login(app.clone(), "test-user", "secret").await;
+    let cookie = login_response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    sqlx::query("UPDATE users SET disabled = 1 WHERE id = ?")
+        .bind("test-user")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        protected(app, &cookie).await.status(),
         StatusCode::UNAUTHORIZED
     );
 }
