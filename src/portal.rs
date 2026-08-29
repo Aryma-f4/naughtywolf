@@ -1,6 +1,6 @@
 use axum::{
     Extension, Form, Router,
-    extract::{Path, State},
+    extract::{FromRequest, Path, Request, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -105,7 +105,7 @@ async fn operations(
     Ok(Html(templates::operations_page(&user, &operations)))
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct OperationForm {
     #[serde(default)]
     name: String,
@@ -114,7 +114,7 @@ struct OperationForm {
     csrf_token: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct AssetForm {
     #[serde(default)]
     name: String,
@@ -146,24 +146,20 @@ async fn create_operation(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repository): State<Repository>,
     session: Session,
-    Form(form): Form<OperationForm>,
+    request: Request,
 ) -> Result<Response, AppError> {
     user.require(Role::Admin)?;
+    let form = match Form::<OperationForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return invalid_operation_form_response(&user, &session, &OperationForm::default())
+                .await;
+        }
+    };
     if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
         || !valid_form_values(&[&form.name, &form.purpose])
     {
-        let csrf_token = issue_csrf_token(&session).await?;
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Html(templates::operation_form_page(
-                &user,
-                &csrf_token,
-                Some("The request is invalid."),
-                &form.name,
-                &form.purpose,
-            )),
-        )
-            .into_response());
+        return invalid_operation_form_response(&user, &session, &form).await;
     }
 
     repository
@@ -199,24 +195,25 @@ async fn create_asset(
     State(repository): State<Repository>,
     Path(operation_id): Path<String>,
     session: Session,
-    Form(form): Form<AssetForm>,
+    request: Request,
 ) -> Result<Response, AppError> {
     authorize_operation(&repository, &user, &operation_id, Role::Operator).await?;
+    let form = match Form::<AssetForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return invalid_asset_form_response(
+                &user,
+                &session,
+                &operation_id,
+                &AssetForm::default(),
+            )
+            .await;
+        }
+    };
     if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
         || !valid_form_values(&[&form.name, &form.kind, &form.owner, &form.address])
     {
-        let csrf_token = issue_csrf_token(&session).await?;
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Html(templates::asset_form_page(
-                &user,
-                &operation_id,
-                &csrf_token,
-                Some("The request is invalid."),
-                [&form.name, &form.kind, &form.owner, &form.address],
-            )),
-        )
-            .into_response());
+        return invalid_asset_form_response(&user, &session, &operation_id, &form).await;
     }
 
     repository
@@ -231,6 +228,45 @@ async fn create_asset(
         )
         .await?;
     Ok(Redirect::to("/operations").into_response())
+}
+
+async fn invalid_operation_form_response(
+    user: &AuthenticatedUser,
+    session: &Session,
+    form: &OperationForm,
+) -> Result<Response, AppError> {
+    let csrf_token = issue_csrf_token(session).await?;
+    Ok((
+        StatusCode::BAD_REQUEST,
+        Html(templates::operation_form_page(
+            user,
+            &csrf_token,
+            Some("The request is invalid."),
+            &form.name,
+            &form.purpose,
+        )),
+    )
+        .into_response())
+}
+
+async fn invalid_asset_form_response(
+    user: &AuthenticatedUser,
+    session: &Session,
+    operation_id: &str,
+    form: &AssetForm,
+) -> Result<Response, AppError> {
+    let csrf_token = issue_csrf_token(session).await?;
+    Ok((
+        StatusCode::BAD_REQUEST,
+        Html(templates::asset_form_page(
+            user,
+            operation_id,
+            &csrf_token,
+            Some("The request is invalid."),
+            [&form.name, &form.kind, &form.owner, &form.address],
+        )),
+    )
+        .into_response())
 }
 
 fn valid_form_values(values: &[&str]) -> bool {

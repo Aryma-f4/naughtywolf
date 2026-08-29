@@ -222,6 +222,31 @@ async fn viewer_cannot_submit_an_operation_form() {
 }
 
 #[tokio::test]
+async fn viewer_malformed_operation_form_is_forbidden_before_form_parsing() {
+    let repository = test_repository().await;
+    let viewer = create_user(&repository, "viewer", Role::Viewer).await;
+    let app = app_with_user_and_repository(repository.clone(), viewer).await;
+
+    let response = app
+        .oneshot(post_form(
+            "/operations",
+            "name=Lab&name=Duplicate&purpose=Practice",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        repository
+            .count_operations_visible_to("viewer", true)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(repository.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn operator_cannot_open_or_submit_an_operation_form() {
     let app = app_with_logged_in_user(Role::Operator).await;
     let open = app
@@ -324,6 +349,54 @@ async fn invalid_operation_form_rerenders_with_a_generic_accessible_error() {
 }
 
 #[tokio::test]
+async fn authorized_malformed_operation_form_gets_generic_bad_request() {
+    let repository = test_repository().await;
+    let admin = create_user(&repository, "admin", Role::Admin).await;
+    let app = app_with_user_and_repository(repository.clone(), admin).await;
+    let form_response = app
+        .clone()
+        .oneshot(Request::get("/operations/new").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let form_body = String::from_utf8(
+        to_bytes(form_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let token = csrf_token(&form_body);
+
+    let response = app
+        .oneshot(post_form(
+            "/operations",
+            format!("name=Lab&name=Duplicate&purpose=Practice&csrf_token={token}"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("The request is invalid."));
+    assert!(body.contains("role=\"alert\" id=\"operation-form-error\""));
+    assert_ne!(csrf_token(&body), token);
+    assert_eq!(
+        repository
+            .count_operations_visible_to("admin", true)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(repository.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn operation_form_rejects_a_missing_csrf_token() {
     let app = app_with_logged_in_user(Role::Admin).await;
     let response = app
@@ -419,6 +492,35 @@ async fn operator_cannot_add_an_asset_outside_their_operation_scope() {
 
     assert_eq!(open.status(), StatusCode::FORBIDDEN);
     assert_eq!(submit.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn out_of_scope_operator_malformed_asset_form_is_forbidden_before_form_parsing() {
+    let repository = test_repository().await;
+    let operation = repository
+        .create_operation("Lab", "Practice")
+        .await
+        .unwrap();
+    let operator = create_user(&repository, "operator", Role::Operator).await;
+    let app = app_with_user_and_repository(repository.clone(), operator).await;
+
+    let response = app
+        .oneshot(post_form(
+            &format!("/operations/{}/assets", operation.id),
+            "name=web-01&name=duplicate&kind=web&owner=Lab&address=127.0.0.1",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        repository
+            .list_assets(&operation.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(repository.count_audit_events().await.unwrap(), 0);
 }
 
 #[tokio::test]
