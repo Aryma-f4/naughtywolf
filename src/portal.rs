@@ -1,10 +1,11 @@
 use axum::{
-    Extension, Router,
-    extract::State,
-    http::header,
+    Extension, Form, Router,
+    extract::{Path, State},
+    http::{StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use serde::Deserialize;
 use tower_sessions::Session;
 use uuid::Uuid;
 
@@ -16,6 +17,7 @@ use crate::{
         rbac::Role,
     },
     db::{models::Operation, repositories::Repository},
+    policy::authorize_operation,
 };
 
 pub mod templates;
@@ -74,7 +76,10 @@ pub fn public_router() -> Router {
 pub fn authenticated_router() -> Router<Repository> {
     Router::new()
         .route("/dashboard", get(dashboard))
-        .route("/operations", get(operations))
+        .route("/operations", get(operations).post(create_operation))
+        .route("/operations/new", get(new_operation))
+        .route("/operations/{operation_id}/assets", post(create_asset))
+        .route("/operations/{operation_id}/assets/new", get(new_asset))
         .route("/inventory", get(inventory))
         .route("/checks", get(checks))
         .route("/audit", get(audit))
@@ -98,6 +103,158 @@ async fn operations(
 ) -> Result<Html<String>, AppError> {
     let operations = visible_operations(&repository, &user).await?;
     Ok(Html(templates::operations_page(&user, &operations)))
+}
+
+#[derive(Deserialize)]
+struct OperationForm {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    purpose: String,
+    csrf_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AssetForm {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    address: String,
+    csrf_token: Option<String>,
+}
+
+async fn new_operation(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    session: Session,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Admin)?;
+    let csrf_token = issue_csrf_token(&session).await?;
+    Ok(Html(templates::operation_form_page(
+        &user,
+        &csrf_token,
+        None,
+        "",
+        "",
+    )))
+}
+
+async fn create_operation(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    session: Session,
+    Form(form): Form<OperationForm>,
+) -> Result<Response, AppError> {
+    user.require(Role::Admin)?;
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || !valid_form_values(&[&form.name, &form.purpose])
+    {
+        let csrf_token = issue_csrf_token(&session).await?;
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Html(templates::operation_form_page(
+                &user,
+                &csrf_token,
+                Some("The request is invalid."),
+                &form.name,
+                &form.purpose,
+            )),
+        )
+            .into_response());
+    }
+
+    repository
+        .create_operation_with_audit(
+            form.name.trim(),
+            form.purpose.trim(),
+            &user.id,
+            &Uuid::new_v4().to_string(),
+        )
+        .await?;
+    Ok(Redirect::to("/operations").into_response())
+}
+
+async fn new_asset(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(operation_id): Path<String>,
+    session: Session,
+) -> Result<Html<String>, AppError> {
+    authorize_operation(&repository, &user, &operation_id, Role::Operator).await?;
+    let csrf_token = issue_csrf_token(&session).await?;
+    Ok(Html(templates::asset_form_page(
+        &user,
+        &operation_id,
+        &csrf_token,
+        None,
+        ["", "", "", ""],
+    )))
+}
+
+async fn create_asset(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(operation_id): Path<String>,
+    session: Session,
+    Form(form): Form<AssetForm>,
+) -> Result<Response, AppError> {
+    authorize_operation(&repository, &user, &operation_id, Role::Operator).await?;
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || !valid_form_values(&[&form.name, &form.kind, &form.owner, &form.address])
+    {
+        let csrf_token = issue_csrf_token(&session).await?;
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Html(templates::asset_form_page(
+                &user,
+                &operation_id,
+                &csrf_token,
+                Some("The request is invalid."),
+                [&form.name, &form.kind, &form.owner, &form.address],
+            )),
+        )
+            .into_response());
+    }
+
+    repository
+        .create_asset_with_audit(
+            &operation_id,
+            form.name.trim(),
+            form.kind.trim(),
+            form.owner.trim(),
+            form.address.trim(),
+            &user.id,
+            &Uuid::new_v4().to_string(),
+        )
+        .await?;
+    Ok(Redirect::to(&format!("/operations/{operation_id}")).into_response())
+}
+
+fn valid_form_values(values: &[&str]) -> bool {
+    values.iter().all(|value| {
+        let value = value.trim();
+        !value.is_empty() && value.chars().count() <= 160
+    })
+}
+
+async fn issue_csrf_token(session: &Session) -> Result<String, AppError> {
+    let csrf_token = Uuid::new_v4().to_string();
+    session
+        .insert(CSRF_TOKEN_KEY, &csrf_token)
+        .await
+        .map_err(|_| AppError::Internal)?;
+    Ok(csrf_token)
+}
+
+async fn csrf_token_matches(session: &Session, submitted: Option<&str>) -> Result<bool, AppError> {
+    let expected: Option<String> = session
+        .get(CSRF_TOKEN_KEY)
+        .await
+        .map_err(|_| AppError::Internal)?;
+    Ok(expected.as_deref() == submitted && submitted.is_some())
 }
 
 async fn inventory(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
@@ -177,9 +334,7 @@ pub async fn login_page_with_new_csrf(
     session: &Session,
     error: Option<&str>,
 ) -> Result<axum::response::Html<String>, axum::http::StatusCode> {
-    let csrf_token = Uuid::new_v4().to_string();
-    session
-        .insert(CSRF_TOKEN_KEY, &csrf_token)
+    let csrf_token = issue_csrf_token(session)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::response::Html(templates::login_page(

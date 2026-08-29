@@ -78,21 +78,27 @@ pub fn dashboard_page(user: &AuthenticatedUser, summary: &DashboardSummary) -> S
 }
 
 pub fn operations_page(user: &AuthenticatedUser, operations: &[Operation]) -> String {
+    let create_link = (user.role == Role::Admin)
+        .then_some("<a class=\"button\" href=\"/operations/new\">Create operation</a>")
+        .unwrap_or_default();
     let body = if operations.is_empty() {
-        let create_link = user
-            .role
-            .allows(Role::Operator)
-            .then_some("<a class=\"button\" href=\"/operations/new\">Create operation</a>")
-            .unwrap_or_default();
-        format!(
-            "<section class=\"zero-state\"><p>No scoped operations yet</p>{create_link}</section>"
-        )
+        format!("<section class=\"zero-state\"><p>No scoped operations yet</p></section>")
     } else {
         let items = operations
             .iter()
             .map(|operation| {
+                let asset_link = user
+                    .role
+                    .allows(Role::Operator)
+                    .then(|| {
+                        format!(
+                            "<a href=\"/operations/{}/assets/new\">Add asset</a>",
+                            escape_html(&operation.id)
+                        )
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "<li><h2>{}</h2><p>{}</p><p class=\"muted\">Status: {:?}</p></li>",
+                    "<li><h2>{}</h2><p>{}</p><p class=\"muted\">Status: {:?}</p>{asset_link}</li>",
                     escape_html(&operation.name),
                     escape_html(&operation.purpose),
                     operation.status,
@@ -102,7 +108,63 @@ pub fn operations_page(user: &AuthenticatedUser, operations: &[Operation]) -> St
         format!("<ul class=\"record-list\">{items}</ul>")
     };
 
-    app_page("Operations", user, "operations", &body)
+    app_page(
+        "Operations",
+        user,
+        "operations",
+        &format!("<div class=\"page-actions\">{create_link}</div>{body}"),
+    )
+}
+
+pub fn operation_form_page(
+    user: &AuthenticatedUser,
+    csrf_token: &str,
+    error: Option<&str>,
+    name: &str,
+    purpose: &str,
+) -> String {
+    let error = form_error(error, "operation-form-error");
+    let described_by = (!error.is_empty())
+        .then_some(" aria-describedby=\"operation-form-error\"")
+        .unwrap_or_default();
+    app_page(
+        "Create operation",
+        user,
+        "operations",
+        &format!(
+            "<form class=\"record-form\" method=\"post\" action=\"/operations\">{error}<input type=\"hidden\" name=\"csrf_token\" value=\"{}\"><label for=\"operation-name\">Name</label><input id=\"operation-name\" name=\"name\" value=\"{}\" maxlength=\"160\" required{described_by}><label for=\"operation-purpose\">Purpose</label><input id=\"operation-purpose\" name=\"purpose\" value=\"{}\" maxlength=\"160\" required{described_by}><button type=\"submit\">Create operation</button></form>",
+            escape_html(csrf_token),
+            escape_html(name),
+            escape_html(purpose),
+        ),
+    )
+}
+
+pub fn asset_form_page(
+    user: &AuthenticatedUser,
+    operation_id: &str,
+    csrf_token: &str,
+    error: Option<&str>,
+    values: [&str; 4],
+) -> String {
+    let error = form_error(error, "asset-form-error");
+    let described_by = (!error.is_empty())
+        .then_some(" aria-describedby=\"asset-form-error\"")
+        .unwrap_or_default();
+    app_page(
+        "Add asset",
+        user,
+        "inventory",
+        &format!(
+            "<form class=\"record-form\" method=\"post\" action=\"/operations/{}/assets\">{error}<input type=\"hidden\" name=\"csrf_token\" value=\"{}\"><label for=\"asset-name\">Name</label><input id=\"asset-name\" name=\"name\" value=\"{}\" maxlength=\"160\" required{described_by}><label for=\"asset-kind\">Kind</label><input id=\"asset-kind\" name=\"kind\" value=\"{}\" maxlength=\"160\" required{described_by}><label for=\"asset-owner\">Owner</label><input id=\"asset-owner\" name=\"owner\" value=\"{}\" maxlength=\"160\" required{described_by}><label for=\"asset-address\">Address</label><input id=\"asset-address\" name=\"address\" value=\"{}\" maxlength=\"160\" required{described_by}><button type=\"submit\">Add asset</button></form>",
+            escape_html(operation_id),
+            escape_html(csrf_token),
+            escape_html(values[0]),
+            escape_html(values[1]),
+            escape_html(values[2]),
+            escape_html(values[3]),
+        ),
+    )
 }
 
 pub fn empty_page(
@@ -136,6 +198,18 @@ fn page_shell(title: &str, content: &str) -> String {
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{} · NaughtyWolf</title><link rel=\"stylesheet\" href=\"/static/admin.css\"><script src=\"/static/admin.js\" defer></script></head><body>{content}</body></html>",
         escape_html(title),
     )
+}
+
+fn form_error(error: Option<&str>, id: &str) -> String {
+    error
+        .map(|message| {
+            format!(
+                "<p class=\"form-error\" role=\"alert\" id=\"{}\">{}</p>",
+                escape_html(id),
+                escape_html(message),
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn escape_html(value: &str) -> String {

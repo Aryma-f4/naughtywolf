@@ -34,6 +34,38 @@ impl Repository {
             .map_err(|_| AppError::Internal)
     }
 
+    pub async fn create_operation_with_audit(
+        &self,
+        name: &str,
+        purpose: &str,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<Operation, AppError> {
+        let id = Uuid::new_v4().to_string();
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query("INSERT INTO operations (id, name, purpose) VALUES (?, ?, ?)")
+            .bind(&id)
+            .bind(name)
+            .bind(purpose)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "operation.created",
+            "operation",
+            &id,
+            "success",
+            correlation_id,
+        )
+        .for_operation(&id);
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+
+        self.find_operation(&id).await?.ok_or(AppError::NotFound)
+    }
+
     pub async fn create_asset(
         &self,
         operation_id: &str,
@@ -62,6 +94,47 @@ impl Repository {
             .fetch_one(&self.pool)
             .await
             .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn create_asset_with_audit(
+        &self,
+        operation_id: &str,
+        name: &str,
+        kind: &str,
+        owner: &str,
+        address: &str,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<Asset, AppError> {
+        let id = Uuid::new_v4().to_string();
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO assets (id, operation_id, name, kind, owner, address) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(operation_id)
+        .bind(name)
+        .bind(kind)
+        .bind(owner)
+        .bind(address)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "asset.created",
+            "asset",
+            &id,
+            "success",
+            correlation_id,
+        )
+        .for_operation(operation_id);
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+
+        self.find_asset(&id).await?.ok_or(AppError::NotFound)
     }
 
     pub async fn list_assets(&self, operation_id: &str) -> Result<Vec<Asset>, AppError> {

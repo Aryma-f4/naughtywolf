@@ -1,5 +1,5 @@
-use naughtywolf::db::models::CheckRunState;
 use naughtywolf::db::repositories::Repository;
+use naughtywolf::{auth::rbac::Role, db::models::CheckRunState};
 use serde_json::json;
 
 async fn test_repository() -> Repository {
@@ -8,6 +8,110 @@ async fn test_repository() -> Repository {
         .unwrap();
     naughtywolf::db::run_migrations(&pool).await.unwrap();
     Repository { pool }
+}
+
+async fn create_user(repo: &Repository, id: &str, role: Role) {
+    sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, ?)")
+        .bind(id)
+        .bind(format!("{id}-user"))
+        .bind("not-a-real-password-hash")
+        .bind(role.to_string())
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn creating_an_asset_records_an_audit_event() {
+    let repo = test_repository().await;
+    create_user(&repo, "admin", Role::Admin).await;
+    let operation = repo.create_operation("Lab", "Practice").await.unwrap();
+
+    let asset = repo
+        .create_asset_with_audit(
+            &operation.id,
+            "web-01",
+            "web",
+            "Lab",
+            "127.0.0.1",
+            "admin",
+            "test-correlation",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(repo.count_audit_events().await.unwrap(), 1);
+    let event =
+        sqlx::query_as::<_, naughtywolf::db::models::AuditEvent>("SELECT * FROM audit_events")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert_eq!(event.action, "asset.created");
+    assert_eq!(event.actor_id.as_deref(), Some("admin"));
+    assert_eq!(event.operation_id.as_deref(), Some(operation.id.as_str()));
+    assert_eq!(event.target_id.as_deref(), Some(asset.id.as_str()));
+    assert_eq!(event.correlation_id, "test-correlation");
+}
+
+#[tokio::test]
+async fn creating_an_operation_records_an_audit_event() {
+    let repo = test_repository().await;
+    create_user(&repo, "admin", Role::Admin).await;
+
+    let operation = repo
+        .create_operation_with_audit("Lab", "Practice", "admin", "operation-correlation")
+        .await
+        .unwrap();
+
+    let event =
+        sqlx::query_as::<_, naughtywolf::db::models::AuditEvent>("SELECT * FROM audit_events")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert_eq!(event.action, "operation.created");
+    assert_eq!(event.actor_id.as_deref(), Some("admin"));
+    assert_eq!(event.operation_id.as_deref(), Some(operation.id.as_str()));
+    assert_eq!(event.target_id.as_deref(), Some(operation.id.as_str()));
+    assert_eq!(event.correlation_id, "operation-correlation");
+}
+
+#[tokio::test]
+async fn operation_creation_rolls_back_when_its_audit_insert_fails() {
+    let repo = test_repository().await;
+
+    assert!(
+        repo.create_operation_with_audit("Lab", "Practice", "missing-user", "correlation")
+            .await
+            .is_err()
+    );
+    let operation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operations")
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+    assert_eq!(operation_count, 0);
+    assert_eq!(repo.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn asset_creation_rolls_back_when_its_audit_insert_fails() {
+    let repo = test_repository().await;
+    let operation = repo.create_operation("Lab", "Practice").await.unwrap();
+
+    assert!(
+        repo.create_asset_with_audit(
+            &operation.id,
+            "web-01",
+            "web",
+            "Lab",
+            "127.0.0.1",
+            "missing-user",
+            "correlation",
+        )
+        .await
+        .is_err()
+    );
+    assert!(repo.list_assets(&operation.id).await.unwrap().is_empty());
+    assert_eq!(repo.count_audit_events().await.unwrap(), 0);
 }
 
 #[tokio::test]
