@@ -230,7 +230,7 @@ async fn create_asset(
             &Uuid::new_v4().to_string(),
         )
         .await?;
-    Ok(Redirect::to(&format!("/operations/{operation_id}")).into_response())
+    Ok(Redirect::to("/operations").into_response())
 }
 
 fn valid_form_values(values: &[&str]) -> bool {

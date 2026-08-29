@@ -466,10 +466,7 @@ async fn authorized_operator_can_submit_the_labeled_asset_form() {
         .await
         .unwrap();
     assert_eq!(submit.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        submit.headers().get("location").unwrap(),
-        format!("/operations/{}", operation.id).as_str()
-    );
+    assert_eq!(submit.headers().get("location").unwrap(), "/operations");
     let assets = repository.list_assets(&operation.id).await.unwrap();
     assert_eq!(assets.len(), 1);
     assert_eq!(assets[0].name, "web-01");
