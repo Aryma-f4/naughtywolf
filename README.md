@@ -1,156 +1,95 @@
 # NaughtyWolf 🐺
 
-Sliver C2 Web Console — modern, Neo-cyber themed operator UI for managing Sliver implants and infrastructure.
+NaughtyWolf is a standalone local portal for authorized security-lab records. It keeps operations, inventory, non-destructive check history, evidence metadata, reports, local accounts, and an append-only audit trail in SQLite.
 
 ## Features
 
-- **Lightweight SPA** — No build pipeline, no Node.js. Pure HTML/CSS/JS served by Axum.
-- **Neo-cyber UI** — Dark theme with cyan/magenta accents, Cobalt Strike-style chain graph.
-- **Multi-User RBAC** — Admin, Operator, Viewer roles with session-based auth.
-- **Sliver Integration** — Connect to any Sliver server via gRPC mTLS.
-- **Operational Pages** — Sessions, Beacons, Listeners, Payloads, Websites, Loot, Credentials, Events.
-- **Chain Graph** — Visualize listener → host → implant topology.
-- **Payload Generation** — Generate implants via `sliver-server` CLI integration.
-- **Audit Logging** — Track all actions through the console.
+- Server-rendered, responsive pages with no frontend build step.
+- Local Admin, Operator, and Viewer roles with signed sessions.
+- Operation membership scoping for non-Admin users.
+- Audited operation, asset, and account changes.
+- Bounded evidence storage with path, file type, length, and SHA-256 verification before download.
+- Printable summaries built only from stored operation records.
 
-## Quick Start
+## Local development
 
 ### Prerequisites
 
-- PostgreSQL (local or via Docker)
-- Sliver server running (for full functionality)
+- A current stable Rust toolchain.
+- SQLite support supplied through the Rust dependencies; no separate database service is required.
 
-### Local Development
+Clone the repository and build it:
 
 ```bash
-# 1. Clone and build
 git clone https://github.com/Aryma-f4/naughtywolf.git
 cd naughtywolf
 cargo build
+```
 
-# 2. Setup database
-docker run -d --name nw-pg -e POSTGRES_PASSWORD=naughtywolf \
-  -e POSTGRES_DB=naughtywolf -e POSTGRES_USER=naughtywolf \
-  -p 5432:5432 postgres:16
+Create the first local administrator. The command prompts for the account password without placing it in shell history:
 
-# 3. Create admin user
-DATABASE_URL="postgres://naughtywolf:naughtywolf@localhost:5432/naughtywolf" \
-NAUGHTYWOLF_SESSION_SECRET="dev-secret" \
-cargo run -- user create --username admin --role admin --password naughtywolf
+```bash
+NAUGHTYWOLF_DATABASE_URL='sqlite:naughtywolf.db?mode=rwc' \
+NAUGHTYWOLF_SESSION_SECRET='replace-with-at-least-32-random-bytes' \
+NAUGHTYWOLF_COOKIE_SECURE=false \
+cargo run -- user create --username admin --role admin
+```
 
-# 4. Run server
-DATABASE_URL="postgres://naughtywolf:naughtywolf@localhost:5432/naughtywolf" \
-NAUGHTYWOLF_SESSION_SECRET="dev-secret" \
-NAUGHTYWOLF_BIND="0.0.0.0:8080" \
+Start the local server:
+
+```bash
+NAUGHTYWOLF_DATABASE_URL='sqlite:naughtywolf.db?mode=rwc' \
+NAUGHTYWOLF_SESSION_SECRET='replace-with-at-least-32-random-bytes' \
+NAUGHTYWOLF_COOKIE_SECURE=false \
 cargo run -- serve
 ```
 
-Open `http://localhost:8080/login` → login with `admin` / `naughtywolf`.
+Open [http://127.0.0.1:8080/login](http://127.0.0.1:8080/login) and sign in with the account you created.
 
-### Docker Deployment
+This HTTP configuration is for local development only. Production deployments require an HTTPS origin and `NAUGHTYWOLF_COOKIE_SECURE=true`. Use a unique random session secret of at least 32 bytes and protect the database and evidence directory with operating-system access controls.
 
-```bash
-docker run -d --name nw-postgres -e POSTGRES_PASSWORD=naughtywolf \
-  -e POSTGRES_DB=naughtywolf -e POSTGRES_USER=naughtywolf \
-  -p 5433:5432 postgres:16
-
-# Build the binary and run with:
-SLIVER_SERVER_PATH="/path/to/sliver-server" \
-NAUGHTYWOLF_BIND="0.0.0.0:8080" \
-DATABASE_URL="postgres://naughtywolf:naughtywolf@host:5433/naughtywolf" \
-NAUGHTYWOLF_SESSION_SECRET="production-secret" \
-./naughtywolf serve
-```
-
-## Connecting to Sliver
-
-### Generate Operator Config
-
-```bash
-# From your Sliver server:
-sliver-server operator --name naughtywolf --lhost 127.0.0.1 \
-  --permissions all --save /path/to/nw.cfg
-```
-
-Or via Sliver console:
-```
-[server] sliver > new-operator --name naughtywolf --lhost 127.0.0.1
-```
-
-### Connect via Web UI
-
-1. Go to **Settings** (sidebar gear icon) → **Sliver Connection**
-2. Enter the path to your `.cfg` operator config file
-3. Click **Connect**
-
-Or via API:
-```bash
-curl -X POST http://localhost:8080/api/sliver/connect \
-  -H "Content-Type: application/json" \
-  -d '{"config_path": "/path/to/nw.cfg"}'
-```
-
-## Environment Variables
+## Configuration
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABASE_URL` | — | PostgreSQL connection string |
-| `NAUGHTYWOLF_SESSION_SECRET` | — | Session encryption key |
-| `NAUGHTYWOLF_BIND` | `127.0.0.1:8080` | Server bind address |
-| `SLIVER_SERVER_PATH` | `sliver-server` | Path to sliver-server binary (for payload generation) |
+| --- | --- | --- |
+| `NAUGHTYWOLF_DATABASE_URL` | `sqlite:naughtywolf.db?mode=rwc` | Local SQLite database URL. |
+| `NAUGHTYWOLF_BIND` | `127.0.0.1:8080` | Server bind address. |
+| `NAUGHTYWOLF_EVIDENCE_DIR` | `evidence` | Root directory for generated evidence files. |
+| `NAUGHTYWOLF_SESSION_SECRET` | none | Required signed-session secret of at least 32 bytes. |
+| `NAUGHTYWOLF_COOKIE_SECURE` | `false` | Set to `true` when served from an HTTPS origin. |
 
-## API Endpoints
+## Local account commands
 
-### Auth
-- `GET /login` — Login page
-- `POST /login` — Login form
-- `GET /logout` — Logout
-
-### Sliver Connection
-- `GET /api/sliver/status` — Connection status
-- `POST /api/sliver/connect` — Connect (body: `{"config_path": "..."}`)
-- `POST /api/sliver/disconnect` — Disconnect
-
-### Data
-- `GET /api/dashboard/stats` — Dashboard statistics
-- `GET /api/sessions` — Active sessions
-- `GET /api/beacons` — Active beacons
-- `GET /api/listeners` — Active listeners/jobs
-- `POST /api/listeners` — Start listener (body: `{"protocol":"http|mtls","host":"0.0.0.0","port":8080}`)
-- `POST /api/listeners/kill/{id}` — Kill listener
-- `GET /api/payloads` — List implant builds
-- `POST /api/payloads/generate` — Generate implant (body: `{"name":"test","goos":"linux","goarch":"amd64","format":"exe","is_beacon":false,"protocol":"mtls","lhost":"127.0.0.1","lport":443}`)
-- `GET /api/websites` — Websites
-- `GET /api/loot` — Loot
-- `GET /api/creds` — Credentials
-
-### Admin
-- `GET /api/users` — List users (admin only)
-- `GET /api/events` — SSE event stream
-
-## Architecture
-
-```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Browser    │────▶│  NaughtyWolf │────▶│  PostgreSQL  │
-│  (SPA)      │     │  (Axum)      │     │  (Sessions)  │
-└─────────────┘     └──────┬───────┘     └──────────────┘
-                           │
-                           ▼
-                    ┌──────────────┐     ┌──────────────┐
-                    │  Sliver      │◀────│  sliver-     │
-                    │  Server      │     │  server CLI  │
-                    │  (gRPC)      │     │  (generate)  │
-                    └──────────────┘     └──────────────┘
+```bash
+cargo run -- user create --username reviewer --role viewer
+cargo run -- user list
+cargo run -- user disable --username reviewer
 ```
 
-## Tech Stack
+Supply the same `NAUGHTYWOLF_DATABASE_URL` for every command that should use the same database. Account roles and disabled state can also be changed by an Admin from `/admin/users`; those changes are recorded in the audit trail. An administrator cannot change their own role or disable their own account.
 
-- **Backend:** Rust, Axum, tonic (gRPC), sqlx, tower-sessions
-- **Frontend:** Vanilla HTML/CSS/JS, hash-routing SPA, SVG graph
-- **TLS:** rustls with aws-lc-rs provider
-- **Database:** PostgreSQL (via sqlx migrations)
+## Portal pages
+
+| Route | Purpose |
+| --- | --- |
+| `/dashboard` | Counts for records visible to the current user. |
+| `/operations` | Authorized operation records and scoped asset creation. |
+| `/inventory` | Scoped inventory. |
+| `/checks` | Scoped check-run history. |
+| `/audit` | Scoped append-only audit history. |
+| `/evidence` | Safe evidence metadata and verified downloads. |
+| `/reports` | Printable operation summaries from stored records. |
+| `/admin/users` | Admin-only local account controls. |
+
+All non-Admin reads are limited to operations where the current user is a member. Evidence downloads resolve that scope before opening a file, then re-check the generated relative path, regular-file status, recorded length, and SHA-256 digest.
+
+## Verification
+
+```bash
+cargo fmt --check
+cargo test
+```
 
 ## License
 
-Internal tool — authorized security testing only.
+Internal tool for authorized security-lab use only.

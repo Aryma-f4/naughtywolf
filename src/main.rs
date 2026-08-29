@@ -11,6 +11,7 @@ use naughtywolf::{
     cli::{Cli, Commands},
     config::Config,
     db::{self, repositories::Repository},
+    evidence::EvidenceStore,
     portal,
 };
 use serde::Deserialize;
@@ -56,11 +57,14 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
         .with_secure(config.cookie_secure)
         .with_expiry(Expiry::OnInactivity(Duration::hours(8)))
         .with_signed(Key::derive_from(&config.session_secret_bytes()));
+    let repository = Repository { pool };
+    let evidence_store = EvidenceStore::from_config(repository.clone(), &config);
     let app = Router::<Repository>::new()
         .route("/login", post(login_handler))
         .merge(portal::authenticated_router())
-        .with_state(Repository { pool })
+        .with_state(repository)
         .merge(public_router())
+        .layer(axum::Extension(evidence_store))
         .layer(session_layer);
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;

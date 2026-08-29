@@ -4,11 +4,31 @@ use uuid::Uuid;
 
 use crate::{
     audit::AuditEntry,
+    auth::rbac::Role,
     db::models::{
         Asset, AssetStatus, AuditEvent, CheckRun, Evidence, Operation, OperationStatus, RunState,
     },
     error::AppError,
 };
+
+/// Password-free account record used by the local administrative portal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalUser {
+    pub id: String,
+    pub username: String,
+    pub role: Role,
+    pub disabled: bool,
+    pub created_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PortalUserRow {
+    id: String,
+    username: String,
+    role: String,
+    disabled: bool,
+    created_at: String,
+}
 
 /// SQL-only access to persisted lab-platform records.
 #[derive(Clone)]
@@ -17,6 +37,105 @@ pub struct Repository {
 }
 
 impl Repository {
+    pub async fn list_users(&self) -> Result<Vec<PortalUser>, AppError> {
+        let rows = sqlx::query_as::<_, PortalUserRow>(
+            "SELECT id, username, role, disabled, created_at FROM users ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(PortalUser {
+                    id: row.id,
+                    username: row.username,
+                    role: row.role.parse().map_err(|_| AppError::Internal)?,
+                    disabled: row.disabled,
+                    created_at: row.created_at,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn set_user_role_with_audit(
+        &self,
+        user_id: &str,
+        role: Role,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<(), AppError> {
+        if user_id == actor_id {
+            return Err(AppError::Conflict(
+                "administrators cannot change their own role".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        let update = sqlx::query(
+            "UPDATE users SET role = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?",
+        )
+        .bind(role.to_string())
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        if update.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "user.role_changed",
+            "user",
+            user_id,
+            "success",
+            correlation_id,
+        );
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn set_user_disabled_with_audit(
+        &self,
+        user_id: &str,
+        disabled: bool,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<(), AppError> {
+        if user_id == actor_id {
+            return Err(AppError::Conflict(
+                "administrators cannot disable their own account".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        let update = sqlx::query(
+            "UPDATE users SET disabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?",
+        )
+        .bind(disabled)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        if update.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "user.disabled",
+            "user",
+            user_id,
+            "success",
+            correlation_id,
+        );
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)
+    }
+
     pub async fn create_operation(&self, name: &str, purpose: &str) -> Result<Operation, AppError> {
         let id = Uuid::new_v4().to_string();
         sqlx::query("INSERT INTO operations (id, name, purpose) VALUES (?, ?, ?)")
@@ -233,6 +352,32 @@ impl Repository {
             )
             .bind(user_id)
             .fetch_all(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn find_evidence_visible_to(
+        &self,
+        evidence_id: &str,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Option<Evidence>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, Evidence>("SELECT * FROM evidence WHERE id = ?")
+                .bind(evidence_id)
+                .fetch_optional(&self.pool)
+                .await
+        } else {
+            sqlx::query_as::<_, Evidence>(
+                "SELECT evidence.* FROM evidence \
+                 JOIN check_runs ON check_runs.id = evidence.check_run_id \
+                 JOIN operation_members ON operation_members.operation_id = check_runs.operation_id \
+                 WHERE evidence.id = ? AND operation_members.user_id = ?",
+            )
+            .bind(evidence_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
             .await
         };
         query.map_err(|_| AppError::Internal)

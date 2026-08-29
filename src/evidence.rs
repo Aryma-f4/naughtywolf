@@ -144,11 +144,7 @@ impl EvidenceStore {
             ));
         }
 
-        let full_path = self.evidence_dir.join(&recorded_relative_path);
-        ensure_path_is_within_root(&self.evidence_dir, &full_path)?;
-        require_safe_directory(&self.evidence_dir).await?;
-        require_safe_directory(&self.evidence_dir.join(run_id)).await?;
-        validate_existing_file(&full_path, evidence).await
+        self.read_verified(evidence).await.map(|_| ())
     }
 
     /// Persist the already-bounded JSON representation of a completed check result.
@@ -158,6 +154,38 @@ impl EvidenceStore {
         })?;
         let bytes = serde_json::to_vec(result).map_err(|_| AppError::Internal)?;
         self.write(run_id, &bytes, "application/json").await
+    }
+
+    /// Read an immutable evidence record after re-validating its generated path,
+    /// regular-file metadata, byte length, and SHA-256 checksum.
+    pub async fn read_verified(&self, evidence: &Evidence) -> Result<Vec<u8>, AppError> {
+        validate_run_id(&evidence.check_run_id)?;
+        if evidence.sha256.len() != 64
+            || !evidence
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AppError::Validation(
+                "stored evidence checksum is invalid".to_owned(),
+            ));
+        }
+
+        let recorded_relative_path = PathBuf::from(&evidence.storage_path);
+        validate_generated_relative_path(&recorded_relative_path)?;
+        let expected_relative_path =
+            PathBuf::from(&evidence.check_run_id).join(format!("{}.json", &evidence.sha256[..16]));
+        if recorded_relative_path != expected_relative_path {
+            return Err(AppError::Validation(
+                "stored evidence path does not match its metadata".to_owned(),
+            ));
+        }
+
+        let full_path = self.evidence_dir.join(&recorded_relative_path);
+        ensure_path_is_within_root(&self.evidence_dir, &full_path)?;
+        require_safe_directory(&self.evidence_dir).await?;
+        require_safe_directory(&self.evidence_dir.join(&evidence.check_run_id)).await?;
+        read_verified_file(&full_path, evidence).await
     }
 }
 
@@ -230,7 +258,7 @@ async fn require_safe_directory(path: &Path) -> Result<(), AppError> {
     }
 }
 
-async fn validate_existing_file(path: &Path, evidence: &Evidence) -> Result<(), AppError> {
+async fn read_verified_file(path: &Path, evidence: &Evidence) -> Result<Vec<u8>, AppError> {
     let metadata = fs::symlink_metadata(path).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AppError::Validation("stored evidence file is missing".to_owned())
@@ -250,7 +278,7 @@ async fn validate_existing_file(path: &Path, evidence: &Evidence) -> Result<(), 
             "stored evidence file does not match its checksum".to_owned(),
         ));
     }
-    Ok(())
+    Ok(bytes)
 }
 
 async fn reject_existing_path(path: &Path) -> Result<(), AppError> {

@@ -1,7 +1,10 @@
 use crate::{
     auth::{AuthenticatedUser, rbac::Role},
-    db::models::Operation,
-    portal::DashboardSummary,
+    db::{
+        models::{AuditEvent, CheckRun, Evidence, Operation},
+        repositories::PortalUser,
+    },
+    portal::{DashboardSummary, OperationReportSummary},
 };
 
 pub fn public_landing() -> String {
@@ -41,7 +44,9 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
         ("reports", "/reports", "Reports"),
     ]
     .into_iter()
-    .chain((user.role == Role::Admin).then_some(("admin", "/admin", "Admin")))
+    .chain(
+        (user.role == Role::Admin).then_some(("admin", "/admin/users", "Admin")),
+    )
     .map(|(name, href, label)| {
         let current = (name == active_nav).then_some(" aria-current=\"page\"").unwrap_or("");
         format!(
@@ -114,6 +119,161 @@ pub fn operations_page(user: &AuthenticatedUser, operations: &[Operation]) -> St
         "operations",
         &format!("<div class=\"page-actions\">{create_link}</div>{body}"),
     )
+}
+
+pub fn checks_page(user: &AuthenticatedUser, runs: &[CheckRun]) -> String {
+    let body = if runs.is_empty() {
+        "<section class=\"zero-state\"><p>No scoped checks yet</p></section>".to_owned()
+    } else {
+        let rows = runs
+            .iter()
+            .map(|run| {
+                format!(
+                    "<tr><td><code>{}</code></td><td>{}</td><td>{:?}</td><td><code>{}</code></td><td>{}</td></tr>",
+                    escape_html(&run.id),
+                    escape_html(&run.check_id),
+                    run.state,
+                    escape_html(&run.operation_id),
+                    escape_html(&run.created_at),
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<div class=\"table-scroll\"><table><caption>Scoped check-run history</caption><thead><tr><th scope=\"col\">Run</th><th scope=\"col\">Check</th><th scope=\"col\">State</th><th scope=\"col\">Operation</th><th scope=\"col\">Created</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+    app_page("Checks", user, "checks", &body)
+}
+
+pub fn audit_page(user: &AuthenticatedUser, events: &[AuditEvent]) -> String {
+    let body = if events.is_empty() {
+        "<section class=\"zero-state\"><p>No scoped audit records yet</p></section>".to_owned()
+    } else {
+        let rows = events
+            .iter()
+            .map(|event| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape_html(&event.action),
+                    escape_html(event.actor_id.as_deref().unwrap_or("System")),
+                    escape_html(&event.target_type),
+                    escape_html(event.target_id.as_deref().unwrap_or("—")),
+                    escape_html(&event.outcome),
+                    escape_html(&event.created_at),
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<div class=\"table-scroll\"><table><caption>Scoped, append-only audit history</caption><thead><tr><th scope=\"col\">Action</th><th scope=\"col\">Actor</th><th scope=\"col\">Target type</th><th scope=\"col\">Target</th><th scope=\"col\">Outcome</th><th scope=\"col\">Created</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+    app_page("Audit", user, "audit", &body)
+}
+
+pub fn evidence_page(user: &AuthenticatedUser, records: &[Evidence]) -> String {
+    let body = if records.is_empty() {
+        "<section class=\"zero-state\"><p>No scoped evidence yet</p></section>".to_owned()
+    } else {
+        let rows = records
+            .iter()
+            .map(|evidence| {
+                let hash_prefix = evidence.sha256.chars().take(12).collect::<String>();
+                format!(
+                    "<tr><td><code>{}</code></td><td>{}</td><td>{} bytes</td><td><code>{}</code></td><td>{}</td><td><a href=\"/evidence/{}/download\">Download</a></td></tr>",
+                    escape_html(&evidence.id),
+                    escape_html(&evidence.content_type),
+                    evidence.byte_len,
+                    escape_html(&hash_prefix),
+                    escape_html(&evidence.created_at),
+                    escape_html(&evidence.id),
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<div class=\"table-scroll\"><table><caption>Scoped evidence metadata</caption><thead><tr><th scope=\"col\">Evidence</th><th scope=\"col\">Content type</th><th scope=\"col\">Size</th><th scope=\"col\">SHA-256 prefix</th><th scope=\"col\">Created</th><th scope=\"col\">File</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+    app_page("Evidence", user, "evidence", &body)
+}
+
+pub fn reports_page(user: &AuthenticatedUser, summaries: &[OperationReportSummary]) -> String {
+    let body = if summaries.is_empty() {
+        "<section class=\"zero-state\"><p>No scoped reports yet</p></section>".to_owned()
+    } else {
+        let reports = summaries
+            .iter()
+            .map(|summary| {
+                format!(
+                    "<article class=\"report-card\"><h2>{}</h2><p>{}</p><dl class=\"report-counts\"><div><dt>Assets</dt><dd>{}</dd></div><div><dt>Queued</dt><dd>{}</dd></div><div><dt>Running</dt><dd>{}</dd></div><div><dt>Succeeded</dt><dd>{}</dd></div><div><dt>Failed</dt><dd>{}</dd></div><div><dt>Cancelled</dt><dd>{}</dd></div><div><dt>Audit records</dt><dd>{}</dd></div></dl></article>",
+                    escape_html(&summary.operation.name),
+                    escape_html(&summary.operation.purpose),
+                    summary.asset_count,
+                    summary.queued_count,
+                    summary.running_count,
+                    summary.succeeded_count,
+                    summary.failed_count,
+                    summary.cancelled_count,
+                    summary.audit_count,
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<p class=\"print-note\">Use your browser’s print command for a printable copy.</p><section class=\"report-list\" aria-label=\"Operation summaries\">{reports}</section>"
+        )
+    };
+    app_page("Reports", user, "reports", &body)
+}
+
+pub fn admin_users_page(
+    user: &AuthenticatedUser,
+    users: &[PortalUser],
+    csrf_token: &str,
+    error: Option<&str>,
+) -> String {
+    let rows = users
+        .iter()
+        .map(|account| {
+            let controls = if account.id == user.id {
+                "<span class=\"muted\">Current account</span>".to_owned()
+            } else {
+                let role_options = [Role::Admin, Role::Operator, Role::Viewer]
+                    .into_iter()
+                    .map(|role| {
+                        let selected = (role == account.role).then_some(" selected").unwrap_or("");
+                        format!(
+                            "<option value=\"{}\"{selected}>{}</option>",
+                            role,
+                            role,
+                        )
+                    })
+                    .collect::<String>();
+                let next_disabled = !account.disabled;
+                let disabled_label = if account.disabled { "Enable" } else { "Disable" };
+                format!(
+                    "<div class=\"account-controls\"><form method=\"post\" action=\"/admin/users/{}/role\"><input type=\"hidden\" name=\"csrf_token\" value=\"{}\"><label for=\"role-{}\">Role</label><select id=\"role-{}\" name=\"role\">{role_options}</select><button type=\"submit\">Update role</button></form><form method=\"post\" action=\"/admin/users/{}/disabled\"><input type=\"hidden\" name=\"csrf_token\" value=\"{}\"><input type=\"hidden\" name=\"disabled\" value=\"{}\"><button class=\"secondary-button\" type=\"submit\">{disabled_label}</button></form></div>",
+                    escape_html(&account.id),
+                    escape_html(csrf_token),
+                    escape_html(&account.id),
+                    escape_html(&account.id),
+                    escape_html(&account.id),
+                    escape_html(csrf_token),
+                    next_disabled,
+                )
+            };
+            let status = if account.disabled { "Disabled" } else { "Enabled" };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{status}</td><td>{}</td><td>{controls}</td></tr>",
+                escape_html(&account.username),
+                escape_html(&account.role.to_string()),
+                escape_html(&account.created_at),
+            )
+        })
+        .collect::<String>();
+    let error = form_error(error, "admin-users-error");
+    let body = format!(
+        "{error}<div class=\"table-scroll\"><table><caption>Local user accounts</caption><thead><tr><th scope=\"col\">Username</th><th scope=\"col\">Role</th><th scope=\"col\">Status</th><th scope=\"col\">Created</th><th scope=\"col\">Controls</th></tr></thead><tbody>{rows}</tbody></table></div>"
+    );
+    app_page("Administration", user, "admin", &body)
 }
 
 pub fn operation_form_page(

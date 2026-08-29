@@ -1,7 +1,7 @@
 use axum::{
     Extension, Form, Router,
     extract::{FromRequest, Path, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -16,7 +16,11 @@ use crate::{
         middleware::{AuthSession, AuthenticatedUserGuard},
         rbac::Role,
     },
-    db::{models::Operation, repositories::Repository},
+    db::{
+        models::{Asset, AuditEvent, CheckRun, Operation, RunState},
+        repositories::Repository,
+    },
+    evidence::EvidenceStore,
     policy::authorize_operation,
 };
 
@@ -31,6 +35,18 @@ pub struct DashboardSummary {
     pub run_count: i64,
     pub evidence_count: i64,
     pub audit_count: i64,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct OperationReportSummary {
+    pub operation: Operation,
+    pub asset_count: usize,
+    pub queued_count: usize,
+    pub running_count: usize,
+    pub succeeded_count: usize,
+    pub failed_count: usize,
+    pub cancelled_count: usize,
+    pub audit_count: usize,
 }
 
 pub async fn visible_operations(
@@ -84,8 +100,12 @@ pub fn authenticated_router() -> Router<Repository> {
         .route("/checks", get(checks))
         .route("/audit", get(audit))
         .route("/evidence", get(evidence))
+        .route("/evidence/{evidence_id}/download", get(download_evidence))
         .route("/reports", get(reports))
         .route("/admin", get(admin))
+        .route("/admin/users", get(admin_users))
+        .route("/admin/users/{user_id}/role", post(set_user_role))
+        .route("/admin/users/{user_id}/disabled", post(set_user_disabled))
         .route("/logout", post(logout))
 }
 
@@ -302,47 +322,235 @@ async fn inventory(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html
     ))
 }
 
-async fn checks(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
-    Html(templates::empty_page(
-        "Checks",
-        &user,
-        "checks",
-        "No scoped checks yet",
-    ))
-}
-
-async fn audit(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
-    Html(templates::empty_page(
-        "Audit",
-        &user,
-        "audit",
-        "No scoped audit records yet",
-    ))
-}
-
-async fn evidence(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
-    Html(templates::empty_page(
-        "Evidence",
-        &user,
-        "evidence",
-        "No scoped evidence yet",
-    ))
-}
-
-async fn reports(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
-    Html(templates::empty_page(
-        "Reports",
-        &user,
-        "reports",
-        "No scoped reports yet",
-    ))
-}
-
-async fn admin(
+async fn checks(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    let runs = repository
+        .list_check_runs_visible_to(&user.id, user.role == Role::Admin)
+        .await?;
+    Ok(Html(templates::checks_page(&user, &runs)))
+}
+
+async fn audit(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    let events = repository
+        .list_audit_events_visible_to(&user.id, user.role == Role::Admin)
+        .await?;
+    Ok(Html(templates::audit_page(&user, &events)))
+}
+
+async fn evidence(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    let records = repository
+        .list_evidence_visible_to(&user.id, user.role == Role::Admin)
+        .await?;
+    Ok(Html(templates::evidence_page(&user, &records)))
+}
+
+async fn download_evidence(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(evidence_id): Path<String>,
+    evidence_store: Option<Extension<EvidenceStore>>,
+) -> Result<Response, AppError> {
+    let evidence = repository
+        .find_evidence_visible_to(&evidence_id, &user.id, user.role == Role::Admin)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let Extension(evidence_store) = evidence_store.ok_or(AppError::Internal)?;
+    let bytes = evidence_store.read_verified(&evidence).await?;
+    let content_type = HeaderValue::try_from(&evidence.content_type)
+        .map_err(|_| AppError::Validation("stored evidence content type is invalid".to_owned()))?;
+    let mut response = bytes.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"evidence\""),
+    );
+    Ok(response)
+}
+
+async fn reports(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    let is_admin = user.role == Role::Admin;
+    let operations = repository
+        .list_operations_visible_to(&user.id, is_admin)
+        .await?;
+    let assets = repository
+        .list_assets_visible_to(&user.id, is_admin)
+        .await?;
+    let runs = repository
+        .list_check_runs_visible_to(&user.id, is_admin)
+        .await?;
+    let events = repository
+        .list_audit_events_visible_to(&user.id, is_admin)
+        .await?;
+    let summaries = operation_report_summaries(operations, &assets, &runs, &events);
+    Ok(Html(templates::reports_page(&user, &summaries)))
+}
+
+fn operation_report_summaries(
+    operations: Vec<Operation>,
+    assets: &[Asset],
+    runs: &[CheckRun],
+    events: &[AuditEvent],
+) -> Vec<OperationReportSummary> {
+    operations
+        .into_iter()
+        .map(|operation| {
+            let operation_id = operation.id.clone();
+            let mut summary = OperationReportSummary {
+                asset_count: assets
+                    .iter()
+                    .filter(|asset| asset.operation_id == operation_id)
+                    .count(),
+                audit_count: events
+                    .iter()
+                    .filter(|event| event.operation_id.as_deref() == Some(operation_id.as_str()))
+                    .count(),
+                operation,
+                queued_count: 0,
+                running_count: 0,
+                succeeded_count: 0,
+                failed_count: 0,
+                cancelled_count: 0,
+            };
+            for run in runs.iter().filter(|run| run.operation_id == operation_id) {
+                match run.state {
+                    RunState::Queued => summary.queued_count += 1,
+                    RunState::Running => summary.running_count += 1,
+                    RunState::Succeeded => summary.succeeded_count += 1,
+                    RunState::Failed => summary.failed_count += 1,
+                    RunState::Cancelled => summary.cancelled_count += 1,
+                }
+            }
+            summary
+        })
+        .collect()
+}
+
+async fn admin(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Result<Redirect, AppError> {
+    user.require(Role::Admin)?;
+    Ok(Redirect::to("/admin/users"))
+}
+
+async fn admin_users(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    session: Session,
 ) -> Result<Html<String>, AppError> {
     user.require(Role::Admin)?;
-    Ok(Html(templates::admin_page(&user)))
+    let users = repository.list_users().await?;
+    let csrf_token = issue_csrf_token(&session).await?;
+    Ok(Html(templates::admin_users_page(
+        &user,
+        &users,
+        &csrf_token,
+        None,
+    )))
+}
+
+#[derive(Deserialize)]
+struct UserRoleForm {
+    role: String,
+    csrf_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UserDisabledForm {
+    disabled: bool,
+    csrf_token: Option<String>,
+}
+
+async fn set_user_role(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(user_id): Path<String>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Admin)?;
+    if user.id == user_id {
+        return Err(AppError::Conflict(
+            "administrators cannot change their own role".to_owned(),
+        ));
+    }
+    let form = match Form::<UserRoleForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => return invalid_admin_users_response(&user, &repository, &session).await,
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await? {
+        return invalid_admin_users_response(&user, &repository, &session).await;
+    }
+    let role = form
+        .role
+        .parse::<Role>()
+        .map_err(|_| AppError::Validation("invalid user role".to_owned()))?;
+
+    repository
+        .set_user_role_with_audit(&user_id, role, &user.id, &Uuid::new_v4().to_string())
+        .await?;
+    Ok(Redirect::to("/admin/users").into_response())
+}
+
+async fn set_user_disabled(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(user_id): Path<String>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Admin)?;
+    if user.id == user_id {
+        return Err(AppError::Conflict(
+            "administrators cannot disable their own account".to_owned(),
+        ));
+    }
+    let form = match Form::<UserDisabledForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => return invalid_admin_users_response(&user, &repository, &session).await,
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await? {
+        return invalid_admin_users_response(&user, &repository, &session).await;
+    }
+
+    repository
+        .set_user_disabled_with_audit(
+            &user_id,
+            form.disabled,
+            &user.id,
+            &Uuid::new_v4().to_string(),
+        )
+        .await?;
+    Ok(Redirect::to("/admin/users").into_response())
+}
+
+async fn invalid_admin_users_response(
+    user: &AuthenticatedUser,
+    repository: &Repository,
+    session: &Session,
+) -> Result<Response, AppError> {
+    let users = repository.list_users().await?;
+    let csrf_token = issue_csrf_token(session).await?;
+    Ok((
+        StatusCode::BAD_REQUEST,
+        Html(templates::admin_users_page(
+            user,
+            &users,
+            &csrf_token,
+            Some("The request is invalid."),
+        )),
+    )
+        .into_response())
 }
 
 async fn logout(session: Session) -> Redirect {

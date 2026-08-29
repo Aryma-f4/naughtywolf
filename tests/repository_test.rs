@@ -512,3 +512,205 @@ async fn admin_scoped_portal_counts_include_all_operations() {
         0
     );
 }
+
+#[tokio::test]
+async fn portal_user_listing_returns_only_safe_account_fields() {
+    let repo = test_repository().await;
+    create_user(&repo, "admin", Role::Admin).await;
+    sqlx::query("UPDATE users SET disabled = 1 WHERE id = ?")
+        .bind("admin")
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+
+    let users = repo.list_users().await.unwrap();
+
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id, "admin");
+    assert_eq!(users[0].username, "admin-user");
+    assert_eq!(users[0].role, Role::Admin);
+    assert!(users[0].disabled);
+    assert!(!users[0].created_at.is_empty());
+}
+
+#[tokio::test]
+async fn role_change_and_its_audit_event_commit_together() {
+    let repo = test_repository().await;
+    create_user(&repo, "admin", Role::Admin).await;
+    create_user(&repo, "target", Role::Operator).await;
+
+    repo.set_user_role_with_audit("target", Role::Viewer, "admin", "role-change-correlation")
+        .await
+        .unwrap();
+
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+        .bind("target")
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "viewer");
+    let event = sqlx::query_as::<_, naughtywolf::db::models::AuditEvent>(
+        "SELECT * FROM audit_events WHERE target_id = ?",
+    )
+    .bind("target")
+    .fetch_one(&repo.pool)
+    .await
+    .unwrap();
+    assert_eq!(event.action, "user.role_changed");
+    assert_eq!(event.actor_id.as_deref(), Some("admin"));
+    assert_eq!(event.target_type, "user");
+    assert_eq!(event.correlation_id, "role-change-correlation");
+}
+
+#[tokio::test]
+async fn failed_role_change_audit_rolls_back_the_role() {
+    let repo = test_repository().await;
+    create_user(&repo, "target", Role::Operator).await;
+
+    let result = repo
+        .set_user_role_with_audit("target", Role::Viewer, "missing-actor", "correlation")
+        .await;
+
+    assert!(result.is_err());
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+        .bind("target")
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "operator");
+    assert_eq!(repo.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn disabled_change_and_its_audit_event_commit_together() {
+    let repo = test_repository().await;
+    create_user(&repo, "admin", Role::Admin).await;
+    create_user(&repo, "target", Role::Viewer).await;
+
+    repo.set_user_disabled_with_audit("target", true, "admin", "disabled-correlation")
+        .await
+        .unwrap();
+
+    let disabled: bool = sqlx::query_scalar("SELECT disabled FROM users WHERE id = ?")
+        .bind("target")
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+    assert!(disabled);
+    let event = sqlx::query_as::<_, naughtywolf::db::models::AuditEvent>(
+        "SELECT * FROM audit_events WHERE target_id = ?",
+    )
+    .bind("target")
+    .fetch_one(&repo.pool)
+    .await
+    .unwrap();
+    assert_eq!(event.action, "user.disabled");
+    assert_eq!(event.actor_id.as_deref(), Some("admin"));
+    assert_eq!(event.target_type, "user");
+    assert_eq!(event.correlation_id, "disabled-correlation");
+}
+
+#[tokio::test]
+async fn failed_disabled_change_audit_rolls_back_the_account_state() {
+    let repo = test_repository().await;
+    create_user(&repo, "target", Role::Viewer).await;
+
+    let result = repo
+        .set_user_disabled_with_audit("target", true, "missing-actor", "correlation")
+        .await;
+
+    assert!(result.is_err());
+    let disabled: bool = sqlx::query_scalar("SELECT disabled FROM users WHERE id = ?")
+        .bind("target")
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+    assert!(!disabled);
+    assert_eq!(repo.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn account_mutations_reject_the_actor_as_the_target() {
+    let repo = test_repository().await;
+    create_user(&repo, "admin", Role::Admin).await;
+
+    assert!(
+        repo.set_user_role_with_audit("admin", Role::Viewer, "admin", "role-correlation")
+            .await
+            .is_err()
+    );
+    assert!(
+        repo.set_user_disabled_with_audit("admin", true, "admin", "disabled-correlation")
+            .await
+            .is_err()
+    );
+
+    let (role, disabled): (String, bool) =
+        sqlx::query_as("SELECT role, disabled FROM users WHERE id = ?")
+            .bind("admin")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert_eq!(role, "admin");
+    assert!(!disabled);
+    assert_eq!(repo.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn evidence_lookup_requires_operation_visibility() {
+    let repo = test_repository().await;
+    let operation = repo
+        .create_operation("Scoped", "Evidence lookup fixture")
+        .await
+        .unwrap();
+    let asset = repo
+        .create_asset(&operation.id, "host", "host", "lab", "127.0.0.1")
+        .await
+        .unwrap();
+    create_user(&repo, "viewer", Role::Viewer).await;
+    repo.ensure_builtin_check("lookup-test", "Lookup test", "viewer", 30, 4_096)
+        .await
+        .unwrap();
+    let run = repo
+        .create_run(
+            "lookup-test",
+            &asset.id,
+            &operation.id,
+            Some("viewer"),
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    let evidence = repo
+        .create_evidence(
+            &run.id,
+            &format!("{}/result.json", run.id),
+            "application/json",
+            0,
+            "digest",
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        repo.find_evidence_visible_to(&evidence.id, "viewer", false)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repo.find_evidence_visible_to(&evidence.id, "admin", true)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    repo.add_member(&operation.id, "viewer").await.unwrap();
+    assert_eq!(
+        repo.find_evidence_visible_to(&evidence.id, "viewer", false)
+            .await
+            .unwrap()
+            .map(|record| record.id),
+        Some(evidence.id)
+    );
+}

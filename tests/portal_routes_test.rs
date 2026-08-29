@@ -8,7 +8,8 @@ use axum::{
 };
 use naughtywolf::{
     auth::{AuthenticatedUser, middleware::AuthSession, rbac::Role},
-    db::{self, repositories::Repository},
+    db::{self, models::RunState, repositories::Repository},
+    evidence::EvidenceStore,
     portal::{DashboardSummary, dashboard_summary, public_router, templates, visible_operations},
 };
 use tower::ServiceExt;
@@ -27,6 +28,16 @@ fn csrf_token(body: &str) -> String {
         .and_then(|remainder| remainder.split('"').next())
         .unwrap()
         .to_owned()
+}
+
+async fn body_string(response: Response) -> String {
+    String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
 }
 
 async fn test_repository() -> Repository {
@@ -111,6 +122,182 @@ async fn app_with_user_and_repository(
             request
         })
         .service(app)
+}
+
+async fn app_with_user_repository_and_store(
+    repository: Repository,
+    user: AuthenticatedUser,
+    evidence_store: EvidenceStore,
+) -> impl tower::Service<Request<Body>, Response = Response, Error = std::convert::Infallible> + Clone
+{
+    let app = Router::<Repository>::new()
+        .route("/test/login", post(test_login))
+        .merge(naughtywolf::portal::authenticated_router())
+        .with_state(repository)
+        .merge(public_router())
+        .layer(Extension(evidence_store))
+        .layer(Extension(user))
+        .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false));
+    let login_response = app
+        .clone()
+        .oneshot(Request::post("/test/login").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let cookie = login_response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    tower::ServiceBuilder::new()
+        .map_request(move |mut request: Request<Body>| {
+            request
+                .headers_mut()
+                .insert("cookie", cookie.parse().unwrap());
+            request
+        })
+        .service(app)
+}
+
+struct ScopedPortalFixture {
+    repository: Repository,
+    viewer: AuthenticatedUser,
+    allowed_operation_id: String,
+    hidden_operation_id: String,
+    allowed_evidence_id: String,
+    hidden_evidence_id: String,
+}
+
+async fn scoped_portal_fixture() -> ScopedPortalFixture {
+    let repository = test_repository().await;
+    let viewer = create_user(&repository, "viewer", Role::Viewer).await;
+    let allowed = repository
+        .create_operation("Allowed operation", "Visible portal records")
+        .await
+        .unwrap();
+    let hidden = repository
+        .create_operation("Hidden operation", "Out-of-scope portal records")
+        .await
+        .unwrap();
+    let first_allowed_asset = repository
+        .create_asset(&allowed.id, "allowed-one", "host", "lab", "10.0.0.1")
+        .await
+        .unwrap();
+    repository
+        .create_asset(&allowed.id, "allowed-two", "host", "lab", "10.0.0.2")
+        .await
+        .unwrap();
+    let hidden_asset = repository
+        .create_asset(&hidden.id, "hidden", "host", "lab", "10.0.0.3")
+        .await
+        .unwrap();
+    repository
+        .add_member(&allowed.id, &viewer.id)
+        .await
+        .unwrap();
+    repository
+        .ensure_builtin_check("allowed-check", "Allowed check", "viewer", 30, 4_096)
+        .await
+        .unwrap();
+    repository
+        .ensure_builtin_check("hidden-check", "Hidden check", "viewer", 30, 4_096)
+        .await
+        .unwrap();
+    let queued_run = repository
+        .create_run(
+            "allowed-check",
+            &first_allowed_asset.id,
+            &allowed.id,
+            Some(&viewer.id),
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let succeeded_run = repository
+        .create_run(
+            "allowed-check",
+            &first_allowed_asset.id,
+            &allowed.id,
+            Some(&viewer.id),
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    repository
+        .finish_run(
+            &succeeded_run.id,
+            RunState::Succeeded,
+            Some(&serde_json::json!({"finding": "recorded"})),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let hidden_run = repository
+        .create_run(
+            "hidden-check",
+            &hidden_asset.id,
+            &hidden.id,
+            Some(&viewer.id),
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let allowed_evidence = repository
+        .create_evidence(
+            &queued_run.id,
+            &format!("{}/allowed.json", queued_run.id),
+            "application/json",
+            17,
+            "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+        )
+        .await
+        .unwrap();
+    let hidden_evidence = repository
+        .create_evidence(
+            &hidden_run.id,
+            &format!("{}/hidden.json", hidden_run.id),
+            "text/plain",
+            99,
+            "9876543210abcdef9876543210abcdef9876543210abcdef9876543210abcdef",
+        )
+        .await
+        .unwrap();
+    for (id, operation_id, action) in [
+        ("allowed-audit", &allowed.id, "allowed.reviewed"),
+        ("hidden-audit", &hidden.id, "hidden.reviewed"),
+    ] {
+        sqlx::query(
+            "INSERT INTO audit_events \
+             (id, actor_id, operation_id, action, target_type, target_id, outcome, correlation_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(&viewer.id)
+        .bind(operation_id)
+        .bind(action)
+        .bind("operation")
+        .bind(operation_id)
+        .bind("success")
+        .bind(format!("{id}-correlation"))
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+    }
+
+    ScopedPortalFixture {
+        repository,
+        viewer,
+        allowed_operation_id: allowed.id,
+        hidden_operation_id: hidden.id,
+        allowed_evidence_id: allowed_evidence.id,
+        hidden_evidence_id: hidden_evidence.id,
+    }
 }
 
 #[tokio::test]
@@ -208,6 +395,365 @@ async fn viewer_cannot_open_admin_page_even_if_they_request_its_url() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn operator_cannot_change_another_users_role() {
+    let app = app_with_logged_in_user(Role::Operator).await;
+    let response = app
+        .oneshot(post_form("/admin/users/target/role", "role=viewer"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_user_table_never_renders_password_hashes() {
+    let repository = test_repository().await;
+    let admin = create_user(&repository, "admin", Role::Admin).await;
+    sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, ?)")
+        .bind("target")
+        .bind("target-user")
+        .bind("secret-password-hash")
+        .bind("viewer")
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+    let app = app_with_user_and_repository(repository, admin).await;
+
+    let response = app
+        .oneshot(Request::get("/admin/users").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(body.contains("target-user"));
+    assert!(!body.contains("password_hash"));
+    assert!(!body.contains("secret-password-hash"));
+}
+
+#[tokio::test]
+async fn viewer_cannot_download_evidence_outside_their_operation_scope() {
+    let repository = test_repository().await;
+    let operation = repository
+        .create_operation("Hidden", "Scoped download fixture")
+        .await
+        .unwrap();
+    let asset = repository
+        .create_asset(&operation.id, "hidden-host", "host", "lab", "10.0.0.2")
+        .await
+        .unwrap();
+    repository
+        .ensure_builtin_check("download-test", "Download test", "viewer", 30, 4_096)
+        .await
+        .unwrap();
+    let run = repository
+        .create_run(
+            "download-test",
+            &asset.id,
+            &operation.id,
+            None,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO evidence (id, check_run_id, storage_path, content_type, byte_len, sha256) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("not-visible")
+    .bind(&run.id)
+    .bind(format!("{}/hidden.json", run.id))
+    .bind("application/json")
+    .bind(0_i64)
+    .bind("hidden")
+    .execute(&repository.pool)
+    .await
+    .unwrap();
+    let viewer = create_user(&repository, "viewer", Role::Viewer).await;
+    let app = app_with_user_and_repository(repository, viewer).await;
+
+    let response = app
+        .oneshot(
+            Request::get("/evidence/not-visible/download")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body, "The requested resource was not found.");
+}
+
+#[tokio::test]
+async fn admin_role_change_requires_csrf_and_writes_an_audit_event() {
+    let repository = test_repository().await;
+    let admin = create_user(&repository, "admin", Role::Admin).await;
+    create_user(&repository, "target", Role::Operator).await;
+    let app = app_with_user_and_repository(repository.clone(), admin).await;
+    let page = app
+        .clone()
+        .oneshot(Request::get("/admin/users").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let page_body = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let token = csrf_token(&page_body);
+
+    let response = app
+        .oneshot(post_form(
+            "/admin/users/target/role",
+            format!("role=viewer&csrf_token={token}"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/admin/users");
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+        .bind("target")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "viewer");
+    let action: String = sqlx::query_scalar("SELECT action FROM audit_events WHERE target_id = ?")
+        .bind("target")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(action, "user.role_changed");
+}
+
+#[tokio::test]
+async fn admin_can_disable_another_account_with_an_audit_event() {
+    let repository = test_repository().await;
+    let admin = create_user(&repository, "admin", Role::Admin).await;
+    create_user(&repository, "target", Role::Viewer).await;
+    let app = app_with_user_and_repository(repository.clone(), admin).await;
+    let page = app
+        .clone()
+        .oneshot(Request::get("/admin/users").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let token = csrf_token(
+        &String::from_utf8(
+            to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap(),
+    );
+
+    let response = app
+        .oneshot(post_form(
+            "/admin/users/target/disabled",
+            format!("disabled=true&csrf_token={token}"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let disabled: bool = sqlx::query_scalar("SELECT disabled FROM users WHERE id = ?")
+        .bind("target")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert!(disabled);
+    let action: String = sqlx::query_scalar("SELECT action FROM audit_events WHERE target_id = ?")
+        .bind("target")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(action, "user.disabled");
+}
+
+#[tokio::test]
+async fn admin_cannot_change_their_own_role() {
+    let repository = test_repository().await;
+    let admin = create_user(&repository, "admin", Role::Admin).await;
+    create_user(&repository, "target", Role::Viewer).await;
+    let app = app_with_user_and_repository(repository.clone(), admin).await;
+    let page = app
+        .clone()
+        .oneshot(Request::get("/admin/users").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let token = csrf_token(
+        &String::from_utf8(
+            to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap(),
+    );
+
+    let response = app
+        .oneshot(post_form(
+            "/admin/users/admin/role",
+            format!("role=viewer&csrf_token={token}"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+        .bind("admin")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "admin");
+    assert_eq!(repository.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn admin_cannot_disable_their_own_account() {
+    let repository = test_repository().await;
+    let admin = create_user(&repository, "admin", Role::Admin).await;
+    create_user(&repository, "target", Role::Viewer).await;
+    let app = app_with_user_and_repository(repository.clone(), admin).await;
+    let page = app
+        .clone()
+        .oneshot(Request::get("/admin/users").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let token = csrf_token(
+        &String::from_utf8(
+            to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap(),
+    );
+
+    let response = app
+        .oneshot(post_form(
+            "/admin/users/admin/disabled",
+            format!("disabled=true&csrf_token={token}"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let disabled: bool = sqlx::query_scalar("SELECT disabled FROM users WHERE id = ?")
+        .bind("admin")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert!(!disabled);
+    assert_eq!(repository.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn admin_role_change_rejects_unknown_roles() {
+    let repository = test_repository().await;
+    let admin = create_user(&repository, "admin", Role::Admin).await;
+    create_user(&repository, "target", Role::Operator).await;
+    let app = app_with_user_and_repository(repository.clone(), admin).await;
+    let page = app
+        .clone()
+        .oneshot(Request::get("/admin/users").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let token = csrf_token(
+        &String::from_utf8(
+            to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap(),
+    );
+
+    let response = app
+        .oneshot(post_form(
+            "/admin/users/target/role",
+            format!("role=owner&csrf_token={token}"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+        .bind("target")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "operator");
+    assert_eq!(repository.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn admin_account_mutation_rejects_a_missing_csrf_token() {
+    let repository = test_repository().await;
+    let admin = create_user(&repository, "admin", Role::Admin).await;
+    create_user(&repository, "target", Role::Operator).await;
+    let app = app_with_user_and_repository(repository.clone(), admin).await;
+
+    let response = app
+        .oneshot(post_form("/admin/users/target/role", "role=viewer"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+        .bind("target")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "operator");
+    assert_eq!(repository.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn admin_csrf_mismatch_rerenders_with_a_replacement_token() {
+    let repository = test_repository().await;
+    let admin = create_user(&repository, "admin", Role::Admin).await;
+    create_user(&repository, "target", Role::Operator).await;
+    let app = app_with_user_and_repository(repository.clone(), admin).await;
+    let page = app
+        .clone()
+        .oneshot(Request::get("/admin/users").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let initial_token = csrf_token(&body_string(page).await);
+
+    let response = app
+        .oneshot(post_form(
+            "/admin/users/target/role",
+            format!("role=viewer&csrf_token={initial_token}-mismatch"),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(response).await;
+    assert!(body.contains("The request is invalid."));
+    assert!(body.contains("role=\"alert\""));
+    assert_ne!(csrf_token(&body), initial_token);
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+        .bind("target")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "operator");
+    assert_eq!(repository.count_audit_events().await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -642,4 +1188,214 @@ async fn asset_form_rejects_each_value_longer_than_160_characters() {
         );
         assert_eq!(repository.count_audit_events().await.unwrap(), 0);
     }
+}
+
+#[tokio::test]
+async fn check_history_renders_only_scoped_runs() {
+    let fixture = scoped_portal_fixture().await;
+    let app = app_with_user_and_repository(fixture.repository, fixture.viewer).await;
+
+    let response = app
+        .oneshot(Request::get("/checks").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    assert!(body.contains("allowed-check"));
+    assert!(body.contains(&fixture.allowed_operation_id));
+    assert!(!body.contains("hidden-check"));
+    assert!(!body.contains(&fixture.hidden_operation_id));
+}
+
+#[tokio::test]
+async fn audit_history_renders_only_scoped_events() {
+    let fixture = scoped_portal_fixture().await;
+    let app = app_with_user_and_repository(fixture.repository, fixture.viewer).await;
+
+    let response = app
+        .oneshot(Request::get("/audit").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    assert!(body.contains("allowed.reviewed"));
+    assert!(!body.contains("hidden.reviewed"));
+}
+
+#[tokio::test]
+async fn evidence_page_renders_safe_scoped_metadata_without_paths() {
+    let fixture = scoped_portal_fixture().await;
+    let app = app_with_user_and_repository(fixture.repository, fixture.viewer).await;
+
+    let response = app
+        .oneshot(Request::get("/evidence").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    assert!(body.contains(&fixture.allowed_evidence_id));
+    assert!(body.contains("application/json"));
+    assert!(body.contains("17 bytes"));
+    assert!(body.contains("abcdef123456"));
+    assert!(!body.contains("allowed.json"));
+    assert!(!body.contains("abcdef1234567890abcdef1234567890"));
+    assert!(!body.contains(&fixture.hidden_evidence_id));
+    assert!(!body.contains("hidden.json"));
+}
+
+#[tokio::test]
+async fn reports_page_counts_only_persisted_scoped_records() {
+    let fixture = scoped_portal_fixture().await;
+    let app = app_with_user_and_repository(fixture.repository, fixture.viewer).await;
+
+    let response = app
+        .oneshot(Request::get("/reports").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    assert!(body.contains("Allowed operation"));
+    assert!(body.contains("Assets</dt><dd>2"));
+    assert!(body.contains("Queued</dt><dd>1"));
+    assert!(body.contains("Succeeded</dt><dd>1"));
+    assert!(body.contains("Audit records</dt><dd>1"));
+    assert!(!body.contains("Hidden operation"));
+}
+
+#[tokio::test]
+async fn scoped_evidence_download_returns_verified_bytes_as_an_attachment() {
+    let repository = test_repository().await;
+    let viewer = create_user(&repository, "viewer", Role::Viewer).await;
+    let operation = repository
+        .create_operation("Download", "Verified download fixture")
+        .await
+        .unwrap();
+    let asset = repository
+        .create_asset(&operation.id, "host", "host", "lab", "127.0.0.1")
+        .await
+        .unwrap();
+    repository
+        .add_member(&operation.id, &viewer.id)
+        .await
+        .unwrap();
+    repository
+        .ensure_builtin_check(
+            "verified-download",
+            "Verified download",
+            "viewer",
+            30,
+            4_096,
+        )
+        .await
+        .unwrap();
+    let run = repository
+        .create_run(
+            "verified-download",
+            &asset.id,
+            &operation.id,
+            Some(&viewer.id),
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let directory = tempfile::TempDir::new().unwrap();
+    let store = EvidenceStore::new(repository.clone(), directory.path());
+    let evidence = store
+        .write(&run.id, br#"{"safe":true}"#, "application/json")
+        .await
+        .unwrap();
+    let app = app_with_user_repository_and_store(repository, viewer, store).await;
+
+    let response = app
+        .oneshot(
+            Request::get(format!("/evidence/{}/download", evidence.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    assert_eq!(
+        response.headers().get("content-disposition").unwrap(),
+        "attachment; filename=\"evidence\""
+    );
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        br#"{"safe":true}"#.as_slice()
+    );
+}
+
+#[tokio::test]
+async fn evidence_download_rejects_a_file_changed_after_storage() {
+    let repository = test_repository().await;
+    let viewer = create_user(&repository, "viewer", Role::Viewer).await;
+    let operation = repository
+        .create_operation("Download", "Checksum fixture")
+        .await
+        .unwrap();
+    let asset = repository
+        .create_asset(&operation.id, "host", "host", "lab", "127.0.0.1")
+        .await
+        .unwrap();
+    repository
+        .add_member(&operation.id, &viewer.id)
+        .await
+        .unwrap();
+    repository
+        .ensure_builtin_check(
+            "checksum-download",
+            "Checksum download",
+            "viewer",
+            30,
+            4_096,
+        )
+        .await
+        .unwrap();
+    let run = repository
+        .create_run(
+            "checksum-download",
+            &asset.id,
+            &operation.id,
+            Some(&viewer.id),
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let directory = tempfile::TempDir::new().unwrap();
+    let store = EvidenceStore::new(repository.clone(), directory.path());
+    let evidence = store
+        .write(&run.id, br#"{"safe":true}"#, "application/json")
+        .await
+        .unwrap();
+    tokio::fs::write(
+        directory.path().join(&evidence.storage_path),
+        br#"{"evil":true}"#,
+    )
+    .await
+    .unwrap();
+    let app = app_with_user_repository_and_store(repository, viewer, store).await;
+
+    let response = app
+        .oneshot(
+            Request::get(format!("/evidence/{}/download", evidence.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        "The request is invalid."
+    );
 }

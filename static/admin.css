@@ -46,6 +46,7 @@ h1 { line-height: 1.15; }
 .button,
 button,
 input,
+select,
 .dock-link {
   min-height: 44px;
 }
@@ -100,7 +101,8 @@ button {
 
 label { font-weight: 700; }
 
-input {
+input,
+select {
   width: 100%;
   padding: 0.5rem 0.75rem;
   border: 1px solid var(--border);
@@ -194,6 +196,56 @@ input {
 .record-list { display: grid; gap: 0.75rem; margin: 0; padding: 0; list-style: none; }
 .muted { color: var(--muted); }
 
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+caption {
+  padding: 1rem;
+  color: var(--muted);
+  font-weight: 700;
+  text-align: left;
+}
+
+th,
+td {
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+th { white-space: nowrap; }
+code { overflow-wrap: anywhere; }
+
+.account-controls,
+.account-controls form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.5rem;
+}
+
+.account-controls label { width: 100%; }
+.account-controls select { width: auto; min-width: 8rem; }
+.secondary-button { color: var(--accent); background: var(--panel); }
+
+.report-list { display: grid; gap: 1rem; }
+.report-card { padding: 1rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); }
+.report-card h2 { margin-top: 0; }
+.report-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: 0.75rem; margin-bottom: 0; }
+.report-counts div { padding: 0.75rem; border: 1px solid var(--border); border-radius: 0.5rem; }
+.report-counts dt { color: var(--muted); font-weight: 700; }
+.report-counts dd { margin: 0; font-size: 1.5rem; font-weight: 800; }
+
 :focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 3px;
@@ -211,4 +263,13 @@ input {
 @media (max-width: 599px) {
   .portal-dock { overflow-x: auto; }
   .dock-label { font-size: .72rem; }
+}
+
+@media print {
+  body { background: #fff; }
+  .portal-header,
+  .portal-dock,
+  .print-note { display: none; }
+  .portal-main { width: 100%; padding: 0; }
+  .report-card { break-inside: avoid; box-shadow: none; }
 }
