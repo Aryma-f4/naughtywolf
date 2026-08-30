@@ -48,6 +48,50 @@ Open [http://127.0.0.1:8080/login](http://127.0.0.1:8080/login) and sign in with
 
 This HTTP configuration is for local development only. Production deployments require an HTTPS origin and `NAUGHTYWOLF_COOKIE_SECURE=true`. Use a unique random session secret of at least 32 bytes and protect the database and evidence directory with operating-system access controls.
 
+## C2 quickstart
+
+The legacy `naughtywolf` package above is a local security-lab records portal. The C2 workspace is separate: `nw-server`, `nw-console`, and `nw-implant` live under `crates/`. Use it only in an authorized lab against systems you own or are explicitly permitted to test.
+
+Build the C2 binaries:
+
+```bash
+cargo build -p nw-server -p nw-console -p nw-implant
+```
+
+Start a native server-only listener with a matching bind address and PSK. `ServerConfig` loads and exposes `NW_CALLBACK_HOST` to retain the continuation plan's single environment surface. In M1 it is a reserved, inert value: the server does not consume, advertise, log, or distribute it. Set each implant's `NW_ENDPOINT` explicitly (as below), or use `redirect <host>` for an existing implant.
+
+```bash
+NW_BIND=127.0.0.1:8081 \
+NW_CALLBACK_HOST=http://127.0.0.1:8081 \
+NW_PSK='replace-with-a-lab-psk' \
+cargo run -p nw-server
+```
+
+For an interactive native listener, run the console instead (it hosts the listener and operator REPL):
+
+```bash
+NW_BIND=127.0.0.1:8081 NW_PSK='replace-with-a-lab-psk' cargo run -p nw-console
+```
+
+In another terminal, run an implant with the same PSK and the callback endpoint:
+
+```bash
+NW_ENDPOINT=http://127.0.0.1:8081 \
+NW_PSK='replace-with-a-lab-psk' \
+cargo run -p nw-implant
+```
+
+At the console, use `sessions`, then `interact <session-id>`. Use `shell <cmd> [args...]` for an authorized test command, or `redirect <host>` to queue `nw/sethost` and change the focused implant's endpoint.
+
+For the server container, copy the local template and replace the development PSK. The container always listens on `0.0.0.0:8081`; set `NW_HOST_PORT` in `.env.c2` to choose its host-side port. In M1, `NW_CALLBACK_HOST` is reserved and inert: the server does not consume, advertise, log, or distribute it. Then use the exact Compose commands below:
+
+```bash
+cp .env.example.c2 .env.c2
+# edit .env.c2 for your authorized lab
+docker compose --env-file .env.c2 -f docker-compose.c2.yml up --build
+docker compose --env-file .env.c2 -f docker-compose.c2.yml down
+```
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -87,7 +131,7 @@ All non-Admin reads are limited to operations where the current user is a member
 
 ```bash
 cargo fmt --check
-cargo test
+cargo test --workspace
 ```
 
 ## License

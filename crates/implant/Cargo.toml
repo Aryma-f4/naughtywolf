@@ -1,0 +1,23 @@
+[package]
+name = "nw-implant"
+version.workspace = true
+edition.workspace = true
+description = "NaughtyWolf C2 implant beacon"
+
+[dependencies]
+nw-profile = { path = "../profile" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+rand.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+nw-server = { path = "../server" }
+tempfile = "3"
+axum.workspace = true

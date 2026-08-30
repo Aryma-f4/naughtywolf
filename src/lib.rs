@@ -1,11 +1,13 @@
 pub mod audit;
 pub mod auth;
+pub mod c2;
 pub mod checks;
 pub mod cli;
 pub mod config;
 pub mod db;
 pub mod error;
 pub mod evidence;
+pub mod payload;
 pub mod policy;
 pub mod portal;
 

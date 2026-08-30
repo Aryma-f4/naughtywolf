@@ -113,3 +113,52 @@ pub struct AuditEvent {
     pub correlation_id: String,
     pub created_at: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+pub enum CallbackStatus {
+    Active,
+    Beacon,
+    Dormant,
+    Lost,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct Callback {
+    pub id: String,
+    pub asset_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub host: String,
+    pub user_name: String,
+    pub process: String,
+    pub arch: String,
+    pub os: String,
+    pub protocol: String,
+    pub status: CallbackStatus,
+    pub last_seen: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct EventRule {
+    pub id: String,
+    pub name: String,
+    pub trigger: String,
+    pub command: String,
+    pub target: String,
+    pub enabled: bool,
+    pub requested_by: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct InstalledService {
+    pub id: String,
+    pub asset_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub name: String,
+    pub install_path: String,
+    pub running: bool,
+    pub started_at: Option<String>,
+    pub created_at: String,
+}

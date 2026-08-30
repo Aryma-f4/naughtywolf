@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     Form, Router,
     extract::State,
@@ -8,6 +10,7 @@ use axum::{
 use clap::Parser;
 use naughtywolf::{
     auth::{authenticate, middleware::AuthSession},
+    c2,
     cli::{Cli, Commands},
     config::Config,
     db::{self, repositories::Repository},
@@ -62,6 +65,7 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
     let app = Router::<Repository>::new()
         .route("/login", post(login_handler))
         .merge(portal::authenticated_router())
+        .merge(c2::router(Arc::new(config.c2_psk)))
         .with_state(repository)
         .merge(public_router())
         .layer(axum::Extension(evidence_store))
@@ -99,7 +103,7 @@ async fn login_handler(
 
     match authenticate(&repository, &form.username, &form.password).await {
         Ok(Some(user)) => match (AuthSession { session }).login(&user).await {
-            Ok(()) => Redirect::to("/").into_response(),
+            Ok(()) => Redirect::to("/dashboard").into_response(),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         },
         Ok(None) => login_failure_response(&session, StatusCode::UNAUTHORIZED).await,

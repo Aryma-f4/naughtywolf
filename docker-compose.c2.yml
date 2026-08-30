@@ -1,0 +1,11 @@
+services:
+  c2:
+    build:
+      context: .
+      dockerfile: Dockerfile.c2
+    ports:
+      - "${NW_HOST_PORT:-8081}:8081"
+    environment:
+      NW_BIND: 0.0.0.0:8081
+      NW_CALLBACK_HOST: ${NW_CALLBACK_HOST:-http://127.0.0.1:8081}
+      NW_PSK: ${NW_PSK:-dev-psk-change-me}

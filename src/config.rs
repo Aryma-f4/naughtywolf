@@ -9,6 +9,7 @@ pub struct Config {
     pub evidence_dir: PathBuf,
     pub session_secret: String,
     pub cookie_secure: bool,
+    pub c2_psk: Vec<u8>,
 }
 
 impl Config {
@@ -37,6 +38,9 @@ impl Config {
                     return Err(ConfigError::InvalidBoolean("NAUGHTYWOLF_COOKIE_SECURE"));
                 }
             },
+            c2_psk: env::var("NAUGHTYWOLF_C2_PSK")
+                .unwrap_or_else(|_| "dev-psk-change-me".into())
+                .into_bytes(),
         })
     }
 
@@ -48,6 +52,7 @@ impl Config {
             evidence_dir: PathBuf::from("evidence"),
             session_secret: "test-session-secret-not-for-production".to_string(),
             cookie_secure: false,
+            c2_psk: b"dev-psk-change-me".to_vec(),
         }
     }
 

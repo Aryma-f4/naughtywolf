@@ -1,0 +1,17 @@
+[package]
+name = "nw-console"
+version.workspace = true
+edition.workspace = true
+description = "NaughtyWolf C2 operator console"
+
+[dependencies]
+nw-profile = { path = "../profile" }
+nw-server = { path = "../server" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true

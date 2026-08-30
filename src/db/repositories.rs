@@ -6,7 +6,8 @@ use crate::{
     audit::AuditEntry,
     auth::rbac::Role,
     db::models::{
-        Asset, AssetStatus, AuditEvent, CheckRun, Evidence, Operation, OperationStatus, RunState,
+        Asset, AssetStatus, AuditEvent, Callback, CheckRun, EventRule, Evidence, InstalledService,
+        Operation, OperationStatus, RunState,
     },
     error::AppError,
 };
@@ -533,6 +534,272 @@ impl Repository {
             .fetch_optional(&self.pool)
             .await
             .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_callbacks_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<Callback>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, Callback>("SELECT * FROM callbacks ORDER BY last_seen DESC, id")
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            sqlx::query_as::<_, Callback>(
+                "SELECT callbacks.* FROM callbacks \
+                 JOIN operation_members ON operation_members.operation_id = callbacks.operation_id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY callbacks.last_seen DESC, callbacks.id",
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    /// Record or refresh a beacon identified by its assigned session id.
+    pub async fn upsert_callback(
+        &self,
+        session_id: &str,
+        hostname: &str,
+        username: &str,
+        os: &str,
+        arch: &str,
+        pid: u32,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT INTO callbacks (id, host, user_name, os, arch, process, status, last_seen) \
+             VALUES (?, ?, ?, ?, ?, ?, 'active', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+             ON CONFLICT(id) DO UPDATE SET \
+             host = excluded.host, user_name = excluded.user_name, os = excluded.os, \
+             arch = excluded.arch, process = excluded.process, status = 'active', \
+             last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        )
+        .bind(session_id)
+        .bind(hostname)
+        .bind(username)
+        .bind(os)
+        .bind(arch)
+        .bind(pid.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        Ok(())
+    }
+
+    /// Refresh a callback's last-seen timestamp on each beacon poll.
+    pub async fn touch_callback(&self, session_id: &str) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE callbacks SET last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), status = 'active' \
+             WHERE id = ?",
+        )
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        Ok(())
+    }
+
+    pub async fn list_event_rules(&self) -> Result<Vec<EventRule>, AppError> {
+        sqlx::query_as::<_, EventRule>("SELECT * FROM event_rules ORDER BY created_at DESC, id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn create_event_rule(
+        &self,
+        name: &str,
+        trigger: &str,
+        command: &str,
+        target: &str,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<EventRule, AppError> {
+        let id = Uuid::new_v4().to_string();
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO event_rules (id, name, trigger, command, target, requested_by) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(trigger)
+        .bind(command)
+        .bind(target)
+        .bind(actor_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "event_rule.created",
+            "event_rule",
+            &id,
+            "success",
+            correlation_id,
+        );
+        insert_audit(&mut transaction, &entry).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| AppError::Internal)?;
+
+        sqlx::query_as::<_, EventRule>("SELECT * FROM event_rules WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_services_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<InstalledService>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, InstalledService>(
+                "SELECT * FROM installed_services ORDER BY created_at DESC, id",
+            )
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, InstalledService>(
+                "SELECT installed_services.* FROM installed_services \
+                 JOIN operation_members ON operation_members.operation_id = installed_services.operation_id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY installed_services.created_at DESC, installed_services.id",
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn update_operation(
+        &self,
+        operation_id: &str,
+        name: &str,
+        purpose: &str,
+        scope_note: &str,
+        status: OperationStatus,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<Operation, AppError> {
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "UPDATE operations SET name = ?, purpose = ?, scope_note = ?, status = ?, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        )
+        .bind(name)
+        .bind(purpose)
+        .bind(scope_note)
+        .bind(status)
+        .bind(operation_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "operation.updated",
+            "operation",
+            operation_id,
+            "success",
+            correlation_id,
+        )
+        .for_operation(operation_id);
+        insert_audit(&mut transaction, &entry).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| AppError::Internal)?;
+
+        self.find_operation(operation_id)
+            .await?
+            .ok_or(AppError::NotFound)
+    }
+
+    pub async fn search_portal(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        query: &str,
+    ) -> Result<(Vec<Operation>, Vec<Asset>, Vec<Callback>), AppError> {
+        let pattern = format!("%{}%", query);
+        let operations = if is_admin {
+            sqlx::query_as::<_, Operation>(
+                "SELECT * FROM operations WHERE name LIKE ? OR purpose LIKE ? \
+                 ORDER BY updated_at DESC, id",
+            )
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, Operation>(
+                "SELECT operations.* FROM operations \
+                 JOIN operation_members ON operation_members.operation_id = operations.id \
+                 WHERE operation_members.user_id = ? AND (operations.name LIKE ? OR operations.purpose LIKE ?) \
+                 ORDER BY operations.updated_at DESC, operations.id",
+            )
+            .bind(user_id)
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|_| AppError::Internal)?;
+
+        let assets = if is_admin {
+            sqlx::query_as::<_, Asset>(
+                "SELECT * FROM assets WHERE name LIKE ? OR owner LIKE ? ORDER BY updated_at DESC, id",
+            )
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, Asset>(
+                "SELECT assets.* FROM assets \
+                 JOIN operation_members ON operation_members.operation_id = assets.operation_id \
+                 WHERE operation_members.user_id = ? AND (assets.name LIKE ? OR assets.owner LIKE ?) \
+                 ORDER BY assets.updated_at DESC, assets.id",
+            )
+            .bind(user_id)
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|_| AppError::Internal)?;
+
+        let callbacks = if is_admin {
+            sqlx::query_as::<_, Callback>(
+                "SELECT * FROM callbacks WHERE host LIKE ? ORDER BY last_seen DESC, id",
+            )
+            .bind(&pattern)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, Callback>(
+                "SELECT callbacks.* FROM callbacks \
+                 JOIN operation_members ON operation_members.operation_id = callbacks.operation_id \
+                 WHERE operation_members.user_id = ? AND callbacks.host LIKE ? \
+                 ORDER BY callbacks.last_seen DESC, callbacks.id",
+            )
+            .bind(user_id)
+            .bind(&pattern)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|_| AppError::Internal)?;
+
+        Ok((operations, assets, callbacks))
     }
 
     pub async fn is_operation_member(
