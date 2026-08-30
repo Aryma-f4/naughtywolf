@@ -205,6 +205,24 @@ impl Dispatcher {
                     Err(e) => Outcome::Error(e.to_string()),
                 }
             }
+            "hashes" => {
+                let Some(sid) = interacted else {
+                    return Outcome::Error("must 'interact' a session first".into());
+                };
+                if self.registry.get(&sid).is_none() {
+                    return Outcome::Error(format!("no session {}", sid));
+                }
+                if args.len() != 1 {
+                    return Outcome::Error("usage: hashes <path>".into());
+                }
+                match self.queue.push(&sid, "nw/hashes".into(), args, 30_000) {
+                    Ok(task_id) => Outcome::TaskQueued {
+                        session: sid,
+                        task_id,
+                    },
+                    Err(e) => Outcome::Error(e.to_string()),
+                }
+            }
             "jobs" => {
                 let Some(sid) = interacted else {
                     return Outcome::Error("must 'interact' a session first".into());

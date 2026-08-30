@@ -9,6 +9,7 @@ CREATE TABLE callbacks (
     os TEXT NOT NULL DEFAULT '',
     protocol TEXT NOT NULL DEFAULT 'http',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'beacon', 'dormant', 'lost')),
+    session_key TEXT NOT NULL DEFAULT '',
     last_seen TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );

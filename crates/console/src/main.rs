@@ -110,6 +110,7 @@ fn print_help() {
          \x20 shell <cmd> [args...]     run a command on the focused session\n\
          \x20 download <path>           stream a remote file to the downloads dir\n\
          \x20 upload <local> <dest>     push a local file to the focused session\n\
+         \x20 hashes <path>              compute SHA-256 of a file on the focused session\n\
          \x20 socks <port>              start a SOCKS5 proxy on the focused session\n\
          \x20 jobs                     list task statuses for the focused session\n\
          \x20 redirect <host>            change the focused session callback host\n\

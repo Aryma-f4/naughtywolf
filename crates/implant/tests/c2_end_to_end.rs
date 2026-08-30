@@ -312,6 +312,73 @@ async fn socks5_proxy_relays_traffic_through_the_implant() {
 }
 
 #[tokio::test]
+async fn hashes_returns_sha256_of_a_remote_file() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+    let psk: Vec<u8> = b"hashes-e2e-psk".to_vec();
+    let c2_port = free_port();
+    let endpoint = format!("http://127.0.0.1:{}", c2_port);
+
+    let registry = Arc::new(SessionRegistry::new());
+    let queue = Arc::new(TaskQueue::new());
+    let state = ServerState {
+        registry: registry.clone(),
+        queue: queue.clone(),
+        psk: Arc::new(psk.clone()),
+        files: nw_server::filestore::FileStore::default(),
+        uploads: nw_server::uploadstore::UploadStore::default(),
+    };
+    let bind = format!("127.0.0.1:{}", c2_port);
+    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let profile = Profile {
+        endpoint: endpoint.clone(),
+        interval: Duration::from_millis(50),
+        jitter: Duration::ZERO,
+        hostname: "hashlab".into(),
+        username: "tester".into(),
+        os: "test-os".into(),
+        arch: "test-arch".into(),
+        pid: 555,
+        addr: "127.0.0.1".into(),
+    };
+    let runtime = Arc::new(BeaconRuntime::new(profile, psk.clone()));
+    let implanted = runtime.clone();
+    let beacon = tokio::spawn(async move { implanted.run().await });
+
+    wait_for_session(&registry).await;
+    let sid = registry.list()[0].id;
+
+    // A file on the "implant" (same process in this e2e) with known bytes.
+    let data = b"hello from naughtywolf hashes test\n";
+    let dir = std::env::temp_dir().join(format!("nw-hashes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join("target.bin");
+    std::fs::write(&path, data).unwrap();
+
+    let task_id = queue
+        .push(&sid, "nw/hashes".into(), vec![path.to_str().unwrap().into()], 30_000)
+        .expect("queued hashes");
+    let result = wait_for_result(&queue, &sid, &task_id).await;
+    assert!(result.ok, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    let expect_hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.starts_with(&expect_hex), "stdout was: {stdout}");
+
+    runtime.trigger_stop();
+    let _ = beacon.await;
+    server_handle.abort();
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn redirect_delivers_its_result_to_the_second_listener() {
     let psk: Vec<u8> = b"redirect-e2e-psk".to_vec();
     let first_port = free_port();

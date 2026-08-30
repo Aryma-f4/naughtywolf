@@ -24,10 +24,18 @@ struct Job {
 /// ponytail: synchronous fs behind one Mutex is fine for the low per-beacon
 /// write volume of a C2; switch to async/batched I/O only if a session ever
 /// streams many large files at once.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FileStore {
     inner: Arc<Mutex<HashMap<Key, Job>>>,
     dir: Arc<PathBuf>,
+}
+
+// Default to the system temp dir so any default-backed store writes off-tree
+// (a test/embedder that omits a dir never litters the working copy).
+impl Default for FileStore {
+    fn default() -> Self {
+        FileStore::new(std::env::temp_dir())
+    }
 }
 
 impl FileStore {
