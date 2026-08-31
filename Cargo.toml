@@ -31,6 +31,13 @@ clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 serde_urlencoded = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono", "json"] }
+argon2 = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+rpassword = "7"
+tempfile = "3"
 
 [package]
 name = "naughtywolf"
@@ -43,7 +50,7 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono", "json"] }
+sqlx.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -51,8 +58,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-bunyan-formatter = "0.3"
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-argon2 = "0.5"
+chrono.workspace = true
+argon2.workspace = true
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 moka = { version = "0.12", features = ["sync"] }
@@ -60,7 +67,7 @@ tower-sessions = { version = "0.14", features = ["memory-store", "signed"] }
 tower-sessions-sqlx-store = { version = "0.15", features = ["sqlite"] }
 time = "0.3"
 cookie = { version = "0.18", features = ["key-expansion"] }
-rpassword = "7"
+rpassword.workspace = true
 async-trait = "0.1"
 dirs = "5"
 anyhow = "1"
@@ -72,7 +79,7 @@ base64 = { version = "0.22", features = ["std"] }
 nw-profile = { path = "crates/profile" }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 
 [lib]
 name = "naughtywolf"

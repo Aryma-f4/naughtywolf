@@ -1,10 +1,4 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use nw_server::{
-    ServerConfig, ServerState, filestore::FileStore, queue::TaskQueue, server,
-    session::SessionRegistry, uploadstore::UploadStore,
-};
+use nw_server::{ServerConfig, ServerState, server};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -13,22 +7,11 @@ fn main() -> anyhow::Result<()> {
 
     let config = ServerConfig::from_env();
 
-    let psk = config.psk.clone().into_bytes();
     let bind = config.bind.clone();
     let tcp_bind = config.tcp_bind.clone();
     let dns_bind = config.dns_bind.clone();
-    let downloads = PathBuf::from(&config.downloads_dir);
-    let registry = Arc::new(SessionRegistry::new());
-    let queue = Arc::new(TaskQueue::new());
-    let state = ServerState {
-        registry,
-        queue,
-        psk: Arc::new(psk),
-        files: FileStore::new(downloads),
-        uploads: UploadStore::default(),
-    };
-
     let rt = tokio::runtime::Runtime::new()?;
+    let state = rt.block_on(server::build_state(&config))?;
     rt.block_on(run(state, bind, tcp_bind, dns_bind))?;
     Ok(())
 }

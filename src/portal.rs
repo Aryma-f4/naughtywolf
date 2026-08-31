@@ -1,6 +1,6 @@
 use axum::{
     Extension, Form, Router,
-    extract::{FromRequest, Path, Request, State},
+    extract::{FromRequest, Path, Query, Request, State},
     http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -17,7 +17,7 @@ use crate::{
         rbac::Role,
     },
     db::{
-        models::{Asset, AuditEvent, CheckRun, Operation, RunState},
+        models::{Asset, AuditEvent, CheckRun, Operation, OperationStatus, RunState},
         repositories::Repository,
     },
     evidence::EvidenceStore,
@@ -84,6 +84,7 @@ pub fn public_router() -> Router {
         )
         .route("/static/admin.css", get(stylesheet))
         .route("/static/admin.js", get(script))
+        .route("/static/anime.min.js", get(anime_script))
 }
 
 /// Routes that always resolve the current local identity before rendering.
@@ -102,6 +103,18 @@ pub fn authenticated_router() -> Router<Repository> {
         .route("/evidence", get(evidence))
         .route("/evidence/{evidence_id}/download", get(download_evidence))
         .route("/reports", get(reports))
+        .route("/payloads", get(payloads))
+        .route("/payloads/generate", post(generate_payload))
+        .route("/payloads/edit/{file}", get(edit_payload))
+        .route("/payloads/download/{file}", get(download_payload))
+        .route("/callbacks", get(callbacks))
+        .route("/eventing", get(eventing).post(create_event_rule))
+        .route("/services", get(services))
+        .route("/search", get(search))
+        .route(
+            "/operations/{operation_id}",
+            get(operation_detail).post(update_operation),
+        )
         .route("/admin", get(admin))
         .route("/admin/users", get(admin_users))
         .route("/admin/users/{user_id}/role", post(set_user_role))
@@ -132,6 +145,42 @@ struct OperationForm {
     #[serde(default)]
     purpose: String,
     csrf_token: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct PayloadForm {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    lhost: String,
+    #[serde(default)]
+    lport: u16,
+    #[serde(default)]
+    psk: String,
+    #[serde(default = "default_protocol")]
+    protocol: String,
+    #[serde(default = "default_interval")]
+    interval_ms: u64,
+    #[serde(default = "default_jitter")]
+    jitter_ms: u64,
+    #[serde(default)]
+    os: String,
+    #[serde(default)]
+    arch: String,
+    /// Rust target triple; empty = host build.
+    #[serde(default)]
+    target: String,
+    csrf_token: Option<String>,
+}
+
+fn default_protocol() -> String {
+    "http".into()
+}
+const fn default_interval() -> u64 {
+    1000
+}
+const fn default_jitter() -> u64 {
+    200
 }
 
 #[derive(Default, Deserialize)]
@@ -398,6 +447,354 @@ async fn reports(
     Ok(Html(templates::reports_page(&user, &summaries)))
 }
 
+async fn payloads(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    session: Session,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Operator)?;
+    let csrf_token = issue_csrf_token(&session).await?;
+    let builds = crate::payload::list().unwrap_or_default();
+    let building = crate::payload::building_jobs();
+    let errors = crate::payload::recent_errors();
+    Ok(Html(templates::payloads_page(
+        &user, &builds, &csrf_token, None, None, &building, &errors,
+    )))
+}
+
+async fn generate_payload(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let form = match Form::<PayloadForm>::from_request(request, &user).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            let csrf_token = issue_csrf_token(&session).await?;
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Html(templates::payloads_page(
+                    &user,
+                    &crate::payload::list().unwrap_or_default(),
+                    &csrf_token,
+                    Some("The request is invalid."),
+                    None,
+                    &crate::payload::building_jobs(),
+                    &crate::payload::recent_errors(),
+                )),
+            )
+                .into_response());
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || form.lhost.trim().is_empty()
+        || form.name.trim().is_empty()
+        || form.lport == 0
+    {
+        let csrf_token = issue_csrf_token(&session).await?;
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Html(templates::payloads_page(
+                &user,
+                &crate::payload::list().unwrap_or_default(),
+                &csrf_token,
+                Some("Provide a name, callback host, and port."),
+                None,
+                &crate::payload::building_jobs(),
+                &crate::payload::recent_errors(),
+            )),
+        )
+            .into_response());
+    }
+
+    let req = crate::payload::BuildRequest {
+        name: form.name,
+        lhost: form.lhost,
+        lport: form.lport,
+        psk: form.psk,
+        protocol: form.protocol,
+        os: form.os,
+        arch: form.arch,
+        interval_ms: form.interval_ms,
+        jitter_ms: form.jitter_ms,
+        target: form.target,
+    };
+    tokio::spawn(async move {
+        let file = crate::payload::predict_file(&req);
+        match crate::payload::build(&req).await {
+            Ok(meta) => tracing::info!(payload = %meta.file, size = meta.size, "implant built"),
+            Err(e) => {
+                crate::payload::record_build_error(&file, &e.to_string());
+                tracing::error!(error = %e, "implant build failed");
+            }
+        }
+    });
+    Ok(Redirect::to("/payloads").into_response())
+}
+
+async fn edit_payload(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    session: Session,
+    Path(file): Path<String>,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Operator)?;
+    let csrf_token = issue_csrf_token(&session).await?;
+    let builds = crate::payload::list().unwrap_or_default();
+    let editor = builds.iter().find(|b| b.file == file).cloned();
+    let building = crate::payload::building_jobs();
+    let errors = crate::payload::recent_errors();
+    Ok(Html(templates::payloads_page(
+        &user, &builds, &csrf_token, None, editor.as_ref(), &building, &errors,
+    )))
+}
+
+async fn download_payload(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    Path(file): Path<String>,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let Some(path) = crate::payload::download_path(&file) else {
+        return Err(AppError::NotFound);
+    };
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|_| AppError::NotFound)?;
+    let filename = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Ok(axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(data))
+        .unwrap())
+}
+
+async fn callbacks(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Operator)?;
+    let callbacks = repository
+        .list_callbacks_visible_to(&user.id, user.role == Role::Admin)
+        .await?;
+    Ok(Html(templates::callbacks_page(&user, &callbacks)))
+}
+
+async fn eventing(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    session: Session,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Operator)?;
+    let csrf_token = issue_csrf_token(&session).await?;
+    let rules = repository.list_event_rules().await?;
+    Ok(Html(templates::eventing_page(&user, &rules, &csrf_token, None)))
+}
+
+async fn create_event_rule(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let form = match Form::<EventRuleForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            let csrf_token = issue_csrf_token(&session).await?;
+            let rules = repository.list_event_rules().await?;
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Html(templates::eventing_page(
+                    &user,
+                    &rules,
+                    &csrf_token,
+                    Some("The request is invalid."),
+                )),
+            )
+                .into_response());
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || !valid_form_values(&[&form.name, &form.trigger, &form.command])
+    {
+        let csrf_token = issue_csrf_token(&session).await?;
+        let rules = repository.list_event_rules().await?;
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Html(templates::eventing_page(
+                &user,
+                &rules,
+                &csrf_token,
+                Some("Provide a rule name, trigger, and command."),
+            )),
+        )
+            .into_response());
+    }
+    repository
+        .create_event_rule(
+            form.name.trim(),
+            form.trigger.trim(),
+            form.command.trim(),
+            if form.target.is_empty() { "all" } else { form.target.trim() },
+            &user.id,
+            &Uuid::new_v4().to_string(),
+        )
+        .await?;
+    Ok(Redirect::to("/eventing").into_response())
+}
+
+async fn services(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Operator)?;
+    let services = repository
+        .list_services_visible_to(&user.id, user.role == Role::Admin)
+        .await?;
+    Ok(Html(templates::services_page(&user, &services)))
+}
+
+async fn search(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Query(params): Query<SearchParams>,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Operator)?;
+    let query = params.q.unwrap_or_default().trim().to_owned();
+    if query.is_empty() {
+        return Ok(Html(templates::search_page(&user, "", &[], &[], &[])));
+    }
+    let (operations, assets, callbacks) = repository
+        .search_portal(&user.id, user.role == Role::Admin, &query)
+        .await?;
+    Ok(Html(templates::search_page(
+        &user, &query, &operations, &assets, &callbacks,
+    )))
+}
+
+async fn operation_detail(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(operation_id): Path<String>,
+    session: Session,
+) -> Result<Html<String>, AppError> {
+    authorize_operation(&repository, &user, &operation_id, Role::Operator).await?;
+    let operation = repository
+        .find_operation(&operation_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let csrf_token = issue_csrf_token(&session).await?;
+    Ok(Html(templates::operation_detail_page(
+        &user,
+        &operation,
+        &csrf_token,
+        None,
+    )))
+}
+
+async fn update_operation(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(operation_id): Path<String>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    authorize_operation(&repository, &user, &operation_id, Role::Operator).await?;
+    let form = match Form::<OperationUpdateForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            let csrf_token = issue_csrf_token(&session).await?;
+            let operation = repository
+                .find_operation(&operation_id)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Html(templates::operation_detail_page(
+                    &user,
+                    &operation,
+                    &csrf_token,
+                    Some("The request is invalid."),
+                )),
+            )
+                .into_response());
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || !valid_form_values(&[&form.name, &form.purpose])
+    {
+        let csrf_token = issue_csrf_token(&session).await?;
+        let operation = repository
+            .find_operation(&operation_id)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Html(templates::operation_detail_page(
+                &user,
+                &operation,
+                &csrf_token,
+                Some("Name and purpose are required."),
+            )),
+        )
+            .into_response());
+    }
+    let status = match form.status.as_str() {
+        "active" => OperationStatus::Active,
+        "closed" => OperationStatus::Closed,
+        _ => OperationStatus::Planned,
+    };
+    repository
+        .update_operation(
+            &operation_id,
+            form.name.trim(),
+            form.purpose.trim(),
+            form.scope_note.trim(),
+            status,
+            &user.id,
+            &Uuid::new_v4().to_string(),
+        )
+        .await?;
+    Ok(Redirect::to("/operations").into_response())
+}
+
+#[derive(Default, Deserialize)]
+struct EventRuleForm {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    trigger: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    target: String,
+    csrf_token: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct OperationUpdateForm {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    purpose: String,
+    #[serde(default)]
+    scope_note: String,
+    #[serde(default)]
+    status: String,
+    csrf_token: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+}
+
 fn operation_report_summaries(
     operations: Vec<Operation>,
     assets: &[Asset],
@@ -602,6 +999,17 @@ pub async fn script() -> Response {
             "application/javascript; charset=utf-8",
         )],
         include_str!("../static/admin.js"),
+    )
+        .into_response()
+}
+
+pub async fn anime_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/anime.min.js"),
     )
         .into_response()
 }

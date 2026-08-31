@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     let runtime = BeaconRuntime::new(profile, psk.into_bytes());
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async { runtime.run().await })?;
+    rt.block_on(async { std::sync::Arc::new(runtime).run().await })?;
     Ok(())
 }
 

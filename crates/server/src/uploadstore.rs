@@ -36,7 +36,15 @@ impl UploadStore {
         if map.contains_key(session) {
             return Err("an upload is already in progress for this session".into());
         }
-        map.insert(*session, Upload { src, dest, offset: 0, total });
+        map.insert(
+            *session,
+            Upload {
+                src,
+                dest,
+                offset: 0,
+                total,
+            },
+        );
         Ok(())
     }
 
@@ -116,7 +124,9 @@ mod tests {
 
         let store = UploadStore::default();
         let sid = Uuid::new_v4();
-        store.start(&sid, src.clone(), "/tmp/out.bin".into()).unwrap();
+        store
+            .start(&sid, src.clone(), "/tmp/out.bin".into())
+            .unwrap();
 
         let c0 = store.push_budget(&sid, 2048);
         assert_eq!(c0.len(), 2);

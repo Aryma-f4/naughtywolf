@@ -20,5 +20,5 @@ sha2.workspace = true
 
 [dev-dependencies]
 nw-server = { path = "../server" }
-tempfile = "3"
+tempfile.workspace = true
 axum.workspace = true

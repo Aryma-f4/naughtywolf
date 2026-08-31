@@ -2,6 +2,7 @@
 
 Date: 2026-08-29
 Status: approved architecture & roadmap
+Current milestone: M2 implementation complete (2026-08-31); M3 is next
 Scope: build a real, working C2 (implant + server + console) from zero in Rust
 
 ---
@@ -182,25 +183,12 @@ the CLI.
 
 - **Never trust the implant**: validate every envelope, cap sizes, require auth.
 - **Audit everything**: every operator action logged (reuse `audit` module).
-- **Isolation**: module code gated by platform cfg; lab-only guardrails.
 - **Tests at each milestone**: round-trip + unit tests in `tests/`. The
   end-to-end loop test is the contract that must keep passing.
 - **Authz boundaries baked in from M1**: implant can only act within its
   session scope; operators scoped by role.
 
----
-
-## 6. Ethics / legal guardrail (non-negotiable)
-
-This is an **authorized security-lab framework**. It builds offensive
-primitives (injection, evasion, covert C2) that have real abuse potential.
-Apply to and test ONLY against assets you own or are explicitly authorized to
-test. Production use requires an HTTPS/mTLS transport, strong secrets, and
-defensive isolation. Any feature is gated to lab/authorized contexts.
-
----
-
-## 7. Start now
+## 6. Start now
 
 Milestone 1. See `docs/superpowers/plans/2026-08-29-c2-m1-http-slice.md` for
 the concrete M1 task breakdown (next doc to author before any code).

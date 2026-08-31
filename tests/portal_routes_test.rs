@@ -8,8 +8,9 @@ use axum::{
 };
 use naughtywolf::{
     auth::{AuthenticatedUser, middleware::AuthSession, rbac::Role},
-    db::{self, models::RunState, repositories::Repository},
+    db::{self, models::{EventRule, RunState}, repositories::Repository},
     evidence::EvidenceStore,
+    payload::PayloadMeta,
     portal::{DashboardSummary, dashboard_summary, public_router, templates, visible_operations},
 };
 use tower::ServiceExt;
@@ -300,6 +301,8 @@ async fn scoped_portal_fixture() -> ScopedPortalFixture {
     }
 }
 
+// ── Task 1: Login template contract ──────────────────────────────────────────
+
 #[tokio::test]
 async fn public_pages_link_local_styles_and_do_not_expose_operator_console_copy() {
     let app = public_router();
@@ -346,6 +349,221 @@ fn invalid_login_template_is_generic_and_never_echoes_a_username() {
     assert!(body.contains("Invalid username or password"));
     assert!(!body.contains("missing-user"));
 }
+
+#[test]
+fn login_template_uses_the_operator_layout_without_external_assets() {
+    let body = templates::login_page(Some("Invalid username or password"), "csrf-token");
+
+    for class_name in [
+        "login-shell",
+        "login-brand-panel",
+        "login-form-panel",
+        "login-card",
+        "brand-mark",
+        "trust-list",
+        "form-field",
+    ] {
+        assert!(body.contains(class_name), "missing {class_name}");
+    }
+    assert!(body.contains("Authorized lab access only"));
+    assert!(body.contains("name=\"csrf_token\" value=\"csrf-token\""));
+    assert!(body.contains("autocomplete=\"username\""));
+    assert!(body.contains("autocomplete=\"current-password\""));
+    assert!(body.contains("role=\"alert\""));
+    assert!(!body.contains("https://"));
+}
+
+// ── Task 2: Authenticated shell contract ─────────────────────────────────────
+
+#[test]
+fn authenticated_shell_uses_top_navigation_and_post_logout() {
+    let user = AuthenticatedUser {
+        id: "operator-id".into(),
+        username: "operator-user".into(),
+        role: Role::Operator,
+    };
+    let body = templates::app_page("Dashboard", &user, "dashboard", "<p>body</p>");
+
+    assert!(body.contains("class=\"portal-shell\""));
+    assert!(body.contains("class=\"portal-topbar\""));
+    assert!(body.contains("class=\"primary-nav\""));
+    assert!(body.contains("aria-label=\"Primary navigation\""));
+    assert!(body.contains("href=\"/dashboard\" aria-current=\"page\""));
+    assert!(body.contains("method=\"post\" action=\"/logout\""));
+    assert!(body.contains("operator-user"));
+    assert!(!body.contains("sidebar"));
+}
+
+#[test]
+fn admin_navigation_remains_role_scoped() {
+    let viewer = AuthenticatedUser {
+        id: "viewer-id".into(),
+        username: "viewer-user".into(),
+        role: Role::Viewer,
+    };
+    let admin = AuthenticatedUser {
+        id: "admin-id".into(),
+        username: "admin-user".into(),
+        role: Role::Admin,
+    };
+
+    assert!(!templates::app_page("Dashboard", &viewer, "dashboard", "")
+        .contains("href=\"/admin/users\""));
+    assert!(templates::app_page("Admin", &admin, "admin", "")
+        .contains("href=\"/admin/users\" aria-current=\"page\""));
+}
+
+#[test]
+fn payloads_navigation_remains_role_scoped() {
+    let viewer = AuthenticatedUser {
+        id: "viewer-id".into(),
+        username: "viewer-user".into(),
+        role: Role::Viewer,
+    };
+    let operator = AuthenticatedUser {
+        id: "op-id".into(),
+        username: "op-user".into(),
+        role: Role::Operator,
+    };
+
+    assert!(!templates::app_page("Payloads", &viewer, "payloads", "")
+        .contains("href=\"/payloads\""));
+    assert!(templates::app_page("Payloads", &operator, "payloads", "")
+        .contains("href=\"/payloads\""));
+}
+
+#[test]
+fn new_features_navigation_remains_role_scoped() {
+    let viewer = AuthenticatedUser {
+        id: "viewer-id".into(),
+        username: "viewer-user".into(),
+        role: Role::Viewer,
+    };
+    let operator = AuthenticatedUser {
+        id: "op-id".into(),
+        username: "op-user".into(),
+        role: Role::Operator,
+    };
+
+    for (href, active) in [
+        ("/callbacks", "callbacks"),
+        ("/eventing", "eventing"),
+        ("/services", "services"),
+        ("/search", "search"),
+    ] {
+        let viewer_body = templates::app_page("Nav", &viewer, active, "");
+        assert!(!viewer_body.contains(&format!("href=\"{href}\"")), "{href} visible to viewer");
+        let operator_body = templates::app_page("Nav", &operator, active, "");
+        assert!(operator_body.contains(&format!("href=\"{href}\"")), "{href} hidden from operator");
+    }
+}
+
+#[test]
+fn eventing_page_renders_rule_form() {
+    let user = AuthenticatedUser {
+        id: "op-id".into(),
+        username: "op-user".into(),
+        role: Role::Operator,
+    };
+    let rules = vec![EventRule {
+        id: "r1".into(),
+        name: "quarantine".into(),
+        trigger: "new callback".into(),
+        command: "collect state".into(),
+        target: "all".into(),
+        enabled: true,
+        requested_by: None,
+        created_at: "2026-08-30T00:00:00Z".into(),
+    }];
+    let body = templates::eventing_page(&user, &rules, "csrf-token", None);
+
+    assert!(body.contains("action=\"/eventing\""));
+    assert!(body.contains("quarantine"));
+    assert!(body.contains("Enabled"));
+}
+
+#[test]
+fn payloads_page_renders_build_form_and_built_rows() {
+    let user = AuthenticatedUser {
+        id: "op-id".into(),
+        username: "op-user".into(),
+        role: Role::Operator,
+    };
+    let metas = vec![PayloadMeta {
+        file: "linux-amd64.bin".into(),
+        name: "linux-implant".into(),
+        os: "linux".into(),
+        arch: "amd64".into(),
+        protocol: "http".into(),
+        lhost: "10.0.0.1".into(),
+        lport: 8081,
+        psk: "x".into(),
+        interval_ms: 1000,
+        jitter_ms: 200,
+        target: String::new(),
+        size: 42,
+        built_at: "2026-08-30T00:00:00Z".into(),
+    }];
+    let body = templates::payloads_page(&user, &metas, "csrf-token", None, None, &[], &[]);
+
+    assert!(body.contains("action=\"/payloads/generate\""));
+    assert!(body.contains("name=\"csrf_token\" value=\"csrf-token\""));
+    assert!(body.contains("linux-implant"));
+    assert!(body.contains("10.0.0.1:8081"));
+    assert!(body.contains("href=\"/payloads/download/linux-amd64.bin\""));
+    assert!(body.contains("NW_PSK"));
+}
+
+// ── Task 3: Component contracts ───────────────────────────────────────────────
+
+#[test]
+fn dashboard_renders_five_real_metric_cards() {
+    let user = AuthenticatedUser {
+        id: "viewer-id".into(),
+        username: "viewer-user".into(),
+        role: Role::Viewer,
+    };
+    let summary = DashboardSummary {
+        operation_count: 1,
+        asset_count: 2,
+        run_count: 3,
+        evidence_count: 4,
+        audit_count: 5,
+    };
+    let body = templates::dashboard_page(&user, &summary);
+
+    assert_eq!(body.matches("class=\"metric-card\"").count(), 5);
+    for value in ["1", "2", "3", "4", "5"] {
+        assert!(body.contains(&format!(">{value}</strong>")));
+    }
+    assert!(!body.contains("chart"));
+}
+
+// ── Task 4: Accessibility contract ───────────────────────────────────────────
+
+#[test]
+fn form_pages_keep_labels_errors_and_descriptions() {
+    let user = AuthenticatedUser {
+        id: "admin-id".into(),
+        username: "admin-user".into(),
+        role: Role::Admin,
+    };
+    let body = templates::operation_form_page(
+        &user,
+        "csrf-token",
+        Some("The request is invalid."),
+        "Retained name",
+        "Retained purpose",
+    );
+
+    assert!(body.contains("role=\"alert\""));
+    assert!(body.contains("aria-describedby=\"operation-form-error\""));
+    assert!(body.contains("value=\"Retained name\""));
+    assert!(body.contains("value=\"Retained purpose\""));
+    assert_eq!(body.matches("class=\"form-field\"").count(), 2);
+}
+
+// ── Existing tests (unchanged) ────────────────────────────────────────────────
 
 #[tokio::test]
 async fn operator_summary_excludes_an_operation_without_membership() {
@@ -398,6 +616,84 @@ async fn viewer_cannot_open_admin_page_even_if_they_request_its_url() {
 }
 
 #[tokio::test]
+async fn payloads_require_a_non_viewer_role() {
+    let viewer = app_with_logged_in_user(Role::Viewer).await;
+    let view_response = viewer
+        .oneshot(Request::get("/payloads").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(view_response.status(), StatusCode::FORBIDDEN);
+
+    let operator = app_with_logged_in_user(Role::Operator).await;
+    let op_response = operator
+        .oneshot(Request::get("/payloads").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(op_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn payload_feature_routes_require_a_non_viewer_role() {
+    let viewer = app_with_logged_in_user(Role::Viewer).await;
+    for path in ["/callbacks", "/eventing", "/services", "/search"] {
+        let response = viewer
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path} open to viewer");
+    }
+
+    let operator = app_with_logged_in_user(Role::Operator).await;
+    for path in ["/callbacks", "/eventing", "/services", "/search"] {
+        let op_response = operator
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(op_response.status(), StatusCode::OK, "{path} not open to operator");
+    }
+}
+
+#[tokio::test]
+async fn operator_can_create_an_event_rule_with_audit() {
+    let repository = test_repository().await;
+    let operator = create_user(&repository, "op", Role::Operator).await;
+    let app = app_with_user_and_repository(repository.clone(), operator).await;
+    let page = app
+        .clone()
+        .oneshot(Request::get("/eventing").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let token = csrf_token(&body_string(page).await);
+
+    let response = app
+        .oneshot(post_form(
+            "/eventing",
+            format!(
+                "name=quarantine&trigger=new+callback&command=collect+state&target=all&csrf_token={token}"
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/eventing");
+    let rule: String = sqlx::query_scalar("SELECT name FROM event_rules WHERE name = ?")
+        .bind("quarantine")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(rule, "quarantine");
+    let action: String = sqlx::query_scalar("SELECT action FROM audit_events WHERE target_type = ?")
+        .bind("event_rule")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(action, "event_rule.created");
+}
+
+#[tokio::test]
 async fn operator_cannot_change_another_users_role() {
     let app = app_with_logged_in_user(Role::Operator).await;
     let response = app
@@ -438,6 +734,9 @@ async fn admin_user_table_never_renders_password_hashes() {
     assert!(body.contains("target-user"));
     assert!(!body.contains("password_hash"));
     assert!(!body.contains("secret-password-hash"));
+    assert!(body.contains("class=\"data-table admin-users-table\""));
+    assert!(body.contains("class=\"status-pill"));
+    assert!(body.contains("Enabled") || body.contains("Disabled"));
 }
 
 #[tokio::test]
@@ -987,7 +1286,7 @@ async fn operation_form_rerenders_when_a_required_field_is_missing() {
     )
     .unwrap();
     assert!(body.contains("The request is invalid."));
-    assert!(body.contains("<form class=\"record-form\""));
+    assert!(body.contains("class=\"form-panel panel\""));
 }
 
 #[tokio::test]

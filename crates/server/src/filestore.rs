@@ -101,7 +101,10 @@ impl FileStore {
 
 fn append_at(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(data)
 }
 

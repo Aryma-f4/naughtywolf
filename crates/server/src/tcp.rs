@@ -24,7 +24,7 @@ async fn handle_conn(sock: &mut tokio::net::TcpStream, state: &ServerState) -> a
     use tokio::io::AsyncWriteExt;
 
     let sealed = read_frame(sock).await?;
-    let reply = match process_sealed(state, &sealed) {
+    let reply = match process_sealed(state, &sealed).await {
         Ok(rep) => rep,
         Err(e) => {
             // Empty reply so the implant-side read doesn't hang on an error.

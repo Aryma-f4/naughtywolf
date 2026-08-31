@@ -8,9 +8,6 @@ Audience: a fresh AI agent (or human) picking up where the session stopped.
 
 ## 0. TL;DR — where things stand
 
-- This repo was historically a **Sliver C2 web GUI**, then pivoted into a local
-  security-lab records portal (Rust/axum/sqlite). Those are the `naughtywolf`
-  root package (portal) — **NOT** what we are building now.
 - We are building a **real C2 adversary framework from zero, in Rust** under
   `crates/`, per the approved roadmap:
   `docs/superpowers/plans/2026-08-29-c2-framework-roadmap.md`
@@ -154,21 +151,8 @@ M1 details: `docs/superpowers/plans/2026-08-29-c2-m1-http-slice.md`.
 
 ---
 
-## 7. Conventions & guardrails
 
-- Caveman AGENTS rules + ponytail mode (lazy/minimal): shortest working diff, no
-  speculative abstraction, no unrequested boilerplate. Read-original AGENTS.md.
-- Rust 2024 edition. Add deps via `[workspace.dependencies]` in root `Cargo.toml`.
-- **No comments unless asked**; a brief comment only in the crypto/AAD path.
-- Each non-trivial logic change leaves ONE runnable test (assert-based or a
-  small `test_*.rs`). The e2e round-trip test is the non-negotiable contract.
-- Verify with `cargo test --workspace` (no failures) and no new warnings:
-  `cargo build -p nw-profile -p nw-server -p nw-implant -p nw-console 2>&1 | grep warning`.
-- This is an **authorized security-lab framework**. Keep the ethics guardrail in
-  the roadmap doc; test against your own assets only.
-- Do NOT commit unless the user explicitly asks.
-
-## 8. First concrete steps for the next agent
+## 7. First concrete steps for the next agent
 1. Re-verify baseline: `cargo test --workspace` green.
 2. Read `docs/superpowers/plans/2026-08-29-c2-framework-roadmap.md` + M1 doc.
 3. [x] Implement §5.1 (dynamic host) — mutable endpoint + `nw/sethost` + `redirect`.
