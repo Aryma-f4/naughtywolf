@@ -14,21 +14,35 @@ fn main() -> anyhow::Result<()> {
     let (endpoint, psk) = match runtime_cfg() {
         Some(cfg) => cfg,
         None => {
-            let e = std::env::var("NW_ENDPOINT").ok().or_else(|| {
-                option_env!("NW_ENDPOINT").map(str::to_owned).filter(|s| !s.is_empty())
-            }).expect("no NW_CFG or NW_ENDPOINT configured");
-            let p = std::env::var("NW_PSK").ok().or_else(|| {
-                option_env!("NW_PSK").map(str::to_owned).filter(|s| !s.is_empty())
-            }).unwrap_or_else(|| "dev-psk-change-me".into());
+            let e = std::env::var("NW_ENDPOINT")
+                .ok()
+                .or_else(|| {
+                    option_env!("NW_ENDPOINT")
+                        .map(str::to_owned)
+                        .filter(|s| !s.is_empty())
+                })
+                .expect("no NW_CFG or NW_ENDPOINT configured");
+            let p = std::env::var("NW_PSK")
+                .ok()
+                .or_else(|| {
+                    option_env!("NW_PSK")
+                        .map(str::to_owned)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| "dev-psk-change-me".into());
             (e, p)
         }
     };
-    let interval_ms = std::env::var("NW_INTERVAL").ok().and_then(|s| s.parse().ok()).or_else(|| {
-        option_env!("NW_INTERVAL").and_then(|s| s.parse().ok())
-    }).unwrap_or(1000);
-    let jitter_ms = std::env::var("NW_JITTER").ok().and_then(|s| s.parse().ok()).or_else(|| {
-        option_env!("NW_JITTER").and_then(|s| s.parse().ok())
-    }).unwrap_or(200);
+    let interval_ms = std::env::var("NW_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| option_env!("NW_INTERVAL").and_then(|s| s.parse().ok()))
+        .unwrap_or(1000);
+    let jitter_ms = std::env::var("NW_JITTER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| option_env!("NW_JITTER").and_then(|s| s.parse().ok()))
+        .unwrap_or(200);
 
     let profile = discover_profile(
         endpoint,
@@ -45,7 +59,13 @@ fn main() -> anyhow::Result<()> {
 /// Runtime-resolvable config: runtime `NW_CFG` env, then BAKED `NW_CFG`, and
 /// finally runtime `NW_ENDPOINT`. Returns `(endpoint, psk)`.
 fn runtime_cfg() -> Option<(String, String)> {
-    let blob = std::env::var("NW_CFG").ok().filter(|s| !s.is_empty())
-        .or_else(|| option_env!("NW_CFG").map(str::to_owned).filter(|s| !s.is_empty()))?;
+    let blob = std::env::var("NW_CFG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            option_env!("NW_CFG")
+                .map(str::to_owned)
+                .filter(|s| !s.is_empty())
+        })?;
     nw_profile::config::decrypt_config(&blob).ok()
 }

@@ -64,7 +64,10 @@ async fn handle_conn(sock: &mut TcpStream) -> anyhow::Result<()> {
         }
         0x04 => {
             read_exact_or_eof(sock, &mut buf[..16]).await?;
-            let octets: Vec<String> = buf[..16].chunks(2).map(|c| format!("{:02x}{:02x}", c[0], c[1])).collect();
+            let octets: Vec<String> = buf[..16]
+                .chunks(2)
+                .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
+                .collect();
             format!("[{}]", octets.join(":"))
         }
         _ => return Ok(()),
@@ -78,18 +81,22 @@ async fn handle_conn(sock: &mut TcpStream) -> anyhow::Result<()> {
 
     if cmd != 0x01 {
         // Only CONNECT supported.
-        sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
         return Ok(());
     }
 
     let target = format!("{host}:{port}");
     match TcpStream::connect(&target).await {
         Ok(mut up) => {
-            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
             let _ = tokio::io::copy_bidirectional(sock, &mut up).await;
         }
         Err(_) => {
-            let _ = sock.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            let _ = sock
+                .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
         }
     }
     Ok(())
@@ -142,7 +149,20 @@ mod tests {
         assert_eq!(resp, [0x05, 0x00]);
 
         // Greeting + CONNECT to the echo target (ATYP=1 IPv4).
-        client.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, (echo_port >> 8) as u8, (echo_port & 0xff) as u8]).unwrap();
+        client
+            .write_all(&[
+                0x05,
+                0x01,
+                0x00,
+                0x01,
+                127,
+                0,
+                0,
+                1,
+                (echo_port >> 8) as u8,
+                (echo_port & 0xff) as u8,
+            ])
+            .unwrap();
         let mut ack = [0u8; 10];
         client.read_exact(&mut ack).unwrap();
         assert_eq!(ack[1], 0x00);

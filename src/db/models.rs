@@ -139,6 +139,76 @@ pub struct Callback {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+pub enum TaskStatus {
+    Pending,
+    Delivering,
+    Delivered,
+    Processing,
+    Completed,
+    Error,
+}
+
+impl TaskStatus {
+    /// Mythic-style human-readable label + CSS class for task state display.
+    pub fn label_class(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Pending => ("Submitted", "neutral"),
+            Self::Delivering => ("Delivering", "neutral"),
+            Self::Delivered => ("Delivered", "warning"),
+            Self::Processing => ("Processing", "warning"),
+            Self::Completed => ("Completed", "success"),
+            Self::Error => ("Error", "danger"),
+        }
+    }
+
+    /// Parse a status string (from DB) and return the Mythic-style label + CSS class.
+    pub fn label_class_from_str(status: &str) -> (&'static str, &'static str) {
+        match status {
+            "pending" => ("Submitted", "neutral"),
+            "delivering" => ("Delivering", "neutral"),
+            "delivered" => ("Delivered", "warning"),
+            "processing" => ("Processing", "warning"),
+            "completed" => ("Completed", "success"),
+            "error" => ("Error", "danger"),
+            _ => ("Unknown", "neutral"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct C2Task {
+    pub id: String,
+    pub session_id: String,
+    pub command: String,
+    #[sqlx(json)]
+    pub args_json: Value,
+    pub timeout_ms: u64,
+    pub status: String,
+    pub created_at: String,
+    pub processing_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub result_output: Option<String>,
+    pub result_ok: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct C2TaskWithResult {
+    pub id: String,
+    pub session_id: String,
+    pub command: String,
+    #[sqlx(json)]
+    pub args_json: Value,
+    pub status: String,
+    pub created_at: String,
+    pub processing_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub result_output: Option<String>,
+    pub result_ok: Option<bool>,
+    pub result_exit_code: Option<i32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
 pub struct EventRule {
     pub id: String,

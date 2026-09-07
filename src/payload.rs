@@ -92,7 +92,14 @@ static RECENT_ERRORS: LazyLock<Mutex<Vec<(String, String, String)>>> =
 pub fn record_build_error(file: &str, err: &str) {
     if let Ok(mut v) = RECENT_ERRORS.lock() {
         v.retain(|(f, _, _)| f != file);
-        v.insert(0, (file.to_owned(), err.to_owned(), chrono::Utc::now().to_rfc3339()));
+        v.insert(
+            0,
+            (
+                file.to_owned(),
+                err.to_owned(),
+                chrono::Utc::now().to_rfc3339(),
+            ),
+        );
         v.truncate(10);
     }
 }
@@ -104,10 +111,7 @@ pub fn clear_build_errors(file: &str) {
 }
 
 pub fn recent_errors() -> Vec<(String, String, String)> {
-    RECENT_ERRORS
-        .lock()
-        .map(|v| v.clone())
-        .unwrap_or_default()
+    RECENT_ERRORS.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
 /// The output file name a request will produce, without building.
@@ -131,7 +135,11 @@ fn sanitize(name: &str) -> String {
 /// Output path of the freshly built implant for the given (possibly empty) target triple.
 fn built_binary(target: &str) -> PathBuf {
     let workspace = env!("CARGO_MANIFEST_DIR");
-    let exe = if target.contains("windows") { ".exe" } else { "" };
+    let exe = if target.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
     if target.is_empty() {
         Path::new(workspace).join(format!("target/release/nw-implant{exe}"))
     } else {
@@ -150,8 +158,7 @@ pub async fn build(req: &BuildRequest) -> Result<PayloadMeta> {
         sanitize(&req.name)
     };
     let file = build_id(&name, &req.os, &req.arch);
-    std::fs::create_dir_all(PAYLOAD_DIR)
-        .with_context(|| format!("create {PAYLOAD_DIR}"))?;
+    std::fs::create_dir_all(PAYLOAD_DIR).with_context(|| format!("create {PAYLOAD_DIR}"))?;
     clear_build_errors(&file);
 
     mark_building(BuildJob {

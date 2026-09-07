@@ -24,9 +24,18 @@ impl Download {
     /// Open `path` for streaming as a download task result.
     pub fn open(path: &str, task_id: Uuid) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| format!("open {path:?}: {e}"))?;
-        let size = file.metadata().map_err(|e| format!("stat {path:?}: {e}"))?.len();
+        let size = file
+            .metadata()
+            .map_err(|e| format!("stat {path:?}: {e}"))?
+            .len();
         let name = basename(path);
-        Ok(Download { file, name, size, offset: 0, task_id })
+        Ok(Download {
+            file,
+            name,
+            size,
+            offset: 0,
+            task_id,
+        })
     }
 
     pub fn task_id(&self) -> Uuid {

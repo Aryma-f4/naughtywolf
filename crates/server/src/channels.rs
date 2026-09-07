@@ -227,6 +227,7 @@ pub fn router(registry: SharedRegistry, queue: SharedQueue, psk: Vec<u8>) -> Rou
         psk: Arc::new(psk),
         files: crate::filestore::FileStore::default(),
         uploads: crate::uploadstore::UploadStore::default(),
+        creds: Arc::new(crate::creds::CredentialStore::new_in_memory()),
     };
     application(state)
 }
@@ -254,6 +255,7 @@ mod tests {
                 std::env::temp_dir().join(format!("nw-test-files-{}", std::process::id())),
             ),
             uploads: crate::uploadstore::UploadStore::default(),
+            creds: Arc::new(crate::creds::CredentialStore::new_in_memory()),
         };
         (state, q)
     }

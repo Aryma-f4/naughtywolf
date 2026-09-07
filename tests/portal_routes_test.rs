@@ -8,7 +8,11 @@ use axum::{
 };
 use naughtywolf::{
     auth::{AuthenticatedUser, middleware::AuthSession, rbac::Role},
-    db::{self, models::{EventRule, RunState}, repositories::Repository},
+    db::{
+        self,
+        models::{EventRule, RunState},
+        repositories::Repository,
+    },
     evidence::EvidenceStore,
     payload::PayloadMeta,
     portal::{DashboardSummary, dashboard_summary, public_router, templates, visible_operations},
@@ -407,10 +411,14 @@ fn admin_navigation_remains_role_scoped() {
         role: Role::Admin,
     };
 
-    assert!(!templates::app_page("Dashboard", &viewer, "dashboard", "")
-        .contains("href=\"/admin/users\""));
-    assert!(templates::app_page("Admin", &admin, "admin", "")
-        .contains("href=\"/admin/users\" aria-current=\"page\""));
+    assert!(
+        !templates::app_page("Dashboard", &viewer, "dashboard", "")
+            .contains("href=\"/admin/users\"")
+    );
+    assert!(
+        templates::app_page("Admin", &admin, "admin", "")
+            .contains("href=\"/admin/users\" aria-current=\"page\"")
+    );
 }
 
 #[test]
@@ -426,10 +434,12 @@ fn payloads_navigation_remains_role_scoped() {
         role: Role::Operator,
     };
 
-    assert!(!templates::app_page("Payloads", &viewer, "payloads", "")
-        .contains("href=\"/payloads\""));
-    assert!(templates::app_page("Payloads", &operator, "payloads", "")
-        .contains("href=\"/payloads\""));
+    assert!(
+        !templates::app_page("Payloads", &viewer, "payloads", "").contains("href=\"/payloads\"")
+    );
+    assert!(
+        templates::app_page("Payloads", &operator, "payloads", "").contains("href=\"/payloads\"")
+    );
 }
 
 #[test]
@@ -452,9 +462,15 @@ fn new_features_navigation_remains_role_scoped() {
         ("/search", "search"),
     ] {
         let viewer_body = templates::app_page("Nav", &viewer, active, "");
-        assert!(!viewer_body.contains(&format!("href=\"{href}\"")), "{href} visible to viewer");
+        assert!(
+            !viewer_body.contains(&format!("href=\"{href}\"")),
+            "{href} visible to viewer"
+        );
         let operator_body = templates::app_page("Nav", &operator, active, "");
-        assert!(operator_body.contains(&format!("href=\"{href}\"")), "{href} hidden from operator");
+        assert!(
+            operator_body.contains(&format!("href=\"{href}\"")),
+            "{href} hidden from operator"
+        );
     }
 }
 
@@ -641,7 +657,11 @@ async fn payload_feature_routes_require_a_non_viewer_role() {
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path} open to viewer");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{path} open to viewer"
+        );
     }
 
     let operator = app_with_logged_in_user(Role::Operator).await;
@@ -651,7 +671,11 @@ async fn payload_feature_routes_require_a_non_viewer_role() {
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(op_response.status(), StatusCode::OK, "{path} not open to operator");
+        assert_eq!(
+            op_response.status(),
+            StatusCode::OK,
+            "{path} not open to operator"
+        );
     }
 }
 
@@ -685,11 +709,12 @@ async fn operator_can_create_an_event_rule_with_audit() {
         .await
         .unwrap();
     assert_eq!(rule, "quarantine");
-    let action: String = sqlx::query_scalar("SELECT action FROM audit_events WHERE target_type = ?")
-        .bind("event_rule")
-        .fetch_one(&repository.pool)
-        .await
-        .unwrap();
+    let action: String =
+        sqlx::query_scalar("SELECT action FROM audit_events WHERE target_type = ?")
+            .bind("event_rule")
+            .fetch_one(&repository.pool)
+            .await
+            .unwrap();
     assert_eq!(action, "event_rule.created");
 }
 

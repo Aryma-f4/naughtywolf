@@ -42,10 +42,11 @@ async fn http_c2_round_trip() {
         psk: Arc::new(psk.clone()),
         files: nw_server::filestore::FileStore::default(),
         uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
 
     let bind = format!("127.0.0.1:{}", port);
-    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
 
     // Give the listener a beat to bind.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -126,10 +127,11 @@ async fn download_streams_a_remote_file_to_the_server() {
         psk: Arc::new(psk.clone()),
         files: nw_server::filestore::FileStore::new(dl_dir.clone()),
         uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
 
     let bind = format!("127.0.0.1:{}", port);
-    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let profile = Profile {
@@ -205,10 +207,11 @@ async fn upload_streams_a_local_file_to_the_implant() {
         psk: Arc::new(psk.clone()),
         files: nw_server::filestore::FileStore::default(),
         uploads: uploads.clone(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
 
     let bind = format!("127.0.0.1:{}", port);
-    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // The operator uses a Dispatch over the SAME queue/uploads so the upload job
@@ -218,7 +221,13 @@ async fn upload_streams_a_local_file_to_the_implant() {
         username: "system".into(),
         role: nw_server::operators::Role::Admin,
     };
-    let dispatcher = nw_server::Dispatcher::new(registry.clone(), queue.clone(), uploads, sys_op);
+    let dispatcher = nw_server::Dispatcher::new(
+        registry.clone(),
+        queue.clone(),
+        uploads,
+        Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
+        sys_op,
+    );
 
     let profile = Profile {
         endpoint: endpoint.clone(),
@@ -298,9 +307,10 @@ async fn socks5_proxy_relays_traffic_through_the_implant() {
         psk: Arc::new(psk.clone()),
         files: nw_server::filestore::FileStore::default(),
         uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
     let bind = format!("127.0.0.1:{}", c2_port);
-    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let profile = Profile {
@@ -396,9 +406,10 @@ async fn hashes_returns_sha256_of_a_remote_file() {
         psk: Arc::new(psk.clone()),
         files: nw_server::filestore::FileStore::default(),
         uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
     let bind = format!("127.0.0.1:{}", c2_port);
-    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let profile = Profile {
@@ -457,6 +468,132 @@ async fn hashes_returns_sha256_of_a_remote_file() {
 }
 
 #[tokio::test]
+async fn script_queues_task_sequence_to_a_session() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+    let psk: Vec<u8> = b"script-e2e-psk".to_vec();
+    let port = free_port();
+    let endpoint = format!("http://127.0.0.1:{}", port);
+
+    let registry = Arc::new(SessionRegistry::new());
+    let queue = Arc::new(TaskQueue::new());
+    let uploads = nw_server::uploadstore::UploadStore::default();
+    let state = ServerState {
+        registry: registry.clone(),
+        queue: queue.clone(),
+        psk: Arc::new(psk.clone()),
+        files: nw_server::filestore::FileStore::default(),
+        uploads: uploads.clone(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
+    };
+
+    let bind = format!("127.0.0.1:{}", port);
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let profile = Profile {
+        endpoint: endpoint.clone(),
+        interval: Duration::from_millis(50),
+        jitter: Duration::ZERO,
+        hostname: "scriptlab".into(),
+        username: "tester".into(),
+        os: "test-os".into(),
+        arch: "test-arch".into(),
+        pid: 444,
+        addr: "127.0.0.1".into(),
+    };
+    let runtime = Arc::new(BeaconRuntime::new(profile, psk.clone()));
+    let implanted = runtime.clone();
+    let beacon = tokio::spawn(async move { implanted.run().await });
+
+    wait_for_session(&registry).await;
+    let sid = registry.list().await[0].id;
+
+    // Write a script file. Also create a temp file for the hashes step.
+    let hash_src = std::env::temp_dir().join(format!("nw-script-hash-{}.bin", std::process::id()));
+    std::fs::write(&hash_src, b"test-data-for-hashes").unwrap();
+
+    let script_text = r#"
+        script: recon-chain
+        step recon {
+            cmd: printf
+            args: recon-done
+        }
+        step check {
+            cmd: nw/hashes
+            args: {{HASH_PATH}}
+            depends_on: [recon]
+            require: recon-done
+        }
+    "#
+    .replace("{{HASH_PATH}}", hash_src.to_str().unwrap());
+    let script_path = std::env::temp_dir().join(format!("nw-script-{}.txt", std::process::id()));
+    std::fs::write(&script_path, script_text).unwrap();
+
+    let sys_op = nw_server::operators::Operator {
+        id: uuid::Uuid::nil(),
+        username: "system".into(),
+        role: nw_server::operators::Role::Admin,
+    };
+    let dispatcher = nw_server::Dispatcher::new(
+        registry.clone(),
+        queue.clone(),
+        uploads,
+        Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
+        sys_op,
+    );
+    dispatcher.set_interacted(Some(sid));
+
+    let outcome = dispatcher
+        .parse(&format!("script {}", script_path.to_str().unwrap()))
+        .await;
+    match &outcome {
+        nw_server::dispatch::Outcome::Local { message } => {
+            assert!(
+                message.contains("queued 2 step(s)"),
+                "message was: {message}"
+            );
+        }
+        other => panic!("script command should return Local, got: {other:?}"),
+    }
+
+    // Both tasks should be queued on the session.
+    let statuses = queue.statuses(&sid).await;
+    assert_eq!(statuses.len(), 2, "expected 2 queued tasks");
+
+    // Wait for task results.
+    let mut waited = Duration::ZERO;
+    loop {
+        let results = queue.results(&sid).await;
+        if results.len() >= 2 {
+            break;
+        }
+        assert!(
+            waited < Duration::from_secs(10),
+            "timed out waiting for script results"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += Duration::from_millis(100);
+    }
+
+    let results = queue.results(&sid).await;
+    for r in &results {
+        assert!(
+            r.ok,
+            "task result failed: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+
+    runtime.trigger_stop();
+    let _ = beacon.await;
+    server_handle.abort();
+    std::fs::remove_file(&script_path).ok();
+    std::fs::remove_file(&hash_src).ok();
+}
+
+#[tokio::test]
 async fn redirect_delivers_its_result_to_the_second_listener() {
     let psk: Vec<u8> = b"redirect-e2e-psk".to_vec();
     let first_port = free_port();
@@ -486,10 +623,11 @@ async fn redirect_delivers_its_result_to_the_second_listener() {
         psk: Arc::new(psk.clone()),
         files: nw_server::filestore::FileStore::default(),
         uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
     let second_bind = format!("127.0.0.1:{}", second_port);
     let second_handle =
-        tokio::spawn(async move { server::serve(second_state, &second_bind).await });
+        tokio::spawn(async move { server::serve_with_bind(second_state, &second_bind).await });
 
     let profile = Profile {
         endpoint: first_endpoint,
@@ -611,6 +749,7 @@ async fn raw_tcp_c2_round_trip() {
         psk: Arc::new(psk.clone()),
         files: nw_server::filestore::FileStore::default(),
         uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
 
     let bind = format!("127.0.0.1:{}", port);
@@ -726,10 +865,11 @@ async fn killjob_cancels_an_in_flight_task() {
         psk: Arc::new(psk.clone()),
         files: nw_server::filestore::FileStore::default(),
         uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
 
     let bind = format!("127.0.0.1:{}", port);
-    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let profile = Profile {
@@ -829,9 +969,10 @@ async fn m2_auth_audit_and_restart_persistence() {
         psk: Arc::new(psk.clone()),
         files: nw_server::filestore::FileStore::default(),
         uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
     let bind = format!("127.0.0.1:{port}");
-    let server_handle = tokio::spawn(async move { server::serve(state, &bind).await });
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let profile = Profile {
@@ -856,6 +997,7 @@ async fn m2_auth_audit_and_restart_persistence() {
         registry.clone(),
         queue.clone(),
         nw_server::uploadstore::UploadStore::default(),
+        Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
         viewer,
     )
     .with_audit(audit.clone());
@@ -869,6 +1011,7 @@ async fn m2_auth_audit_and_restart_persistence() {
         registry.clone(),
         queue.clone(),
         nw_server::uploadstore::UploadStore::default(),
+        Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
         admin,
     )
     .with_audit(audit.clone());

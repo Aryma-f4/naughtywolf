@@ -595,13 +595,11 @@ impl Repository {
     /// Look up the per-session AES key (base64) for a callback id, for routing
     /// beacon polls to the right cipher. Returns None if unknown.
     pub async fn session_key_for(&self, session_id: &str) -> Result<Option<String>, AppError> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT session_key FROM callbacks WHERE id = ?",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|_| AppError::Internal)
+        sqlx::query_scalar::<_, String>("SELECT session_key FROM callbacks WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
     }
 
     /// Refresh a callback's last-seen timestamp on each beacon poll.
@@ -615,6 +613,139 @@ impl Repository {
         .await
         .map_err(|_| AppError::Internal)?;
         Ok(())
+    }
+
+    /// Enqueue a task for a session (Mythic-style: creates a task in 'pending' status).
+    pub async fn enqueue_task(
+        &self,
+        session_id: &str,
+        command: &str,
+        args_json: &serde_json::Value,
+        timeout_ms: u64,
+    ) -> Result<String, AppError> {
+        let task_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO c2_tasks (id, session_id, command, args_json, timeout_ms, status)
+             VALUES (?, ?, ?, ?, ?, 'pending')",
+        )
+        .bind(&task_id)
+        .bind(session_id)
+        .bind(command)
+        .bind(args_json)
+        .bind(timeout_ms as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        Ok(task_id)
+    }
+
+    /// Fetch pending tasks for a session, marking fetched tasks as 'delivering' then 'delivered'.
+    pub async fn fetch_pending_tasks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::db::models::C2Task>, AppError> {
+        let rows: Vec<crate::db::models::C2Task> =
+            sqlx::query_as("SELECT * FROM c2_tasks WHERE session_id = ? AND status = 'pending'")
+                .bind(session_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|_| AppError::Internal)?;
+        for row in &rows {
+            sqlx::query("UPDATE c2_tasks SET status = 'delivered', processing_at = datetime('now') WHERE id = ?")
+                .bind(&row.id)
+                .execute(&self.pool)
+                .await
+                .map_err(|_| AppError::Internal)?;
+        }
+        Ok(rows)
+    }
+
+    /// Store a task result and mark the task as completed or error (Mythic-style).
+    pub async fn store_task_result(
+        &self,
+        task_id: &str,
+        ok: bool,
+        stdout: &[u8],
+        stderr: &[u8],
+        exit_code: i32,
+    ) -> Result<(), AppError> {
+        let status = if ok { "completed" } else { "error" };
+        sqlx::query(
+            "UPDATE c2_tasks SET status = ?, completed_at = datetime('now'),
+             result_output = ?, result_ok = ? WHERE id = ?",
+        )
+        .bind(status)
+        .bind({
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(stdout)
+        })
+        .bind(if ok { 1 } else { 0 })
+        .bind(task_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+
+        sqlx::query(
+            "INSERT OR REPLACE INTO c2_task_results
+             (task_id, ok, stdout, stderr, exit_code, completed_at)
+             VALUES (?, ?, ?, ?, ?, datetime('now'))",
+        )
+        .bind(task_id)
+        .bind(if ok { 1 } else { 0 })
+        .bind(stdout)
+        .bind(stderr)
+        .bind(exit_code)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+
+        // Audit log
+        let action = if ok { "task_completed" } else { "task_error" };
+        sqlx::query(
+            "INSERT INTO c2_audit (operator_id, operator_name, action, target_session, details, succeeded, timestamp)
+             VALUES (?, ?, ?, NULL, ?, ?, datetime('now'))",
+        )
+        .bind("")
+        .bind("system")
+        .bind(action)
+        .bind(format!("task {} {}", task_id, if ok { "completed" } else { "errored" }))
+        .bind(if ok { 1 } else { 0 })
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+
+        Ok(())
+    }
+
+    /// List tasks for a session with their results (for the callback detail page).
+    pub async fn list_tasks_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::db::models::C2TaskWithResult>, AppError> {
+        sqlx::query_as::<_, crate::db::models::C2TaskWithResult>(
+            "SELECT t.id, t.session_id, t.command, t.args_json, t.status, t.created_at,
+                    t.processing_at, t.completed_at, t.result_output, t.result_ok, r.exit_code
+             FROM c2_tasks t
+             LEFT JOIN c2_task_results r ON r.task_id = t.id
+             WHERE t.session_id = ?
+             ORDER BY t.created_at DESC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
+    /// Find a callback (session) by ID.
+    pub async fn find_callback(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::db::models::Callback>, AppError> {
+        sqlx::query_as("SELECT * FROM callbacks WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
     }
 
     pub async fn list_event_rules(&self) -> Result<Vec<EventRule>, AppError> {
@@ -658,10 +789,7 @@ impl Repository {
             correlation_id,
         );
         insert_audit(&mut transaction, &entry).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
 
         sqlx::query_as::<_, EventRule>("SELECT * FROM event_rules WHERE id = ?")
             .bind(&id)
@@ -729,10 +857,7 @@ impl Repository {
         )
         .for_operation(operation_id);
         insert_audit(&mut transaction, &entry).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
 
         self.find_operation(operation_id)
             .await?

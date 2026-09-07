@@ -1,0 +1,13 @@
+[package]
+name = "nw-modules"
+version.workspace = true
+edition.workspace = true
+description = "NaughtyWolf C2 post-exploitation module interface and registry"
+
+[dependencies]
+nw-profile = { path = "../profile" }
+serde.workspace = true
+serde_json = "1"
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

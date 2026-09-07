@@ -3,6 +3,7 @@ use std::sync::RwLock;
 use uuid::Uuid;
 
 use crate::audit_log::SharedAudit;
+use crate::creds::SharedCredStore;
 use crate::operators::{Operator, Role};
 use crate::queue::SharedQueue;
 use crate::session::SharedRegistry;
@@ -30,6 +31,7 @@ pub struct Dispatcher {
     pub registry: SharedRegistry,
     pub queue: SharedQueue,
     pub uploads: UploadStore,
+    pub creds: SharedCredStore,
     pub operator: Operator,
     audit: Option<SharedAudit>,
     interacted: RwLock<Option<Uuid>>,
@@ -40,12 +42,14 @@ impl Dispatcher {
         registry: SharedRegistry,
         queue: SharedQueue,
         uploads: UploadStore,
+        creds: SharedCredStore,
         operator: Operator,
     ) -> Self {
         Dispatcher {
             registry,
             queue,
             uploads,
+            creds,
             operator,
             audit: None,
             interacted: RwLock::new(None),
@@ -361,6 +365,112 @@ impl Dispatcher {
                     Err(e) => Outcome::Error(e.to_string()),
                 }
             }
+            "script" => {
+                let Some(sid) = interacted else {
+                    return Outcome::Error("must 'interact' a session first".into());
+                };
+                if self.registry.get(&sid).await.is_none() {
+                    return Outcome::Error(format!("no session {}", sid));
+                }
+                if args.len() != 1 {
+                    return Outcome::Error("usage: script <file-path>".into());
+                }
+                let content = match std::fs::read_to_string(&args[0]) {
+                    Ok(c) => c,
+                    Err(e) => return Outcome::Error(format!("read {}: {}", args[0], e)),
+                };
+                let script = match nw_modules::Script::parse(&content) {
+                    Ok(s) => s,
+                    Err(e) => return Outcome::Error(format!("parse script: {}", e)),
+                };
+                let order = script.topo_sorted();
+                let mut queued = 0;
+                for step in &order {
+                    match self
+                        .queue
+                        .push(
+                            &sid,
+                            step.command.clone(),
+                            step.args.clone(),
+                            step.timeout_ms,
+                        )
+                        .await
+                    {
+                        Ok(_) => queued += 1,
+                        Err(e) => {
+                            return Outcome::Error(format!(
+                                "failed to queue step '{}' of '{}': {}",
+                                step.name, script.name, e
+                            ));
+                        }
+                    }
+                }
+                Outcome::Local {
+                    message: format!(
+                        "script '{}' queued {} step(s) to {}",
+                        script.name, queued, sid
+                    ),
+                }
+            }
+            "creds" => {
+                let Some(sid) = interacted else {
+                    return Outcome::Error("must 'interact' a session first".into());
+                };
+                if self.registry.get(&sid).await.is_none() {
+                    return Outcome::Error(format!("no session {}", sid));
+                }
+                if args.is_empty() {
+                    // List harvested credentials for this session.
+                    let list = self.creds.list(&sid.to_string()).await;
+                    if list.is_empty() {
+                        return Outcome::Local {
+                            message: "no credentials harvested for this session".into(),
+                        };
+                    }
+                    let body = list
+                        .iter()
+                        .map(|c| format!("{}  {}  {}", c.source, c.cred_type, c.id))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Outcome::Local { message: body };
+                }
+                match args[0].as_str() {
+                    "--all" => {
+                        if !self.operator.role.allows(Role::Admin) {
+                            return Outcome::Error("admin role required for --all".into());
+                        }
+                        let list = self.creds.list_all().await;
+                        if list.is_empty() {
+                            return Outcome::Local {
+                                message: "no credentials harvested".into(),
+                            };
+                        }
+                        let body = list
+                            .iter()
+                            .map(|c| {
+                                format!("{}  {}  session={}", c.source, c.cred_type, c.session_id)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        Outcome::Local { message: body }
+                    }
+                    "--harvest" => {
+                        match self
+                            .queue
+                            .push(&sid, "nw/creds".into(), vec![], 30_000)
+                            .await
+                        {
+                            Ok(task_id) => Outcome::TaskQueued {
+                                session: sid,
+                                task_id,
+                                role: self.operator.role,
+                            },
+                            Err(e) => Outcome::Error(e.to_string()),
+                        }
+                    }
+                    _ => Outcome::Error("usage: creds [--all | --harvest]".into()),
+                }
+            }
             "" => Outcome::Local {
                 message: String::new(),
             },
@@ -372,9 +482,8 @@ impl Dispatcher {
 fn required_role(command: &str) -> Option<Role> {
     match command {
         "sessions" | "interact" | "jobs" => Some(Role::Viewer),
-        "shell" | "redirect" | "download" | "upload" | "socks" | "hashes" | "killjob" | "kill" => {
-            Some(Role::Operator)
-        }
+        "shell" | "redirect" | "download" | "upload" | "socks" | "hashes" | "creds" | "script"
+        | "killjob" | "kill" => Some(Role::Operator),
         "" => None,
         _ => Some(Role::Viewer),
     }
@@ -391,6 +500,8 @@ fn action_name(command: &str) -> &'static str {
         "upload" => "task.upload",
         "socks" => "task.socks",
         "hashes" => "task.hashes",
+        "creds" => "cred.harvest",
+        "script" => "automation.run",
         "jobs" => "task.list",
         "killjob" => "task.cancel",
         _ => "command.unknown",
@@ -423,7 +534,11 @@ mod tests {
             username: "system".into(),
             role: crate::operators::Role::Admin,
         };
-        (Dispatcher::new(reg, q, UploadStore::default(), op), sid)
+        let empty_pool = crate::creds::CredentialStore::new_in_memory();
+        (
+            Dispatcher::new(reg, q, UploadStore::default(), Arc::new(empty_pool), op),
+            sid,
+        )
     }
 
     #[tokio::test]

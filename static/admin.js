@@ -11,12 +11,9 @@
   let buildDismissed = false;
 
   const entryAnims = () => {
-    if (typeof anime === "undefined") return;
-    const links = [...document.querySelectorAll(".primary-nav .nav-link")];
-    anime({ targets: document.querySelector(".portal-topbar"), translateY: [-14, 0], opacity: [0, 1], easing: "easeOutCubic", duration: 360 });
+    if (typeof anime === "undefined" || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     anime({ targets: document.querySelector(".page-heading"), translateY: [-10, 0], opacity: [0, 1], easing: "easeOutCubic", duration: 380, delay: 60 });
     anime({ targets: ".portal-main > :not(.page-heading)", translateY: [12, 0], opacity: [0, 1], easing: "easeOutCubic", duration: 420, delay: anime.stagger(40, { start: 110 }) });
-    anime({ targets: links, translateX: [-8, 0], opacity: [0, 1], easing: "easeOutCubic", duration: 320, delay: anime.stagger(26, { start: 100 }) });
   };
 
   const initMain = () => {
@@ -137,7 +134,119 @@
     window.addEventListener("scroll", syncTopbar, { passive: true });
   }
 
+  /* ── Callback detail page (Mythic-style) ────────────────────────────── */
+  const initCallbackSSE = () => {
+    const form = document.getElementById("task-form");
+    if (!form) return;
+
+    const sseEndpoint = form.dataset.sseEndpoint || null;
+    const logEl = document.getElementById("results-log");
+
+    // SSE connection for real-time task results.
+    if (sseEndpoint && logEl) {
+      const evtSource = new EventSource(sseEndpoint);
+      evtSource.addEventListener("message", (event) => {
+        const data = JSON.parse(event.data);
+        const entry = document.createElement("div");
+        entry.className = "entry";
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = `${data.command} - ${data.status} at ${data.completed_at}`;
+        const output = document.createElement("div");
+        output.className = "output";
+        output.textContent = data.output || "(no output)";
+        entry.append(meta, output);
+        logEl.prepend(entry);
+      });
+      evtSource.onerror = () => { /* silently reconnect */ };
+    }
+
+    // Auto-submit task form via fetch (Mythic-style: stay on page).
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const formData = new FormData(form);
+      const command = formData.get("command") || "";
+      const argsStr = formData.get("args") || "";
+      const args = argsStr ? argsStr.split(" ").filter((a) => a.trim()) : [];
+      const csrfToken = formData.get("csrf_token") || "";
+
+      try {
+        const res = await fetch(form.action, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": csrfToken,
+          },
+          body: JSON.stringify({ command, args, timeout_ms: 30000 }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        // Optimistically add the task to the results stream.
+        const resultsStream = document.querySelector(".results-stream");
+        if (resultsStream) {
+          const placeholder = document.createElement("div");
+          placeholder.className = "entry";
+          // data.command and data.status come from our own JSON API response (same-origin),
+          // not from raw user HTML — safe to set as text.
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.textContent = `${data.command} - ${data.status}`;
+          placeholder.appendChild(meta);
+          resultsStream.prepend(placeholder);
+        }
+      } catch (err) {
+        console.error("Task submission failed:", err);
+      }
+    });
+
+    // Refresh button reloads tasks.
+    const refreshBtn = document.getElementById("refresh-btn");
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", () => window.location.reload());
+    }
+  };
+
+  /* ── Command history (Mythic-style: up/down arrow in command input) ─── */
+  const initCommandHistory = () => {
+    const cmdInput = document.getElementById("command");
+    if (!cmdInput) return;
+    const history = [];
+    let historyIndex = -1;
+    cmdInput.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (historyIndex < history.length - 1) {
+          historyIndex++;
+          cmdInput.value = history[history.length - 1 - historyIndex] || "";
+        }
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (historyIndex > 0) {
+          historyIndex--;
+          cmdInput.value = history[history.length - 1 - historyIndex] || "";
+        } else if (historyIndex === 0) {
+          historyIndex = -1;
+          cmdInput.value = "";
+        }
+      }
+    });
+    // Capture submitted commands into history.
+    const form = cmdInput.closest("form");
+    if (form) {
+      form.addEventListener("submit", () => {
+        if (cmdInput.value.trim()) {
+          history.unshift(cmdInput.value);
+          if (history.length > 50) history.pop();
+          historyIndex = -1;
+        }
+      });
+    }
+  };
+
   initMain();
+  initCallbackSSE();
+  initCommandHistory();
   pollBuilds();
   entryAnims();
 })();

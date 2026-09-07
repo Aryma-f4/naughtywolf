@@ -1,4 +1,5 @@
 pub mod download;
+pub mod evasion;
 pub mod runner;
 pub mod runtime;
 pub mod socks5;

@@ -91,6 +91,23 @@ pub async fn init_schema(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS c2_creds (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES c2_sessions(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            cred_type TEXT NOT NULL,
+            data TEXT NOT NULL,
+            collected_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_c2_creds_session ON c2_creds(session_id)")
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 

@@ -22,6 +22,7 @@ pub async fn serve_dns(
         psk: Arc::new(psk),
         files: crate::filestore::FileStore::default(),
         uploads: crate::uploadstore::UploadStore::default(),
+        creds: Arc::new(crate::creds::CredentialStore::new_in_memory()),
     };
     let sock = Arc::new(tokio::net::UdpSocket::bind(&bind).await?);
     tracing::info!(bind, "c2 dns listener up");

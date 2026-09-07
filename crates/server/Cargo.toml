@@ -21,6 +21,7 @@ argon2.workspace = true
 async-trait = { workspace = true }
 futures = { workspace = true }
 chrono.workspace = true
+nw-modules = { path = "../modules" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

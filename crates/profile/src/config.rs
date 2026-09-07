@@ -1,5 +1,5 @@
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 
 use crate::crypto;
 
@@ -67,10 +67,7 @@ fn random_key() -> [u8; crypto::KEY_LEN] {
 }
 
 fn xor(a: &[u8], b: &[u8]) -> Vec<u8> {
-    a.iter()
-        .zip(b.iter().cycle())
-        .map(|(x, y)| x ^ y)
-        .collect()
+    a.iter().zip(b.iter().cycle()).map(|(x, y)| x ^ y).collect()
 }
 
 #[cfg(test)]

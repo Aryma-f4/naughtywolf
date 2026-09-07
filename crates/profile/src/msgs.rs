@@ -102,7 +102,12 @@ mod tests {
 
     #[test]
     fn messages_serialize() {
-        let t = Task { id: Uuid::new_v4(), command: "whoami".into(), args: vec![], timeout_ms: 1000 };
+        let t = Task {
+            id: Uuid::new_v4(),
+            command: "whoami".into(),
+            args: vec![],
+            timeout_ms: 1000,
+        };
         let j = serde_json::to_string(&t).unwrap();
         let back: Task = serde_json::from_str(&j).unwrap();
         assert_eq!(back.command, "whoami");

@@ -211,10 +211,7 @@ mod tests {
 
     #[test]
     fn query_and_txt_response_round_trip() {
-        let qname = vec![
-            base32_encode(b"hello-world"),
-            "nwc2".to_string(),
-        ];
+        let qname = vec![base32_encode(b"hello-world"), "nwc2".to_string()];
         let resp = encode_txt_response(99, &qname, &base32_encode(b"reply-data"));
         let (id, labels) = parse_query(&resp).unwrap();
         assert_eq!(id, 99);
@@ -238,7 +235,11 @@ mod tests {
         // Simulate a register: ~500-byte envelope -> base32 -> many 63-byte labels.
         let payload: Vec<u8> = (0..500u32).map(|i| (i % 251) as u8).collect();
         let b32 = base32_encode(&payload);
-        let mut labels = b32.as_bytes().chunks(63).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>();
+        let mut labels = b32
+            .as_bytes()
+            .chunks(63)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>();
         labels.push(MARKER.to_string());
 
         let reply_payload: Vec<u8> = (0..200u32).map(|i| (i % 97) as u8).collect();

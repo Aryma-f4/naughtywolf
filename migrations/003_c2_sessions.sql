@@ -21,7 +21,12 @@ CREATE TABLE IF NOT EXISTS c2_tasks (
     command TEXT NOT NULL,
     args_json TEXT NOT NULL,
     timeout_ms INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'completed')) DEFAULT 'pending',
+    status TEXT NOT NULL CHECK (status IN ('pending', 'delivering', 'delivered', 'processing', 'completed', 'error')) DEFAULT 'pending',
+    processing_at TEXT,
+    completed_at TEXT,
+    result_output TEXT,
+    result_ok INTEGER,
+    result_exit_code INTEGER,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -33,6 +38,9 @@ CREATE TABLE IF NOT EXISTS c2_task_results (
     exit_code INTEGER NOT NULL,
     completed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_c2_tasks_session ON c2_tasks(session_id);
+CREATE INDEX IF NOT EXISTS idx_c2_tasks_status ON c2_tasks(status);
 
 CREATE TABLE IF NOT EXISTS c2_operators (
     id TEXT PRIMARY KEY,

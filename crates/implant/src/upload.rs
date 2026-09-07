@@ -28,8 +28,17 @@ impl Upload {
             .append(true)
             .open(dest)
             .map_err(|e| format!("open {dest:?}: {e}"))?;
-        let received = file.metadata().map_err(|e| format!("stat {dest:?}: {e}"))?.len();
-        Ok(Upload { file, dest: dest.to_string(), size: received, received, task_id })
+        let received = file
+            .metadata()
+            .map_err(|e| format!("stat {dest:?}: {e}"))?
+            .len();
+        Ok(Upload {
+            file,
+            dest: dest.to_string(),
+            size: received,
+            received,
+            task_id,
+        })
     }
 
     pub fn task_id(&self) -> Uuid {
@@ -64,7 +73,11 @@ impl Upload {
         if end > self.received {
             self.received = end;
         }
-        FileAck { received: self.received, total: self.size, done: self.received >= self.size }
+        FileAck {
+            received: self.received,
+            total: self.size,
+            done: self.received >= self.size,
+        }
     }
 
     pub fn done(&self) -> bool {

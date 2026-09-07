@@ -1,5 +1,5 @@
 use axum::{
-    Extension, Form, Router,
+    Extension, Form, Json, Router,
     extract::{FromRequest, Path, Query, Request, State},
     http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
@@ -108,7 +108,10 @@ pub fn authenticated_router() -> Router<Repository> {
         .route("/payloads/edit/{file}", get(edit_payload))
         .route("/payloads/download/{file}", get(download_payload))
         .route("/callbacks", get(callbacks))
+        .route("/callbacks/{session_id}", get(callback_detail))
+        .route("/c2/sessions/{session_id}/tasks", get(tasks_json))
         .route("/eventing", get(eventing).post(create_event_rule))
+        .route("/events", get(events_feed))
         .route("/services", get(services))
         .route("/search", get(search))
         .route(
@@ -457,7 +460,13 @@ async fn payloads(
     let building = crate::payload::building_jobs();
     let errors = crate::payload::recent_errors();
     Ok(Html(templates::payloads_page(
-        &user, &builds, &csrf_token, None, None, &building, &errors,
+        &user,
+        &builds,
+        &csrf_token,
+        None,
+        None,
+        &building,
+        &errors,
     )))
 }
 
@@ -544,7 +553,13 @@ async fn edit_payload(
     let building = crate::payload::building_jobs();
     let errors = crate::payload::recent_errors();
     Ok(Html(templates::payloads_page(
-        &user, &builds, &csrf_token, None, editor.as_ref(), &building, &errors,
+        &user,
+        &builds,
+        &csrf_token,
+        None,
+        editor.as_ref(),
+        &building,
+        &errors,
     )))
 }
 
@@ -585,6 +600,78 @@ async fn callbacks(
     Ok(Html(templates::callbacks_page(&user, &callbacks)))
 }
 
+/// Mythic-style callback detail/interact page.
+/// Shows callback metadata, a tasking panel, and a task history table.
+/// Task results stream in real-time via SSE on the companion endpoint.
+async fn callback_detail(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(session_id): Path<String>,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Operator)?;
+    let callback = repository
+        .find_callback(&session_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let tasks = repository
+        .list_tasks_for_session(&session_id)
+        .await
+        .unwrap_or_default();
+    let csrf_token = Uuid::new_v4().to_string();
+    Ok(Html(templates::callback_detail_page(
+        &user,
+        &callback,
+        &tasks,
+        &csrf_token,
+    )))
+}
+
+/// JSON API for listing tasks for a callback session.
+async fn tasks_json(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    user.require(Role::Operator)?;
+    let tasks = repository
+        .list_tasks_for_session(&session_id)
+        .await
+        .unwrap_or_default();
+    let arr: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|t| {
+            let (label, cls) = crate::db::models::TaskStatus::label_class_from_str(&t.status);
+            serde_json::json!({
+                "id": t.id,
+                "command": t.command,
+                "args": t.args_json,
+                "status": t.status,
+                "state_label": label,
+                "state_class": cls,
+                "created_at": t.created_at,
+                "processing_at": t.processing_at,
+                "completed_at": t.completed_at,
+                "result_output": t.result_output,
+                "result_ok": t.result_ok,
+                "result_exit_code": t.result_exit_code,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "tasks": arr })))
+}
+
+/// Mythic-style event feed page showing operation-wide audit events.
+async fn events_feed(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    user.require(Role::Operator)?;
+    let events = repository
+        .list_audit_events_visible_to(&user.id, user.role == Role::Admin)
+        .await?;
+    Ok(Html(templates::event_feed_page(&user, &events)))
+}
+
 async fn eventing(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repository): State<Repository>,
@@ -593,7 +680,12 @@ async fn eventing(
     user.require(Role::Operator)?;
     let csrf_token = issue_csrf_token(&session).await?;
     let rules = repository.list_event_rules().await?;
-    Ok(Html(templates::eventing_page(&user, &rules, &csrf_token, None)))
+    Ok(Html(templates::eventing_page(
+        &user,
+        &rules,
+        &csrf_token,
+        None,
+    )))
 }
 
 async fn create_event_rule(
@@ -641,7 +733,11 @@ async fn create_event_rule(
             form.name.trim(),
             form.trigger.trim(),
             form.command.trim(),
-            if form.target.is_empty() { "all" } else { form.target.trim() },
+            if form.target.is_empty() {
+                "all"
+            } else {
+                form.target.trim()
+            },
             &user.id,
             &Uuid::new_v4().to_string(),
         )
@@ -674,7 +770,11 @@ async fn search(
         .search_portal(&user.id, user.role == Role::Admin, &query)
         .await?;
     Ok(Html(templates::search_page(
-        &user, &query, &operations, &assets, &callbacks,
+        &user,
+        &query,
+        &operations,
+        &assets,
+        &callbacks,
     )))
 }
 

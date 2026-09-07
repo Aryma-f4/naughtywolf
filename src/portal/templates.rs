@@ -2,14 +2,15 @@ use crate::{
     auth::{AuthenticatedUser, rbac::Role},
     db::{
         models::{
-            Asset, AuditEvent, Callback, CallbackStatus, CheckRun, EventRule, Evidence,
-            InstalledService, Operation, OperationStatus, RunState,
+            Asset, AuditEvent, C2TaskWithResult, Callback, CallbackStatus, CheckRun, EventRule,
+            Evidence, InstalledService, Operation, OperationStatus, RunState,
         },
         repositories::PortalUser,
     },
     payload::{BuildJob, PayloadMeta},
     portal::{DashboardSummary, OperationReportSummary},
 };
+use base64::Engine;
 
 pub fn public_landing() -> String {
     page_shell(
@@ -30,7 +31,15 @@ pub fn login_page(error: Option<&str>, csrf_token: &str) -> String {
         .unwrap_or_default();
 
     let content = format!(
-        r#"<main class="login-shell"><section class="login-brand-panel" aria-labelledby="login-brand-title"><div class="brand-lockup"><span class="brand-mark" aria-hidden="true">NW</span><span class="brand-name"><strong>NaughtyWolf</strong><small>Operator Portal</small></span></div><div class="login-brand-copy"><p class="eyebrow">Authorized Operations Workspace</p><h1 id="login-brand-title">Operate with scope, evidence, and accountability.</h1><p>Manage authorized lab records from one local control surface.</p></div><ul class="trust-list" aria-label="Portal capabilities"><li>Scoped operations</li><li>Append-only audit</li><li>Verified evidence</li></ul></section><section class="login-form-panel" aria-labelledby="login-title"><form class="login-card" method="post" action="/login"><p class="eyebrow">Local operator access</p><h2 id="login-title">Sign in</h2><p class="login-intro">Use your assigned local account.</p>{error}<input type="hidden" name="csrf_token" value="{csrf_token}"><div class="form-field"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required></div><div class="form-field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required></div><button class="primary-action" type="submit">Enter workspace</button><p class="login-guardrail">Authorized lab access only</p></form></section></main>"#,
+        r#"<main class="login-shell">
+<section class="login-brand-panel" aria-labelledby="login-brand-title">
+  <div class="brand-lockup"><span class="brand-mark" aria-hidden="true">{wolf}</span><span class="brand-name"><strong>naughtywolf<span class="brand-period">.</span></strong><small>Independent by instinct</small></span></div>
+  <div class="login-brand-copy"><p class="eyebrow">THE OPERATOR'S FIELDNOTES / 001</p><h1 id="login-brand-title">A sharper<br>instinct.<br><em>A clearer view.</em></h1><p>Your operations, evidence, and every detail in between.<br>One focused space to see the whole picture.</p></div>
+  <div class="login-orbit" aria-hidden="true"><span></span><span></span><span></span><div>{wolf}</div><small>OBSERVE · CONNECT · DOCUMENT</small></div>
+  <ul class="trust-list" aria-label="Portal capabilities"><li>01 / Scoped operations</li><li>02 / Verified evidence</li><li>03 / Traceable actions</li></ul>
+</section>
+<section class="login-form-panel" aria-labelledby="login-title"><div class="login-access-note"><span class="status-dot"></span> LOCAL WORKSPACE <span>NW / ACCESS</span></div><form class="login-card" method="post" action="/login"><span class="login-index" aria-hidden="true">[ 01 — ACCESS ]</span><p class="eyebrow">Good to have you back</p><h2 id="login-title">Find your focus.</h2><p class="login-intro">Sign in to your operator workspace.</p>{error}<input type="hidden" name="csrf_token" value="{csrf_token}"><div class="form-field"><label for="username">Username</label><input id="username" name="username" autocomplete="username" placeholder="Your operator name" required></div><div class="form-field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required></div><button class="primary-action" type="submit">Enter workspace <span aria-hidden="true">↗</span></button><p class="login-guardrail">Authorized lab access only</p></form><div class="login-footer"><span>NAUGHTYWOLF / OPERATOR PORTAL</span><span>Stay curious. Stay in scope.</span></div></section></main>"#,
+        wolf = wolf_mark(),
         error = error,
         csrf_token = escape_html(csrf_token),
     );
@@ -60,7 +69,10 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
         ),
         (
             "Automation",
-            vec![("eventing", "/eventing", "Eventing")],
+            vec![
+                ("eventing", "/eventing", "Eventing"),
+                ("events", "/events", "Event Feed"),
+            ],
         ),
         (
             "System",
@@ -73,12 +85,17 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
     ];
 
     // Role-gate operator-only and admin-only navigation links.
-    let operator_only = ["callbacks", "services", "eventing", "search", "payloads"];
+    let operator_only = [
+        "callbacks",
+        "services",
+        "eventing",
+        "events",
+        "search",
+        "payloads",
+    ];
     if !user.role.allows(Role::Operator) {
         for group in groups.iter_mut() {
-            group
-                .1
-                .retain(|(name, _, _)| !operator_only.contains(name));
+            group.1.retain(|(name, _, _)| !operator_only.contains(name));
         }
     }
     if user.role != Role::Admin {
@@ -91,6 +108,7 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
     let quick_links = [
         ("dashboard", "/dashboard", "Dashboard"),
         ("callbacks", "/callbacks", "Callbacks"),
+        ("events", "/events", "Events"),
         ("payloads", "/payloads", "Payloads"),
         ("search", "/search", "Search"),
     ]
@@ -101,7 +119,7 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
             .then_some(" aria-current=\"page\"")
             .unwrap_or("");
         format!(
-            "<a class=\"quick-link\" href=\"{href}\"{current}><span class=\"material-symbols-outlined nav-icon\" aria-hidden=\"true\">{}</span><span>{label}</span></a>",
+            "<a class=\"quick-link\" href=\"{href}\"{current}><span class=\"nav-icon\" aria-hidden=\"true\">{}</span><span>{label}</span></a>",
             nav_icon(name),
         )
     })
@@ -117,7 +135,7 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
                         .then_some(" aria-current=\"page\"")
                         .unwrap_or("");
                     format!(
-                        "<a class=\"nav-link\" href=\"{href}\"{current}><span class=\"material-symbols-outlined nav-icon\" aria-hidden=\"true\">{}</span><span class=\"nav-label\">{label}</span></a>",
+                        "<a class=\"nav-link\" href=\"{href}\"{current}><span class=\"nav-icon\" aria-hidden=\"true\">{}</span><span class=\"nav-label\">{label}</span></a>",
                         nav_icon(name),
                     )
                 })
@@ -133,7 +151,28 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
         title,
         APP_ASSETS,
         &format!(
-            r##"<div class="portal-shell"><a class="skip-link" href="#main-content">Skip to main content</a><header class="portal-topbar" data-topbar><a class="portal-brand" href="/dashboard"><span class="brand-mark" aria-hidden="true">NW</span><span class="brand-name"><strong>NaughtyWolf</strong><small>Operator Console</small></span></a><nav class="topbar-quick" aria-label="Quick access">{quick_links}</nav><div class="operator-identity"><span class="operator-name">{username}</span><span class="role-badge">{role}</span><form method="post" action="/logout"><button class="logout-button" type="submit">Sign out</button></form></div></header><nav class="primary-nav" aria-label="Primary navigation" data-primary-nav>{nav}</nav><main id="main-content" class="portal-main"><div class="page-heading"><p class="eyebrow">Authorized workspace</p><h1>{title}</h1></div>{body}</main></div>"##,
+            r##"<div class="portal-shell"><a class="skip-link" href="#main-content">Skip to main content</a><header class="portal-topbar" data-topbar><a class="portal-brand" href="/dashboard"><span class="brand-mark" aria-hidden="true">{wolf}</span><span class="brand-name"><strong>naughtywolf<span class="brand-period">.</span></strong><small>Operator fieldnotes</small></span></a><nav class="topbar-quick" aria-label="Quick access">{quick_links}</nav><div class="operator-identity"><span class="operator-avatar" aria-hidden="true">{initial}</span><span class="operator-name">{username}</span><span class="role-badge">{role}</span><form method="post" action="/logout"><button class="logout-button" type="submit">Sign out <span aria-hidden="true">↗</span></button></form></div></header><nav class="primary-nav" aria-label="Primary navigation" data-primary-nav><div class="nav-workspace"><span class="workspace-symbol" aria-hidden="true">N / W</span><div><strong>Local workspace</strong><small>Scoped by design</small></div></div>{nav}<div class="nav-footnote"><span class="eyebrow">A sharper instinct.</span><p>Observe carefully.<br>Leave a clear record.</p><span class="nav-edition">NW — FIELD EDITION 01</span></div></nav><main id="main-content" class="portal-main"><div class="page-heading"><div><p class="eyebrow">Workspace <span aria-hidden="true">/</span> {title}</p><h1>{heading}</h1><p class="page-description">{description}</p></div><span class="page-stamp">{stamp}</span></div>{body}<footer class="workspace-footer"><span>NAUGHTYWOLF<span class="brand-period">.</span> <span class="footer-divider">/</span> OPERATOR FIELDNOTES</span><span>Made for the details.</span></footer></main></div>"##,
+            wolf = wolf_mark(),
+            initial = escape_html(
+                &user
+                    .username
+                    .chars()
+                    .next()
+                    .unwrap_or('N')
+                    .to_uppercase()
+                    .to_string()
+            ),
+            heading = if active_nav == "dashboard" {
+                "The overview.".to_owned()
+            } else {
+                escape_html(title)
+            },
+            description = page_description(active_nav),
+            stamp = if active_nav == "dashboard" {
+                "01 / OBSERVE"
+            } else {
+                "NW / FIELDNOTES"
+            },
             username = escape_html(&user.username),
             role = escape_html(&user.role.to_string()),
             title = escape_html(title),
@@ -144,17 +183,38 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
 }
 
 pub fn dashboard_page(user: &AuthenticatedUser, summary: &DashboardSummary) -> String {
+    let metrics = [
+        ("Operations", summary.operation_count, "Authorized lab operations", "/operations", "operations"),
+        ("Assets", summary.asset_count, "Scoped targets", "/inventory", "inventory"),
+        ("Check runs", summary.run_count, "Executed checks", "/checks", "checks"),
+        ("Evidence", summary.evidence_count, "Stored artifacts", "/evidence", "evidence"),
+        ("Audit records", summary.audit_count, "Append-only events", "/audit", "audit"),
+    ].iter().enumerate().map(|(i, (label, count, note, href, icon))| format!(
+        r#"<article class="metric-card"><div class="metric-top"><span class="nav-icon" aria-hidden="true">{}</span><span class="metric-index">0{}</span></div><span>{label}</span><strong>{count}</strong><small>{note}</small><a class="metric-link" href="{href}" aria-label="View {label}"><span aria-hidden="true">↗</span></a></article>"#,
+        nav_icon(icon), i + 1,
+    )).collect::<String>();
+    let first_action = if user.role == Role::Admin {
+        r#"<a class="button" href="/operations/new">Create operation <span aria-hidden="true">↗</span></a>"#
+    } else {
+        r#"<a class="button" href="/operations">Explore operations <span aria-hidden="true">↗</span></a>"#
+    };
+    let scope_note = if summary.operation_count == 0 {
+        "A clean slate. Your next operation starts here."
+    } else {
+        "Every operation has a story. Keep the details connected."
+    };
     app_page(
         "Dashboard",
         user,
         "dashboard",
         &format!(
-            "<section class=\"metric-grid\" aria-label=\"Scoped summary\"><article class=\"metric-card\"><span>Operations</span><strong>{}</strong><small>Authorized lab operations</small></article><article class=\"metric-card\"><span>Assets</span><strong>{}</strong><small>Scoped targets</small></article><article class=\"metric-card\"><span>Check runs</span><strong>{}</strong><small>Executed checks</small></article><article class=\"metric-card\"><span>Evidence</span><strong>{}</strong><small>Stored artifacts</small></article><article class=\"metric-card\"><span>Audit records</span><strong>{}</strong><small>Append-only events</small></article></section>",
-            summary.operation_count,
-            summary.asset_count,
-            summary.run_count,
-            summary.evidence_count,
-            summary.audit_count,
+            r#"<section class="overview-hero" aria-labelledby="overview-title"><div class="hero-copy"><p class="eyebrow"><span class="status-dot"></span> YOUR WORKSPACE, IN FOCUS</p><h2 id="overview-title">See the whole picture.<br><em>Follow every detail.</em></h2><p>{scope_note}</p><div class="hero-actions">{first_action}<a class="text-action" href="/reports">Open reports <span aria-hidden="true">↗</span></a></div></div><div class="scope-orbit" aria-hidden="true"><div class="orbit-ring orbit-ring-outer"></div><div class="orbit-ring orbit-ring-middle"></div><div class="orbit-ring orbit-ring-inner"></div><div class="orbit-cross orbit-cross-h"></div><div class="orbit-cross orbit-cross-v"></div><div class="orbit-core">{wolf}</div><span class="orbit-point point-one"></span><span class="orbit-point point-two"></span><span class="orbit-label orbit-label-top">01 / SCOPE</span><span class="orbit-label orbit-label-bottom">02 / EVIDENCE</span><span class="orbit-coordinate">NW · ALL DETAILS CONNECTED</span></div></section>
+        <div class="section-heading"><h2>By the numbers<span class="muted"> /</span></h2><span>RECORDS VISIBLE TO YOU</span></div><section class="metric-grid" aria-label="Scoped summary">{metrics}</section>
+        <div class="overview-bottom"><section class="field-map panel" aria-labelledby="field-map-title"><div class="section-heading"><h2 id="field-map-title">A connected workflow</h2><span>01 → 03</span></div><p class="section-intro">From a defined scope to a record you can stand behind.</p><div class="workflow-steps"><a href="/operations"><span class="step-index">01 / DEFINE</span><span class="step-symbol" aria-hidden="true">{scope_icon}</span><h3>Set the scope.</h3><p>Give each operation a clear purpose and boundary.</p><span class="step-link">View operations ↗</span></a><a href="/inventory"><span class="step-index">02 / OBSERVE</span><span class="step-symbol" aria-hidden="true">{asset_icon}</span><h3>Know the details.</h3><p>Keep your assets and check history in context.</p><span class="step-link">Explore assets ↗</span></a><a href="/evidence"><span class="step-index">03 / DOCUMENT</span><span class="step-symbol" aria-hidden="true">{evidence_icon}</span><h3>Leave a record.</h3><p>Bring the evidence together for your next report.</p><span class="step-link">Review evidence ↗</span></a></div></section><aside class="field-note"><span class="eyebrow">THE FIELD NOTE / 001</span><span class="note-asterisk" aria-hidden="true">✳</span><h2>Good work.<br>Clear evidence.</h2><p>The strongest finding is the one you can trace. Keep your scope intentional and your records complete.</p><a href="/audit">Follow the audit trail <span aria-hidden="true">↗</span></a><span class="note-bottom">STAY CURIOUS. STAY IN SCOPE.</span></aside></div>"#,
+            wolf = wolf_mark(),
+            scope_icon = nav_icon("operations"),
+            asset_icon = nav_icon("inventory"),
+            evidence_icon = nav_icon("evidence"),
         ),
     )
 }
@@ -428,11 +488,36 @@ fn current_arch_label() -> String {
 /// (target-triple, label, os, arch). Empty triple = host-native build.
 const PLATFORMS: &[(&str, &str, &str, &str)] = &[
     ("", "This computer (native)", "current", "current"),
-    ("x86_64-unknown-linux-musl", "Linux x86-64 (musl)", "linux", "amd64"),
-    ("x86_64-unknown-linux-gnu", "Linux x86-64 (glibc)", "linux", "amd64"),
-    ("aarch64-unknown-linux-musl", "Linux ARM64 (musl)", "linux", "arm64"),
-    ("x86_64-pc-windows-gnu", "Windows x86-64", "windows", "amd64"),
-    ("aarch64-apple-darwin", "macOS Apple Silicon", "macos", "arm64"),
+    (
+        "x86_64-unknown-linux-musl",
+        "Linux x86-64 (musl)",
+        "linux",
+        "amd64",
+    ),
+    (
+        "x86_64-unknown-linux-gnu",
+        "Linux x86-64 (glibc)",
+        "linux",
+        "amd64",
+    ),
+    (
+        "aarch64-unknown-linux-musl",
+        "Linux ARM64 (musl)",
+        "linux",
+        "arm64",
+    ),
+    (
+        "x86_64-pc-windows-gnu",
+        "Windows x86-64",
+        "windows",
+        "amd64",
+    ),
+    (
+        "aarch64-apple-darwin",
+        "macOS Apple Silicon",
+        "macos",
+        "arm64",
+    ),
     ("x86_64-apple-darwin", "macOS Intel", "macos", "amd64"),
 ];
 
@@ -490,7 +575,17 @@ pub fn payloads_page(
         .map(|j| {
             format!(
                 "<li>{}</li>",
-                escape_html(&format!("{} ({}/{}, {})", j.name, j.os, j.arch, if j.target.is_empty() { "native".into() } else { j.target.clone() }))
+                escape_html(&format!(
+                    "{} ({}/{}, {})",
+                    j.name,
+                    j.os,
+                    j.arch,
+                    if j.target.is_empty() {
+                        "native".into()
+                    } else {
+                        j.target.clone()
+                    }
+                ))
             )
         })
         .collect::<String>();
@@ -548,11 +643,12 @@ pub fn payloads_page(
             )
         })
         .collect::<String>();
-    let visible_platform = if f_target.is_empty() && f_os == current_os() && f_arch == current_arch_label() {
-        "current".into()
-    } else {
-        format!("{}/{}", f_os, f_arch)
-    };
+    let visible_platform =
+        if f_target.is_empty() && f_os == current_os() && f_arch == current_arch_label() {
+            "current".into()
+        } else {
+            format!("{}/{}", f_os, f_arch)
+        };
 
     let protocol_options = [
         ("http", "HTTP"),
@@ -580,10 +676,156 @@ pub fn payloads_page(
         f_os = escape_html(&f_os),
         f_arch = escape_html(&f_arch),
         f_target = escape_html(&f_target),
-        btn_label = if editor.is_some() { "Recompile implant" } else { "Build implant" },
+        btn_label = if editor.is_some() {
+            "Recompile implant"
+        } else {
+            "Build implant"
+        },
         protocol_options = protocol_options,
     );
     app_page("Payloads", user, "payloads", &body)
+}
+
+/// Mythic-style callback detail / interact page.
+/// Features a tasking panel (command input + tab completion), task history
+/// table with color-coded Mythic-style status pills, and SSE-powered
+/// real-time task result streaming.
+pub fn callback_detail_page(
+    user: &AuthenticatedUser,
+    callback: &Callback,
+    tasks: &[C2TaskWithResult],
+    csrf_token: &str,
+) -> String {
+    // Build task history rows with Mythic-style status pills.
+    let rows = if tasks.is_empty() {
+        "<section class=\"empty-state panel\"><p>No task history yet. Submit a command below.</p></section>".to_owned()
+    } else {
+        let mut out = String::new();
+        for t in tasks {
+            let (label, cls) = crate::db::models::TaskStatus::label_class_from_str(&t.status);
+            let state_pill = format!(
+                "<span class=\"status-pill status-{cls}\">{}</span>",
+                escape_html(label)
+            );
+            let output_display = if let Some(ref out_text) = t.result_output {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(out_text)
+                    .unwrap_or_default();
+                escape_html(&String::from_utf8_lossy(&decoded))
+            } else {
+                "<span class=\"muted\">—</span>".to_owned()
+            };
+            out.push_str(&format!(
+                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&t.id[..t.id.len().min(8)]),
+                escape_html(&t.command),
+                state_pill,
+                escape_html(&t.created_at),
+                output_display,
+            ));
+        }
+        format!(
+            "<div class=\"table-scroll\"><table class=\"data-table task-history\"><caption>Task history</caption><thead><tr><th scope=\"col\">Task ID</th><th scope=\"col\">Command</th><th scope=\"col\">State</th><th scope=\"col\">Submitted</th><th scope=\"col\">Output</th></tr></thead><tbody>{out}</tbody></table></div>"
+        )
+    };
+
+    // Command suggestions for the input <datalist>.
+    let suggestions = [
+        "ls",
+        "pwd",
+        "whoami",
+        "hostname",
+        "env",
+        "netstat",
+        "ifconfig",
+        "id",
+        "ps",
+        "cat /etc/passwd",
+        "curl",
+        "wget",
+        "bash",
+        "zsh",
+    ];
+    let suggestions_html: String = suggestions
+        .iter()
+        .map(|cmd| {
+            format!(
+                "<option value=\"{}\">{}</option>",
+                escape_html(cmd),
+                escape_html(cmd)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let callback_detail = format!(
+        "<div class=\"callback-header\"><div class=\"callback-meta\"><h2>{}</h2><p class=\"muted\">{}@{} &mdash; {} {}</p></div>{}</div>",
+        escape_html(&callback.host),
+        escape_html(&callback.user_name),
+        escape_html(&callback.host),
+        escape_html(&callback.os),
+        escape_html(&callback.arch),
+        {
+            let (label, cls) = callback_status(callback.status);
+            format!("<span class=\"status-pill status-{cls}\">{}</span>", label)
+        }
+    );
+
+    let tasking_panel = format!(
+        "<div class=\"panel tasking-panel\"><h3>Task This Callback</h3>
+        <form id=\"task-form\" action=\"/c2/sessions/{}/tasks\" method=\"POST\" data-sse-endpoint=\"/c2/sessions/{}/tasks/sse\">
+            <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">
+            <div class=\"field-group\">
+                <label for=\"command\">Command</label>
+                <input list=\"command-suggestions\" type=\"text\" id=\"command\" name=\"command\" autocomplete=\"off\" placeholder=\"e.g. whoami\" required>
+                <datalist id=\"command-suggestions\">{}</datalist>
+            </div>
+            <div class=\"field-group\">
+                <label for=\"args\">Arguments</label>
+                <input type=\"text\" id=\"args\" name=\"args\" placeholder=\"optional\">
+            </div>
+            <div class=\"form-actions\">
+                <button type=\"submit\" class=\"btn btn-primary\">Execute &rarr;</button>
+                <button type=\"button\" id=\"refresh-btn\" class=\"btn btn-ghost\">Refresh</button>
+            </div>
+        </form></div>",
+        &callback.id, &callback.id, escape_html(csrf_token), suggestions_html
+    );
+
+    let content = format!(
+        "<div class=\"callback-detail-shell\">{}{}
+        <div id=\"task-results\" class=\"panel results-stream\"><h3>Task Results <span class=\"muted\">(live)</span></h3>
+        <div id=\"results-log\" class=\"results-log\"></div></div>
+        {}</div>",
+        callback_detail, tasking_panel, rows
+    );
+
+    app_page("Callback Interact", user, "callbacks", &content)
+}
+
+/// Mythic-style event feed page — operation-wide audit events with chat input.
+pub fn event_feed_page(user: &AuthenticatedUser, events: &[AuditEvent]) -> String {
+    let rows = if events.is_empty() {
+        "<section class=\"empty-state panel\"><p>No events yet.</p></section>".to_owned()
+    } else {
+        format!(
+            "<div class=\"table-scroll\"><table class=\"data-table\"><caption>Recent events</caption><thead><tr><th scope=\"col\">Time</th><th scope=\"col\">Actor</th><th scope=\"col\">Action</th><th scope=\"col\">Outcome</th></tr></thead><tbody>{}</tbody></table></div>",
+            events
+                .iter()
+                .map(|e| format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape_html(&e.created_at),
+                    escape_html(&e.actor_id.clone().unwrap_or_default()),
+                    escape_html(&e.action),
+                    escape_html(&e.outcome)
+                ))
+                .collect::<String>()
+        )
+    };
+    let chat = "<div class=\"panel\"><h3>Event Feed</h3><div class=\"chat-input\"><input type=\"text\" placeholder=\"Type a note...\" disabled><button class=\"btn btn-ghost\" disabled>Send</button></div></div>";
+    let _content = format!("<div class=\"event-feed-shell\">{}</div>", chat);
+    let _ = rows; // rows would go in the main panel
+    app_page("Event Feed", user, "events", &format!("{}{}", chat, rows))
 }
 
 pub fn callbacks_page(user: &AuthenticatedUser, callbacks: &[Callback]) -> String {
@@ -593,7 +835,7 @@ pub fn callbacks_page(user: &AuthenticatedUser, callbacks: &[Callback]) -> Strin
             let (status_label, status_class) = callback_status(c.status);
             let status = status_pill(status_label, status_class);
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/callbacks/{}\" class=\"btn btn-sm btn-ghost\">Interact &rarr;</a></td></tr>",
                 escape_html(&c.host),
                 escape_html(&c.user_name),
                 escape_html(&c.process),
@@ -601,8 +843,9 @@ pub fn callbacks_page(user: &AuthenticatedUser, callbacks: &[Callback]) -> Strin
                 escape_html(&c.protocol),
                 status,
                 escape_html(&c.last_seen),
-                c.operation_id.as_deref().map(|id| format!("<code>{}</code>", escape_html(&id[..id.len().min(8)]))).unwrap_or_else(|| "—".into()),
+                c.operation_id.as_deref().map(|id| format!("<code>{}</code>", escape_html(&id[..id.len().min(8)]))).unwrap_or_else(|| "&mdash;".into()),
                 escape_html(&c.created_at),
+                escape_html(&c.id),
             )
         })
         .collect::<String>();
@@ -610,10 +853,15 @@ pub fn callbacks_page(user: &AuthenticatedUser, callbacks: &[Callback]) -> Strin
         "<section class=\"empty-state panel\"><p>No callbacks yet. Build a payload and run the implant to see beacons here.</p></section>".to_owned()
     } else {
         format!(
-            "<div class=\"table-scroll\"><table class=\"data-table callbacks-table\"><caption>Active callbacks</caption><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">User</th><th scope=\"col\">Process</th><th scope=\"col\">OS/Arch</th><th scope=\"col\">Proto</th><th scope=\"col\">Status</th><th scope=\"col\">Last seen</th><th scope=\"col\">Op</th><th scope=\"col\">First seen</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<div class=\"table-scroll\"><table class=\"data-table callbacks-table\"><caption>Active callbacks</caption><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">User</th><th scope=\"col\">Process</th><th scope=\"col\">OS/Arch</th><th scope=\"col\">Proto</th><th scope=\"col\">Status</th><th scope=\"col\">Last seen</th><th scope=\"col\">Op</th><th scope=\"col\">First seen</th><th scope=\"col\">Actions</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
-    app_page("Callbacks", user, "callbacks", &format!("<p>Inbound C2 sessions and beacons.</p>{table}"))
+    app_page(
+        "Callbacks",
+        user,
+        "callbacks",
+        &format!("<p>Inbound C2 sessions and beacons.</p>{table}"),
+    )
 }
 
 pub fn eventing_page(
@@ -677,13 +925,19 @@ pub fn services_page(user: &AuthenticatedUser, services: &[InstalledService]) ->
         })
         .collect::<String>();
     let table = if services.is_empty() {
-        "<section class=\"empty-state panel\"><p>No installed services reported yet.</p></section>".to_owned()
+        "<section class=\"empty-state panel\"><p>No installed services reported yet.</p></section>"
+            .to_owned()
     } else {
         format!(
             "<div class=\"table-scroll\"><table class=\"data-table services-table\"><caption>Installed services</caption><thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Install path</th><th scope=\"col\">State</th><th scope=\"col\">Started</th><th scope=\"col\">Asset</th><th scope=\"col\">Created</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
-    app_page("Services", user, "services", &format!("<p>Persistence services installed across targets.</p>{table}"))
+    app_page(
+        "Services",
+        user,
+        "services",
+        &format!("<p>Persistence services installed across targets.</p>{table}"),
+    )
 }
 
 pub fn search_page(
@@ -808,23 +1062,58 @@ pub fn admin_page(user: &AuthenticatedUser) -> String {
     )
 }
 
-fn nav_icon(name: &str) -> &'static str {
+fn wolf_mark() -> &'static str {
+    r#"<svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="m7 8 12 8h10l12-8-3 24-14 10L10 32Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="m7 8 10 21 7 13 7-13L41 8M17 29l-5-9 12 5 12-5-5 9M20 33h8l-4 4Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>"#
+}
+
+fn page_description(name: &str) -> &'static str {
     match name {
-        "dashboard" => "dashboard",
-        "operations" => "explore",
-        "callbacks" => "bolt",
-        "services" => "storage",
-        "eventing" => "notifications_active",
-        "inventory" => "inventory_2",
-        "checks" => "fact_check",
-        "audit" => "receipt_long",
-        "evidence" => "folder_open",
-        "reports" => "description",
-        "payloads" => "rocket_launch",
-        "admin" => "admin_panel_settings",
-        "search" => "search",
-        _ => "",
+        "dashboard" => "A little perspective. Every operation, in one place.",
+        "operations" => "Clear scope. Deliberate work. A place for every operation.",
+        "inventory" => "The assets that make up your field of view.",
+        "checks" => "A traceable record of what you have observed.",
+        "evidence" => "The details that turn observations into findings.",
+        "reports" => "Bring the complete story into view.",
+        "audit" => "Every action leaves a record. Follow it here.",
+        "admin" => "The people and permissions behind your workspace.",
+        "callbacks" => "Your connections, organized and in context.",
+        "events" => "A running record of workspace activity.",
+        "search" => "Find the detail you are looking for.",
+        _ => "Your workspace, with every detail in focus.",
     }
+}
+
+fn nav_icon(name: &str) -> String {
+    let paths = match name {
+        "dashboard" => {
+            r#"<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>"#
+        }
+        "operations" => r#"<circle cx="12" cy="12" r="9"/><path d="m16 8-2.5 5.5L8 16l2.5-5.5Z"/>"#,
+        "callbacks" => r#"<path d="m13 2-9 12h7l-1 8 10-13h-7Z"/>"#,
+        "services" => {
+            r#"<rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01M11 6.5h6M11 17.5h6"/>"#
+        }
+        "eventing" => {
+            r#"<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4M12 2V1"/>"#
+        }
+        "events" => r#"<path d="M3 12h4l3-8 4 16 3-8h4"/>"#,
+        "inventory" => {
+            r#"<path d="m12 3 9 5v9l-9 5-9-5V8Zm0 10 9-5M12 13 3 8m9 5v9M7.5 5.5l9 5"/>"#
+        }
+        "checks" => {
+            r#"<rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V2h6v2M8 12l3 3 5-6"/>"#
+        }
+        "audit" => r#"<path d="M5 3h14v19l-3-2-4 2-4-2-3 2ZM8 8h8M8 12h8M8 16h5"/>"#,
+        "evidence" => r#"<path d="M3 7V4h6l3 3h9v13H3ZM3 10h18"/>"#,
+        "reports" => r#"<path d="M5 2h9l5 5v15H5ZM14 2v6h5M8 12h8M8 16h8"/>"#,
+        "payloads" => r#"<path d="m12 3 9 5-9 5-9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/>"#,
+        "admin" => r#"<path d="m12 2 8 4v6c0 6-8 10-8 10S4 18 4 12V6Z"/><path d="m8 12 3 3 5-6"/>"#,
+        "search" => r#"<circle cx="10.5" cy="10.5" r="7.5"/><path d="m16 16 5 5"/>"#,
+        _ => r#"<circle cx="12" cy="12" r="8"/>"#,
+    };
+    format!(
+        r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{paths}</svg>"#
+    )
 }
 
 fn operation_status(status: OperationStatus) -> (&'static str, &'static str) {
@@ -860,7 +1149,7 @@ fn status_pill(label: &str, class_name: &'static str) -> String {
     )
 }
 
-const APP_ASSETS: &str = r#"<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=block"><script defer src="/static/anime.min.js"></script><script defer src="/static/admin.js"></script>"#;
+const APP_ASSETS: &str = r#"<script defer src="/static/anime.min.js"></script><script defer src="/static/admin.js"></script>"#;
 
 fn page_shell(title: &str, head_extra: &str, content: &str) -> String {
     format!(

@@ -1,9 +1,9 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use sha2::{Digest, Sha256};
 
 pub const KEY_LEN: usize = 32;
@@ -48,23 +48,43 @@ pub fn nonce_for(envelope_id: u64) -> [u8; NONCE_LEN] {
 }
 
 /// Encrypt plaintext with AES-256-GCM. Returns `CIPHERTEXT||TAG` in base64.
-pub fn encrypt(key: &[u8; KEY_LEN], envelope_id: u64, plaintext: &[u8]) -> Result<String, CryptoError> {
+pub fn encrypt(
+    key: &[u8; KEY_LEN],
+    envelope_id: u64,
+    plaintext: &[u8],
+) -> Result<String, CryptoError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::Encrypt(e.to_string()))?;
     let nonce_bytes = nonce_for(envelope_id);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad: &envelope_id.to_le_bytes() })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: &envelope_id.to_le_bytes(),
+            },
+        )
         .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
     Ok(B64.encode(ct))
 }
 
-pub fn decrypt(key: &[u8; KEY_LEN], envelope_id: u64, ciphertext_b64: &str) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt(
+    key: &[u8; KEY_LEN],
+    envelope_id: u64,
+    ciphertext_b64: &str,
+) -> Result<Vec<u8>, CryptoError> {
     let ct = B64.decode(ciphertext_b64)?;
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::Decrypt(e.to_string()))?;
     let nonce_bytes = nonce_for(envelope_id);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let pt = cipher
-        .decrypt(nonce, Payload { msg: &ct, aad: &envelope_id.to_le_bytes() })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &ct,
+                aad: &envelope_id.to_le_bytes(),
+            },
+        )
         .map_err(|e| CryptoError::Decrypt(e.to_string()))?;
     Ok(pt)
 }
@@ -113,9 +133,8 @@ impl KeyPair {
     /// HPKE-ish static-static: public_bytes is the peer's x25519 public key.
     pub fn shared_secret(&self, peer_public: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let pk = x25519_dalek::PublicKey::from(
-            <[u8; 32]>::try_from(peer_public).map_err(|_| {
-                CryptoError::Exchange("peer public key must be 32 bytes".into())
-            })?,
+            <[u8; 32]>::try_from(peer_public)
+                .map_err(|_| CryptoError::Exchange("peer public key must be 32 bytes".into()))?,
         );
         Ok(self.secret.diffie_hellman(&pk).to_bytes().to_vec())
     }
