@@ -9,10 +9,15 @@ crates/*/*.dat
 
 # Environment
 .env
+.env.*
+!.env.example
+!.env.example.c2
 
-# SQLite (not used but shouldn't be committed)
+# Local SQLite databases and sidecar files
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 
 # Editor
 .idea/

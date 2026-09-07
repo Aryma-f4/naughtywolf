@@ -1,9 +1,13 @@
 (() => {
   const isSPALink = (a) => {
     const href = (a.getAttribute("href") || "").trim();
-    if (!href.startsWith("/")) return false;
-    if (href === "/login" || href === "/logout") return false;
-    if (href.includes("/payloads/download/")) return false;
+    if (!href.startsWith("/") || href.startsWith("//")) return false;
+    if (a.hasAttribute("download")) return false;
+    const target = a.getAttribute("target");
+    if (target && target.toLowerCase() !== "_self") return false;
+    const path = new URL(href, window.location.href).pathname;
+    if (path === "/login" || path === "/logout") return false;
+    if (path.includes("/payloads/download/") || /^\/evidence\/[^/]+\/download$/.test(path)) return false;
     return true;
   };
 
@@ -77,35 +81,97 @@
         buildTimer = null;
         return;
       }
-      navigate(window.location.pathname + window.location.search, true);
+      navigate(window.location.pathname + window.location.search, { historyMode: "none", silent: true, background: true });
     }, 3000);
   };
 
-  const updateActive = (href) => {
-    const path = href.split("?")[0];
+  const updateActive = (doc) => {
+    const activeHrefs = new Set([...doc.querySelectorAll('.nav-link[aria-current="page"], .quick-link[aria-current="page"]')]
+      .map(link => link.getAttribute("href")));
     document.querySelectorAll(".nav-link, .quick-link").forEach((link) => {
-      const match = (link.getAttribute("href") || "").split("?")[0] === path;
-      if (match) link.setAttribute("aria-current", "page");
+      if (activeHrefs.has(link.getAttribute("href"))) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     });
   };
 
-  async function navigate(href, silent) {
-    const res = await fetch(href, { headers: { "X-Requested-With": "naughtywolf" }, credentials: "same-origin" });
-    if (!res.ok) { window.location.href = href; return; }
-    if (new URL(res.url).pathname === "/login") { window.location.href = "/login"; return; }
-    const html = await res.text();
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    const nextMain = doc.querySelector("main");
+  const showNavigationError = (href) => {
+    document.getElementById("navigation-error")?.remove();
+    const notice = document.createElement("div");
+    notice.id = "navigation-error";
+    notice.className = "navigation-error";
+    notice.setAttribute("role", "alert");
+    const message = document.createElement("span");
+    message.textContent = "Couldn't load that page. Your current view is still available.";
+    const retry = document.createElement("a");
+    retry.href = href;
+    retry.textContent = "Try again";
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "dismiss-btn";
+    dismiss.setAttribute("aria-label", "Dismiss navigation error");
+    dismiss.textContent = "×";
+    dismiss.addEventListener("click", () => notice.remove());
+    notice.append(message, retry, dismiss);
+    document.body.appendChild(notice);
+  };
+
+  let activeNavigation = null;
+  async function navigate(href, { historyMode = "push", silent = false, background = false } = {}) {
+    // Background refreshes must never interrupt an operator's menu selection.
+    if (background && activeNavigation) return;
+    activeNavigation?.abort();
+    const controller = new AbortController();
+    activeNavigation = controller;
+    const timeout = setTimeout(() => controller.abort(), 15000);
     const currentMain = document.querySelector("main");
-    if (nextMain && currentMain) currentMain.replaceWith(nextMain);
-    const t = doc.querySelector("title")?.textContent;
-    if (t) document.title = t;
-    updateActive(href);
-    window.scrollTo({ top: 0 });
-    history.pushState({}, "", href);
-    initMain();
-    if (!silent) entryAnims();
+    if (!background) {
+      currentMain?.setAttribute("aria-busy", "true");
+      document.getElementById("navigation-error")?.remove();
+    }
+    try {
+      const res = await fetch(href, {
+        headers: { "X-Requested-With": "naughtywolf" },
+        credentials: "same-origin",
+        signal: controller.signal,
+      });
+      if (activeNavigation !== controller) return;
+      if (res.status === 401 || new URL(res.url).pathname === "/login") {
+        window.location.href = "/login";
+        return;
+      }
+      if (!res.ok) throw new Error("Navigation request failed");
+      if (!res.headers.get("content-type")?.includes("text/html")) {
+        window.location.href = res.url;
+        return;
+      }
+      const html = await res.text();
+      if (activeNavigation !== controller) return;
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const nextMain = doc.querySelector("main");
+      if (!nextMain || !currentMain) throw new Error("Page content is unavailable");
+      currentMain.replaceWith(nextMain);
+      const title = doc.querySelector("title")?.textContent;
+      if (title) document.title = title;
+      updateActive(doc);
+      if (historyMode === "push" && href !== window.location.pathname + window.location.search + window.location.hash) {
+        history.pushState({}, "", href);
+      }
+      initMain();
+      if (!background) {
+        window.scrollTo({ top: 0 });
+        nextMain.setAttribute("tabindex", "-1");
+        nextMain.focus({ preventScroll: true });
+      }
+      if (!silent) entryAnims();
+    } catch (_) {
+      if (activeNavigation === controller && !background) showNavigationError(href);
+    } finally {
+      clearTimeout(timeout);
+      if (activeNavigation === controller) {
+        document.querySelector("main")?.removeAttribute("aria-busy");
+        activeNavigation = null;
+      }
+    }
   }
 
   document.addEventListener("click", (e) => {
@@ -119,7 +185,7 @@
 
   window.addEventListener("popstate", () => {
     if (window.location.pathname !== "/login" && window.location.pathname !== "/logout") {
-      navigate(window.location.pathname + window.location.search, true);
+      navigate(window.location.pathname + window.location.search, { historyMode: "none", silent: true });
     }
   });
 

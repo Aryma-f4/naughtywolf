@@ -969,3 +969,28 @@ label { font-weight: 500; color: #ddc7cc; }
   .overview-hero { display: block; }
   .metric-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 }
+
+/* Content navigation status does not animate or replace the navigation shell. */
+.portal-main[aria-busy="true"] { cursor: progress; }
+.portal-main:focus { outline: none; }
+.navigation-error {
+  position: fixed;
+  z-index: 80;
+  bottom: 1rem;
+  right: 1rem;
+  display: flex;
+  align-items: center;
+  gap: .8rem;
+  width: min(32rem, calc(100% - 2rem));
+  padding: 1rem;
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+  font-size: .8rem;
+}
+.navigation-error > span { flex: 1; }
+.navigation-error > a { display: inline-flex; align-items: center; min-height: 44px; white-space: nowrap; }
+@media print { .navigation-error { display: none; } }

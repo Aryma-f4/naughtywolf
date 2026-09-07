@@ -61,7 +61,7 @@ export NAUGHTYWOLF_COOKIE_SECURE=false
 
 For repeat starts, save these settings—including the generated secret—in your gitignored `.env` file. The portal loads `.env` on startup; existing shell environment variables take precedence. Keep the session secret stable across restarts to preserve signed sessions.
 
-The root `.env.example` still contains legacy PostgreSQL/Sliver settings. Use the `NAUGHTYWOLF_*` settings above for this portal.
+The supplied [`.env.example`](.env.example) documents the current portal settings. When creating a new configuration, copy it to `.env` and replace the placeholder secrets.
 
 ### 4. Create your administrator
 
@@ -185,7 +185,7 @@ After editing them, stop the running server and run:
 cargo run -p naughtywolf -- serve
 ```
 
-Cargo rebuilds changed assets. Then refresh the browser once. Subsequent menu navigation updates the main content without replaying navbar animations.
+Cargo rebuilds changed assets. Then refresh the browser once. Subsequent menu navigation updates the main content without replaying navbar animations. Back/Forward keeps the browser history intact, rapid clicks keep the latest selection, and a failed request leaves the current view available with a retry link.
 
 The older `static/app.html`, `static/app.js`, and `static/style.css` files are not the active portal UI.
 
@@ -197,6 +197,9 @@ cargo fmt --all --check
 
 # Check JavaScript syntax (requires Node.js for this check only).
 node --check static/admin.js
+
+# Run navigation regression tests (requires Node.js, no npm install).
+node --test tests/navigation_test.cjs
 
 # Run the portal route, rendering, and access-control tests.
 cargo test -p naughtywolf --test portal_routes_test
