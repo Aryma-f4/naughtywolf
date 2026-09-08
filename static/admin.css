@@ -709,6 +709,9 @@ button, .button, .primary-action, .btn { gap: .65rem; transition: background .18
 .primary-action, .button { font-weight: 650; }
 .brand-mark { border: 0; background: none; }
 .brand-mark svg { width: 100%; height: 100%; }
+.portal-brand .brand-mark { transition: filter .25s ease; }
+.portal-brand:hover .brand-mark, .portal-brand:focus-visible .brand-mark { filter: drop-shadow(0 0 8px rgb(255 104 104 / 45%)); }
+@media (prefers-reduced-motion: reduce) { .portal-brand .brand-mark { transition: none; } }
 .brand-name strong { font-size: 1.25rem; letter-spacing: -.06em; font-weight: 750; }
 .brand-name small { font-size: .56rem; letter-spacing: .17em; }
 .brand-period { color: var(--accent); }

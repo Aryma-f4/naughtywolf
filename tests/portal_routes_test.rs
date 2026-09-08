@@ -1723,3 +1723,185 @@ async fn evidence_download_rejects_a_file_changed_after_storage() {
         "The request is invalid."
     );
 }
+
+#[tokio::test]
+async fn topology_data_is_scoped_and_omits_callback_details_for_viewers() {
+    let fixture = scoped_portal_fixture().await;
+    sqlx::query("INSERT INTO callbacks (id, operation_id, host, session_key) VALUES ('test-callback', ?, 'sensitive-callback-host', 'test-session-secret')")
+        .bind(&fixture.allowed_operation_id).execute(&fixture.repository.pool).await.unwrap();
+    let app = app_with_user_and_repository(fixture.repository, fixture.viewer).await;
+    let response = app
+        .oneshot(Request::get("/topology/data").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Allowed operation"));
+    assert!(body.contains("allowed-one"));
+    assert!(!body.contains("Hidden operation"));
+    assert!(!body.contains("session_key"));
+    assert!(!body.contains("password_hash"));
+    assert!(!body.contains("sensitive-callback-host"));
+    assert!(!body.contains("test-session-secret"));
+}
+
+#[tokio::test]
+async fn graph_and_recon_pages_render_without_javascript() {
+    let app = app_with_logged_in_user(Role::Admin).await;
+    for path in ["/topology", "/recon", "/recon?asset="] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(body.contains("/static/workspace.js"));
+        assert!(body.contains("No assets"));
+    }
+}
+
+#[tokio::test]
+async fn recon_execution_requires_operator_and_csrf() {
+    let viewer = app_with_logged_in_user(Role::Viewer).await;
+    let response = viewer
+        .oneshot(post_form("/recon/run", "asset_id=unknown&mode=dns"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let admin = app_with_logged_in_user(Role::Admin).await;
+    let response = admin
+        .oneshot(post_form("/recon/run", "asset_id=unknown&mode=dns"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn recon_persists_observations_audit_and_topology_relationships() {
+    let repo = test_repository().await;
+    let admin = create_user(&repo, "recon-admin", Role::Admin).await;
+    let op = repo
+        .create_operation("Recon fixture", "Local test")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE operations SET status = 'active' WHERE id = ?")
+        .bind(&op.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    let asset = repo
+        .create_asset(&op.id, "test-host", "host", "lab", "192.0.2.10")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO callbacks (id, operation_id, asset_id, host, session_key) VALUES ('test-callback', ?, ?, 'test-callback-host', 'never-expose-this-key')")
+        .bind(&op.id).bind(&asset.id).execute(&repo.pool).await.unwrap();
+    let app = app_with_user_and_repository(repo.clone(), admin).await;
+    let page = app
+        .clone()
+        .oneshot(Request::get("/recon").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let token = csrf_token(&body_string(page).await);
+    // A documentation IP is parsed locally; DNS-only mode opens no network connection.
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/recon/run",
+            format!("asset_id={}&mode=dns&csrf_token={token}", asset.id),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let runs = repo
+        .list_check_runs_visible_to("recon-admin", true)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].state, RunState::Succeeded);
+    assert_eq!(repo.count_audit_events().await.unwrap(), 2);
+    let graph = body_string(
+        app.clone()
+            .oneshot(Request::get("/topology/data").body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(!graph.contains("never-expose-this-key"));
+    let graph: serde_json::Value = serde_json::from_str(&graph).unwrap();
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 4);
+    let edges = graph["edges"].as_array().unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|e| e["source"] == format!("asset:{}", asset.id)
+                && e["target"] == "callback:test-callback")
+    );
+    assert!(edges.iter().any(|e| e["label"] == "resolved to"));
+    let history = body_string(
+        app.oneshot(
+            Request::get(format!("/recon?asset={}", asset.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(history.contains("dns.address"));
+    assert!(history.contains("192.0.2.10"));
+}
+
+#[tokio::test]
+async fn recon_rejects_out_of_scope_and_inactive_assets_before_creating_runs() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "recon-operator", Role::Operator).await;
+    let op = repo
+        .create_operation("Restricted fixture", "Local test")
+        .await
+        .unwrap();
+    let asset = repo
+        .create_asset(&op.id, "test-host", "host", "lab", "192.0.2.10")
+        .await
+        .unwrap();
+    let app = app_with_user_and_repository(repo.clone(), operator.clone()).await;
+    let page = app
+        .clone()
+        .oneshot(Request::get("/recon").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let token = csrf_token(&body_string(page).await);
+    let body = format!("asset_id={}&mode=dns&csrf_token={token}", asset.id);
+    let response = app
+        .clone()
+        .oneshot(post_form("/recon/run", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    repo.add_member(&op.id, &operator.id).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(post_form("/recon/run", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    sqlx::query("UPDATE operations SET status = 'active' WHERE id = ?")
+        .bind(&op.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE assets SET status = 'retired' WHERE id = ?")
+        .bind(&asset.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    let response = app.oneshot(post_form("/recon/run", body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        repo.list_check_runs_visible_to(&operator.id, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(repo.count_audit_events().await.unwrap(), 0);
+}

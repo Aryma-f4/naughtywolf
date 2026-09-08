@@ -59,7 +59,7 @@ fn asset_record_input() -> CheckInput {
 fn catalog_has_only_builtin_non_destructive_checks() {
     let checks = catalog();
 
-    assert_eq!(checks.len(), 1);
+    assert_eq!(checks.len(), 2);
     assert!(
         checks
             .iter()

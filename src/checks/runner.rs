@@ -68,6 +68,7 @@ pub struct AssetRecordReviewInput {}
 #[serde(tag = "check", content = "input", rename_all = "kebab-case")]
 pub enum CheckInput {
     AssetRecordReview(AssetRecordReviewInput),
+    SurfaceRecon(super::recon::SurfaceReconInput),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +412,7 @@ impl Drop for RunCancellation {
 fn validate_input(definition: &CheckDefinition, input: &CheckInput) -> Result<(), AppError> {
     match (definition.id, input) {
         ("asset-record-review", CheckInput::AssetRecordReview(_)) => Ok(()),
+        ("surface-recon", CheckInput::SurfaceRecon(_)) => Ok(()),
         _ => Err(AppError::Validation(
             "input does not match the selected check".to_owned(),
         )),
@@ -424,6 +426,9 @@ async fn run_check(
 ) -> Result<CheckResult, &'static str> {
     match (check_id, input) {
         ("asset-record-review", CheckInput::AssetRecordReview(_)) => review_asset_record(asset),
+        ("surface-recon", CheckInput::SurfaceRecon(input)) => {
+            super::recon::collect(&asset.address, input).await
+        }
         _ => Err("check implementation is unavailable"),
     }
 }

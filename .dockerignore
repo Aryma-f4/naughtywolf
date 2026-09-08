@@ -3,3 +3,16 @@
 !Cargo.lock
 !crates/
 !crates/**
+!src/
+!src/**
+!static/
+!static/**
+!migrations/
+!migrations/**
+# Exclude local artifacts and credentials, including inside allowed folders.
+**/target/
+**/.env
+**/.env.*
+**/*.db
+**/*.db-*
+**/*.dat

@@ -19,16 +19,28 @@ pub struct CheckDefinition {
     pub execution_kind: ExecutionKind,
 }
 
-const CATALOG: [CheckDefinition; 1] = [CheckDefinition {
-    id: "asset-record-review",
-    label: "Asset record review",
-    required_role: Role::Operator,
-    timeout: Duration::from_secs(5),
-    max_output_bytes: 4_096,
-    builtin: true,
-    mutates_target: false,
-    execution_kind: ExecutionKind::InProcess,
-}];
+const CATALOG: [CheckDefinition; 2] = [
+    CheckDefinition {
+        id: "asset-record-review",
+        label: "Asset record review",
+        required_role: Role::Operator,
+        timeout: Duration::from_secs(5),
+        max_output_bytes: 4_096,
+        builtin: true,
+        mutates_target: false,
+        execution_kind: ExecutionKind::InProcess,
+    },
+    CheckDefinition {
+        id: "surface-recon",
+        label: "DNS and HTTP reconnaissance",
+        required_role: Role::Operator,
+        timeout: Duration::from_secs(15),
+        max_output_bytes: 8_192,
+        builtin: true,
+        mutates_target: false,
+        execution_kind: ExecutionKind::InProcess,
+    },
+];
 
 pub fn catalog() -> &'static [CheckDefinition] {
     &CATALOG

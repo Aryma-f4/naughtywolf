@@ -43,7 +43,7 @@ pub fn login_page(error: Option<&str>, csrf_token: &str) -> String {
         error = error,
         csrf_token = escape_html(csrf_token),
     );
-    page_shell("Sign in", "", &content)
+    page_shell("Sign in", MOTION_ASSETS, &content)
 }
 
 pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &str) -> String {
@@ -52,6 +52,8 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
             "Command",
             vec![
                 ("dashboard", "/dashboard", "Dashboard"),
+                ("topology", "/topology", "Topology"),
+                ("recon", "/recon", "Recon"),
                 ("callbacks", "/callbacks", "Callbacks"),
                 ("operations", "/operations", "Operations"),
                 ("inventory", "/inventory", "Assets"),
@@ -860,7 +862,9 @@ pub fn callbacks_page(user: &AuthenticatedUser, callbacks: &[Callback]) -> Strin
         "Callbacks",
         user,
         "callbacks",
-        &format!("<p>Inbound C2 sessions and beacons.</p>{table}"),
+        &format!(
+            "<div class=\"page-actions\"><a class=\"button\" href=\"/topology\">Open topology ↗</a></div><p>Inbound C2 sessions and beacons.</p>{table}"
+        ),
     )
 }
 
@@ -1068,6 +1072,8 @@ fn wolf_mark() -> &'static str {
 
 fn page_description(name: &str) -> &'static str {
     match name {
+        "topology" => "Every asset. Every callback. One connected field of view.",
+        "recon" => "Turn scoped observations into a clearer picture.",
         "dashboard" => "A little perspective. Every operation, in one place.",
         "operations" => "Clear scope. Deliberate work. A place for every operation.",
         "inventory" => "The assets that make up your field of view.",
@@ -1088,6 +1094,10 @@ fn nav_icon(name: &str) -> String {
         "dashboard" => {
             r#"<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>"#
         }
+        "topology" => {
+            r#"<circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="m10 8-4 8m8-8 4 8M8 19h8"/>"#
+        }
+        "recon" => r#"<circle cx="11" cy="11" r="8"/><path d="m17 17 4 4M11 7v8M7 11h8"/>"#,
         "operations" => r#"<circle cx="12" cy="12" r="9"/><path d="m16 8-2.5 5.5L8 16l2.5-5.5Z"/>"#,
         "callbacks" => r#"<path d="m13 2-9 12h7l-1 8 10-13h-7Z"/>"#,
         "services" => {
@@ -1149,7 +1159,8 @@ fn status_pill(label: &str, class_name: &'static str) -> String {
     )
 }
 
-const APP_ASSETS: &str = r#"<script defer src="/static/anime.min.js"></script><script defer src="/static/admin.js"></script>"#;
+const MOTION_ASSETS: &str = r#"<script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script>"#;
+const APP_ASSETS: &str = r#"<link rel="stylesheet" href="/static/workspace.css"><script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script><script defer src="/static/workspace.js"></script><script defer src="/static/admin.js"></script>"#;
 
 fn page_shell(title: &str, head_extra: &str, content: &str) -> String {
     format!(
@@ -1170,7 +1181,7 @@ fn form_error(error: Option<&str>, id: &str) -> String {
         .unwrap_or_default()
 }
 
-fn escape_html(value: &str) -> String {
+pub(super) fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")

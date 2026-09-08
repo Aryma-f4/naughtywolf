@@ -15,9 +15,7 @@
   let buildDismissed = false;
 
   const entryAnims = () => {
-    if (typeof anime === "undefined" || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-    anime({ targets: document.querySelector(".page-heading"), translateY: [-10, 0], opacity: [0, 1], easing: "easeOutCubic", duration: 380, delay: 60 });
-    anime({ targets: ".portal-main > :not(.page-heading)", translateY: [12, 0], opacity: [0, 1], easing: "easeOutCubic", duration: 420, delay: anime.stagger(40, { start: 110 }) });
+    window.NWMotion?.page(document.querySelector("main"));
   };
 
   const initMain = () => {
@@ -25,6 +23,7 @@
       btn.addEventListener("click", () => btn.closest("[data-dismissible]")?.remove());
     });
     bindPayloadForm();
+    window.NWWorkspace?.init(document.querySelector("main"));
   };
 
   const bindPayloadForm = () => {
@@ -149,6 +148,7 @@
       const doc = new DOMParser().parseFromString(html, "text/html");
       const nextMain = doc.querySelector("main");
       if (!nextMain || !currentMain) throw new Error("Page content is unavailable");
+      window.NWMotion?.clearPage();
       currentMain.replaceWith(nextMain);
       const title = doc.querySelector("title")?.textContent;
       if (title) document.title = title;
@@ -310,6 +310,7 @@
     }
   };
 
+  window.NW = { navigate };
   initMain();
   initCallbackSSE();
   initCommandHistory();

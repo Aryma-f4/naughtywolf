@@ -1,30 +1,29 @@
+# Coolify: Docker Compose build pack; assign app https://your-domain:8080.
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: naughtywolf
-      POSTGRES_PASSWORD: naughtywolf
-      POSTGRES_DB: naughtywolf
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U naughtywolf"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    ports:
-      - "5432:5432"
-    restart: unless-stopped
-
   app:
-    build: .
-    ports:
-      - "8080:8080"
-    env_file: .env.docker
-    depends_on:
-      db:
-        condition: service_healthy
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NAUGHTYWOLF_BIND: 0.0.0.0:8080
+      NAUGHTYWOLF_DATABASE_URL: sqlite:/data/naughtywolf.db?mode=rwc
+      NAUGHTYWOLF_EVIDENCE_DIR: /data/evidence
+      NAUGHTYWOLF_SESSION_SECRET: ${NAUGHTYWOLF_SESSION_SECRET:?Set a unique session secret of at least 32 bytes}
+      NAUGHTYWOLF_C2_PSK: ${NAUGHTYWOLF_C2_PSK:?Set a unique C2 shared key}
+      NAUGHTYWOLF_COOKIE_SECURE: ${NAUGHTYWOLF_COOKIE_SECURE:-true}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - naughtywolf-data:/data
+    expose:
+      - "8080"
+    init: true
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "4", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
 volumes:
-  pgdata:
+  naughtywolf-data:

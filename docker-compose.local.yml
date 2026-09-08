@@ -1,0 +1,7 @@
+# Localhost-only overlay; do not select this file in Coolify.
+services:
+  app:
+    ports:
+      - "127.0.0.1:${NAUGHTYWOLF_HOST_PORT:-8080}:8080"
+    environment:
+      NAUGHTYWOLF_COOKIE_SECURE: "false"

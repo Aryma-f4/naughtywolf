@@ -144,10 +144,19 @@ mod tests {
         let key = [7u8; crypto::KEY_LEN];
         let e = Envelope::new(Kind::Register, 42, None, "secret".into());
         let sealed = e.seal(&key).unwrap();
-        // The wire blob must not expose any structured (JSON) frame content.
-        assert!(!sealed.contains("Register"));
-        assert!(!sealed.contains("secret"));
-        assert!(!sealed.contains("42"));
+        // Inspect the decoded wire structure: random base64 can coincidentally
+        // contain short plaintext substrings such as "42".
+        let wire: serde_json::Value =
+            serde_json::from_slice(&b64_decode(&sealed).unwrap()).unwrap();
+        let fields: std::collections::BTreeSet<_> = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(fields, ["blob", "session_id"].into_iter().collect());
+        assert!(wire["blob"].is_string());
+        assert!(wire["session_id"].is_null());
         let back = Envelope::open(&key, &sealed).unwrap();
         assert_eq!(back.id, e.id);
         assert_eq!(back.kind, e.kind);

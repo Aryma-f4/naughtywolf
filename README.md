@@ -6,7 +6,7 @@ A Rust workspace for authorized security labs, with a local web portal for opera
 
 The interface pairs a dark red theme with editorial typography, a custom wolf mark, and responsive layouts. Menu navigation updates the page content while keeping the header and navigation in place.
 
-[Quick start](#quick-start) · [Screenshots](#screenshots) · [Configuration](#configuration) · [Development](#development) · [Native C2 guide](docs/c2-quickstart.md)
+[Quick start](#quick-start) · [Deploy on Coolify](docs/coolify.md) · [Screenshots](#screenshots) · [Configuration](#configuration) · [Development](#development) · [Native C2 guide](docs/c2-quickstart.md)
 
 ![NaughtyWolf dashboard with the red theme, scoped record counts, and workflow overview](docs/screenshots/dashboard-desktop.jpg)
 
@@ -25,11 +25,14 @@ The portal and native C2 packages have separate configuration and account stores
 
 - **Operation records:** define a purpose, track assets, and keep related lab records together.
 - **Scoped overview:** dashboard counts come from persisted records visible to the signed-in user.
+- **Interactive topology:** map operations, assets, registered callbacks, and saved DNS observations. Search, filter, pan, zoom, inspect nodes, or switch to a list.
+- **Integrated reconnaissance:** run DNS or DNS + HTTP/TLS observations against a selected active asset. Results persist in check history, enrich the topology, and leave an audit trail.
 - **Evidence and reporting:** inspect stored artifacts and produce printable operation summaries.
 - **Traceability:** an append-only audit trail records operation, asset, and account changes.
 - **Local access control:** Admin, Operator, and Viewer roles, password hashing, signed sessions, and CSRF-protected forms.
 - **Evidence verification:** downloads check the stored path, file type, length, and SHA-256 digest.
 - **Responsive interface:** desktop navigation, a scrollable mobile menu, locally bundled icons and scripts, keyboard focus indicators, and reduced-motion support.
+- **Anime.js motion:** staggered content entrances, a drawn wolf logo, dashboard orbit accents, and topology connection reveals. Motion is finite, stops when the tab is hidden, and respects reduced-motion preferences. Menu navigation keeps the header and navigation stationary.
 - **No frontend build pipeline:** Rust renders the HTML; CSS and JavaScript ship with the binary.
 
 ## Quick start
@@ -83,16 +86,42 @@ The server exposes a health endpoint at `/healthz`; a healthy process returns HT
 
 ## Your first workflow
 
+For hosted deployment, follow the **[Coolify guide](docs/coolify.md)**: select the Docker Compose build pack, use `/docker-compose.yml`, set the two secrets, assign an HTTPS domain to service `app` on internal port `8080`, and deploy. Database, evidence, and generated payloads persist in the `/data` volume. The image includes Rust and the workspace sources for the existing payload build UI.
+
 1. **Define an operation.** As an Admin, open **Operations → Create operation** and enter its name and purpose.
 2. **Record the assets.** Use **Add asset** on an operation to register its scoped targets.
-3. **Review the records.** Inspect inventory, available check history, and evidence associated with your work.
-4. **Read the summary.** Open **Reports** for operation summaries and **Audit** to trace recorded changes.
+3. **Explore the relationships.** Open **Topology** to see recorded operation → asset → callback associations. Select a node to inspect its details.
+4. **Collect observations.** Review and activate the operation, then open **Recon**, choose an active asset and an observation profile, and run the check. DNS addresses from the latest recon run appear in the topology.
+5. **Read the summary.** Open **Checks** for recorded runs, **Reports** for operation summaries, and **Audit** to trace recorded changes.
 
 A fresh workspace starts with zero operations, assets, checks, and evidence. Creating an account can already produce an audit record. Dashboard figures are stored counts, not sample analytics.
 
+### Topology and recon
+
+The topology uses persisted associations, including an asset link only when the callback belongs to the same operation. Unassigned callbacks remain unlinked. Lines describe recorded relationships, not discovered network routes. Viewer accounts can inspect scoped assets and recon results; callback nodes require Operator or Admin access.
+
+Use search and the operation/status filters to focus a large inventory. Parent nodes remain visible for context. At most **240 nodes** are drawn at once; the counter discloses omitted nodes. Drag the canvas to pan, use **+ / −** to zoom, and **Fit** to center the graph. Keyboard users can select nodes with Enter or Space and use arrow keys, + / −, and 0 while the canvas is focused. **Refresh** loads a new snapshot; the graph does not auto-poll. An empty workspace offers a clearly labelled sample graph that creates no records.
+
+| Recon profile | Observations |
+| --- | --- |
+| **DNS** | Up to 16 resolved IPv4/IPv6 addresses. A literal IP is recorded directly. |
+| **DNS + HTTP / TLS** | DNS plus one HEAD request to the asset origin, its HTTP status, and selected response headers. HTTPS verifies the certificate and hostname. |
+
+Recon requires an active asset in an active operation and an Operator or Admin account with access to that operation. Hostnames and bare IP addresses default to HTTPS; an explicit `http://` URL selects HTTP. URL paths, queries, fragments, and embedded credentials are not sent. Redirects are observed without following them; response bodies and cookies are not collected. Proxy environment variables are ignored. Loopback and private lab addresses are supported; unspecified, multicast, and link-local destinations are rejected.
+
+Each run has a 15-second execution limit, an 8 KiB saved-output limit, and shares four execution slots per portal process. Results remain available in Recon and Checks, including partial DNS findings if HTTP fails. Recon history shows the latest 20 runs for the selected asset or all visible assets. This is a scoped observation workflow; it does not include port sweeps, autonomous exploit agents, or a RedAmon service dependency.
+
 ## Screenshots
 
-Captured from the running application using an isolated local preview account. These images show the red theme and a fresh workspace; they do not contain live operation data.
+Captured from the running application using an isolated local preview account. The topology screenshot uses the built-in labelled sample dataset; the other views show a fresh workspace. They do not contain live operation data.
+
+### Connected topology
+
+![Interactive topology with two sample operations, six assets, six callbacks, and a node inspector](docs/screenshots/topology-desktop.jpg)
+
+### Recon workspace
+
+![Reconnaissance workspace with scoped target selection and observation history](docs/screenshots/recon-desktop.jpg)
 
 ### Operator access
 
@@ -104,6 +133,10 @@ The navigation scrolls horizontally, and the dashboard reflows for a narrow scre
 
 <img src="docs/screenshots/dashboard-mobile.jpg" alt="NaughtyWolf dashboard at a 390-pixel mobile viewport" width="390">
 
+Topology also offers a compact list with the same search, filters, and node inspector.
+
+<img src="docs/screenshots/topology-mobile.jpg" alt="Mobile topology list showing the labelled sample dataset" width="390">
+
 The desktop dashboard is shown at the top of this README. Original screenshots are in [`docs/screenshots`](docs/screenshots).
 
 ## Pages and access
@@ -111,6 +144,8 @@ The desktop dashboard is shown at the top of this README. Original screenshots a
 | Page | Route | Purpose |
 | --- | --- | --- |
 | Dashboard | `/dashboard` | Visible operation, asset, check, evidence, and audit counts. |
+| Topology | `/topology` | Interactive relationship map, filters, node inspector, and list view. |
+| Recon | `/recon` | Scoped DNS/HTTP observations and saved results; execution requires Operator or Admin. |
 | Operations | `/operations` | Operation records and asset creation. |
 | Assets | `/inventory` | Inventory for visible operations. |
 | Checks | `/checks` | Recorded check-run history. |
@@ -177,7 +212,7 @@ For CI, account creation and password reset also accept `--password-stdin`. Use 
 
 ### UI changes require a restart
 
-The active portal renders templates from `src/portal/templates.rs` and embeds `static/admin.css`, `static/admin.js`, and `static/anime.min.js` at compile time.
+The active portal renders templates from `src/portal/templates.rs` and `src/portal/workspace.rs`. It embeds `static/admin.css`, `static/admin.js`, `static/workspace.css`, `static/workspace.js`, `static/motion.js`, and `static/anime.min.js` at compile time.
 
 After editing them, stop the running server and run:
 
@@ -197,9 +232,11 @@ cargo fmt --all --check
 
 # Check JavaScript syntax (requires Node.js for this check only).
 node --check static/admin.js
+node --check static/workspace.js
+node --check static/motion.js
 
 # Run navigation regression tests (requires Node.js, no npm install).
-node --test tests/navigation_test.cjs
+node --test tests/navigation_test.cjs tests/workspace_test.cjs tests/motion_test.cjs
 
 # Run the portal route, rendering, and access-control tests.
 cargo test -p naughtywolf --test portal_routes_test
@@ -215,12 +252,17 @@ src/
   main.rs                 Portal startup, sessions, and login
   portal.rs               Portal routes and handlers
   portal/templates.rs     Active HTML templates
+  portal/workspace.rs     Topology and recon routes, rendering, and scoped graph data
+  checks/recon.rs         Bounded DNS and HTTP/TLS observations
   auth/                   Passwords, sessions, and roles
   db/                     SQLite models and repositories
   evidence.rs             Evidence storage and verification
 static/
   admin.css               Active portal theme and responsive layouts
   admin.js                Content navigation and interactions
+  workspace.css           Topology and recon layouts
+  workspace.js            Graph model, interactions, and recon form navigation
+  motion.js               Anime.js accents and motion-preference lifecycle
   anime.min.js            Bundled animation library
 migrations/               Database schema migrations
 crates/                   Native server, console, client, and shared code
@@ -241,7 +283,7 @@ docs/
 | Port 8080 is already in use | Stop the existing instance or set `NAUGHTYWOLF_BIND=127.0.0.1:8082` and open that port. |
 | An Operator or Viewer sees no operations | Check operation membership; account creation alone does not grant access to existing operations. |
 | You expect a browser UI after starting `nw-server` | Start the `naughtywolf` portal. The native server is a separate entry point. |
-| Root Docker setup expects PostgreSQL or missing build files | The root Docker recipe targets older infrastructure. Use the native portal quick start above. |
+| Container/Coolify setup | Use the [Coolify guide](docs/coolify.md). The current root Compose file uses SQLite and a persistent `/data` volume. |
 
 ## Intended use
 

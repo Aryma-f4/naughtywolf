@@ -25,6 +25,7 @@ use crate::{
 };
 
 pub mod templates;
+mod workspace;
 
 pub const CSRF_TOKEN_KEY: &str = "login_csrf_token";
 
@@ -84,6 +85,9 @@ pub fn public_router() -> Router {
         )
         .route("/static/admin.css", get(stylesheet))
         .route("/static/admin.js", get(script))
+        .route("/static/motion.js", get(motion_script))
+        .route("/static/workspace.js", get(workspace_script))
+        .route("/static/workspace.css", get(workspace_style))
         .route("/static/anime.min.js", get(anime_script))
 }
 
@@ -93,6 +97,10 @@ pub fn public_router() -> Router {
 pub fn authenticated_router() -> Router<Repository> {
     Router::new()
         .route("/dashboard", get(dashboard))
+        .route("/topology", get(workspace::topology_page))
+        .route("/topology/data", get(workspace::topology_data))
+        .route("/recon", get(workspace::recon_page))
+        .route("/recon/run", post(workspace::run_recon))
         .route("/operations", get(operations).post(create_operation))
         .route("/operations/new", get(new_operation))
         .route("/operations/{operation_id}/assets", post(create_asset))
@@ -1110,6 +1118,35 @@ pub async fn anime_script() -> Response {
             "application/javascript; charset=utf-8",
         )],
         include_str!("../static/anime.min.js"),
+    )
+        .into_response()
+}
+
+async fn workspace_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/workspace.js"),
+    )
+        .into_response()
+}
+
+async fn motion_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/motion.js"),
+    )
+        .into_response()
+}
+async fn workspace_style() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../static/workspace.css"),
     )
         .into_response()
 }
