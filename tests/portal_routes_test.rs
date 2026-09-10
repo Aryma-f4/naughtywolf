@@ -20,6 +20,18 @@ use naughtywolf::{
 use tower::ServiceExt;
 use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
 
+struct PayloadArtifactCleanup {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl Drop for PayloadArtifactCleanup {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn post_form(path: &str, body: impl Into<Body>) -> Request<Body> {
     Request::post(path)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -43,6 +55,73 @@ async fn body_string(response: Response) -> String {
             .to_vec(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn public_payload_download_requires_the_matching_uuid_not_a_login() {
+    let token = "550e8400-e29b-41d4-a716-446655440000";
+    let wrong_token = "550e8400-e29b-41d4-a716-446655440001";
+    let file = "public-download-route-test.bin";
+    let dir = std::path::Path::new("payloads");
+    std::fs::create_dir_all(dir).unwrap();
+    let artifact = dir.join(file);
+    let sidecar = dir.join(format!("{file}.json"));
+    let _cleanup = PayloadArtifactCleanup {
+        paths: vec![artifact.clone(), sidecar.clone()],
+    };
+    std::fs::write(&artifact, b"public-payload-bytes").unwrap();
+    std::fs::write(
+        &sidecar,
+        serde_json::to_vec(&serde_json::json!({
+            "file": file,
+            "name": "public-download-route-test",
+            "os": "linux",
+            "arch": "amd64",
+            "protocol": "https",
+            "lhost": "gateofbabylon.space",
+            "lport": 443,
+            "psk": "test-only",
+            "interval_ms": 5000,
+            "jitter_ms": 1000,
+            "target": "x86_64-unknown-linux-musl",
+            "size": 20,
+            "built_at": "2026-09-10T00:00:00Z",
+            "public_id": token
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let response = public_router()
+        .oneshot(
+            Request::get(format!("/payloads/download/{token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"public-download-route-test.bin\""
+    );
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        "public-payload-bytes"
+    );
+
+    for unavailable in [file, wrong_token] {
+        let response = public_router()
+            .oneshot(
+                Request::get(format!("/payloads/download/{unavailable}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 async fn test_repository() -> Repository {
@@ -518,6 +597,7 @@ fn payloads_page_renders_build_form_and_built_rows() {
         interval_ms: 1000,
         jitter_ms: 200,
         target: String::new(),
+        public_id: "550e8400-e29b-41d4-a716-446655440000".into(),
         size: 42,
         built_at: "2026-08-30T00:00:00Z".into(),
     }];
@@ -527,7 +607,8 @@ fn payloads_page_renders_build_form_and_built_rows() {
     assert!(body.contains("name=\"csrf_token\" value=\"csrf-token\""));
     assert!(body.contains("linux-implant"));
     assert!(body.contains("10.0.0.1:8081"));
-    assert!(body.contains("href=\"/payloads/download/linux-amd64.bin\""));
+    assert!(body.contains("href=\"/payloads/download/550e8400-e29b-41d4-a716-446655440000\""));
+    assert!(!body.contains("href=\"/payloads/download/linux-amd64.bin\""));
     assert!(body.contains("NW_PSK"));
     assert!(body.contains("data-payload-wizard"));
     assert!(body.contains("aria-label=\"Payload creation progress\""));

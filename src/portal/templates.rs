@@ -599,7 +599,7 @@ pub fn payloads_page(
                 escape_html(&format!("{}:{}", b.lhost, b.lport)),
                 b.size,
                 escape_html(&b.built_at),
-                url_encode(&b.file),
+                url_encode(&b.public_id),
                 file = url_encode(&b.file),
             )
         })
