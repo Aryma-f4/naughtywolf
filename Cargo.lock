@@ -1518,6 +1518,7 @@ dependencies = [
  "futures",
  "hex",
  "moka",
+ "nw-implant",
  "nw-profile",
  "reqwest",
  "rpassword",

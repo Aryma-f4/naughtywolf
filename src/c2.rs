@@ -474,6 +474,9 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use axum::routing::post;
+    use nw_implant::runtime::{BeaconRuntime, Profile};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tower::ServiceExt;
 
     fn b64(b: &[u8]) -> String {
@@ -545,6 +548,11 @@ mod tests {
         assert_eq!(second.tasks.len(), 1);
         assert_eq!(first.tasks[0].id.to_string(), task_id);
         assert_eq!(second.tasks[0].id, first.tasks[0].id);
+        sqlx::query("UPDATE c2_tasks SET processing_at = '2000-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&task_id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
 
         let acknowledged = sealed_poll(
             &repo,
@@ -558,12 +566,14 @@ mod tests {
         )
         .await;
         assert!(acknowledged.tasks.is_empty());
-        let status: String = sqlx::query_scalar("SELECT status FROM c2_tasks WHERE id = ?")
-            .bind(task_id)
-            .fetch_one(&repo.pool)
-            .await
-            .unwrap();
+        let (status, processing_at): (String, Option<String>) =
+            sqlx::query_as("SELECT status, processing_at FROM c2_tasks WHERE id = ?")
+                .bind(task_id)
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
         assert_eq!(status, "processing");
+        assert_ne!(processing_at.as_deref(), Some("2000-01-01T00:00:00Z"));
     }
 
     async fn terminal_audit_count(repo: &Repository, task_id: &str) -> i64 {
@@ -650,6 +660,146 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "delivered");
+    }
+
+    #[derive(Clone)]
+    struct LossyPollState {
+        repo: Repository,
+        psk: Arc<Vec<u8>>,
+        drop_delivery: Arc<AtomicBool>,
+        delivery_dropped: Arc<AtomicBool>,
+    }
+
+    async fn lossy_checkin(
+        State(state): State<LossyPollState>,
+        body: axum::body::Bytes,
+    ) -> Result<axum::body::Bytes, StatusCode> {
+        let is_poll = std::str::from_utf8(&body)
+            .ok()
+            .and_then(Envelope::routing_id)
+            .is_some();
+        let response = process_sealed(&state.repo, &state.psk, &body, "http")
+            .await
+            .map_err(|error| error.status())?;
+        if is_poll && state.drop_delivery.load(Ordering::SeqCst) {
+            let delivered: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM c2_tasks WHERE status = 'delivered'")
+                    .fetch_one(&state.repo.pool)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if delivered > 0 {
+                state.drop_delivery.store(false, Ordering::SeqCst);
+                state.delivery_dropped.store(true, Ordering::SeqCst);
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+        }
+        Ok(axum::body::Bytes::from(response))
+    }
+
+    #[tokio::test]
+    async fn lost_delivery_then_processing_cancel_terminates_implant_task_once() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let psk = Arc::new(b"lossy-cancel-psk".to_vec());
+        let state = LossyPollState {
+            repo: repo.clone(),
+            psk: psk.clone(),
+            drop_delivery: Arc::new(AtomicBool::new(false)),
+            delivery_dropped: Arc::new(AtomicBool::new(false)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/c2/checkin", post(lossy_checkin))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let runtime = Arc::new(BeaconRuntime::new(
+            Profile {
+                endpoint: format!("http://127.0.0.1:{port}"),
+                interval: Duration::from_millis(50),
+                jitter: Duration::ZERO,
+                hostname: "lossy-cancel-host".into(),
+                username: "tester".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                pid: 4242,
+                addr: "127.0.0.1".into(),
+            },
+            psk.as_ref().clone(),
+        ));
+        let beacon_runtime = runtime.clone();
+        let beacon = tokio::spawn(async move { beacon_runtime.run().await });
+
+        let session_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM callbacks WHERE host = 'lossy-cancel-host' LIMIT 1",
+                )
+                .fetch_optional(&repo.pool)
+                .await
+                .unwrap()
+                {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("implant registration");
+
+        state.drop_delivery.store(true, Ordering::SeqCst);
+        let victim = repo
+            .enqueue_task(&session_id, "sleep", &serde_json::json!(["30"]), 60_000)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.delivery_dropped.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first delivery response was lost");
+
+        let cancellation = repo
+            .request_task_cancellation(&session_id, &victim, "operator-1", "alice")
+            .await
+            .unwrap();
+        assert!(matches!(
+            cancellation,
+            crate::db::models::TaskCancellation::Requested { .. }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status: String = sqlx::query_scalar("SELECT status FROM c2_tasks WHERE id = ?")
+                    .bind(&victim)
+                    .fetch_one(&repo.pool)
+                    .await
+                    .unwrap();
+                if status == "cancelled" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("redelivered victim must be terminated by nw/killtask");
+
+        let result: (bool, Vec<u8>, i64) =
+            sqlx::query_as("SELECT ok, stderr, exit_code FROM c2_task_results WHERE task_id = ?")
+                .bind(&victim)
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert!(!result.0);
+        assert_eq!(result.1, b"task cancelled");
+        assert_eq!(result.2, -1);
+        assert_eq!(terminal_audit_count(&repo, &victim).await, 1);
+
+        runtime.trigger_stop();
+        let _ = beacon.await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -789,7 +939,7 @@ mod tests {
         let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
         crate::db::run_migrations(&pool).await.unwrap();
         let repo = Repository { pool: pool.clone() };
-        let app = router(Arc::new(b"dev-psk-change-me".to_vec())).with_state(repo);
+        let app = router(Arc::new(b"dev-psk-change-me".to_vec())).with_state(repo.clone());
         let psk_key = session_key(b"dev-psk-change-me");
 
         // Full forward-secret handshake: implant rolls ephemeral x25519 key.
@@ -879,11 +1029,23 @@ mod tests {
             .unwrap();
         assert_eq!(session_addr, "10.20.30.40");
 
-        // Poll encrypted under the derived session key.
+        let queued = repo
+            .enqueue_task(
+                &ack_msg.session_id.to_string(),
+                "whoami",
+                &serde_json::json!([]),
+                5_000,
+            )
+            .await
+            .unwrap();
+
+        // Poll encrypted under the derived session key and verify the JSON
+        // endpoint keeps the database UUID rather than inventing a wire id.
         let poll_pt = serde_json::to_vec(&PollRequest::default()).unwrap();
         let poll_ct = crypto::encrypt(&session_key, 2, &poll_pt).unwrap();
         let poll_env = Envelope::new(Kind::TaskResult, 2, Some(ack_msg.session_id), poll_ct);
         let resp2 = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -895,6 +1057,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
+        let reply_env: Envelope = serde_json::from_slice(
+            &axum::body::to_bytes(resp2.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let reply_pt = crypto::decrypt(&session_key, reply_env.id, &reply_env.encrypted).unwrap();
+        let reply: PollReply = serde_json::from_slice(&reply_pt).unwrap();
+        assert_eq!(reply.tasks.len(), 1);
+        assert_eq!(reply.tasks[0].id.to_string(), queued);
+
+        let accepted = PollRequest {
+            accepted_task_ids: vec![reply.tasks[0].id],
+            results: vec![nw_profile::msgs::TaskResult {
+                task_id: reply.tasks[0].id,
+                ok: true,
+                stdout: b"tester".to_vec(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            }],
+            ..Default::default()
+        };
+        let accepted_ct =
+            crypto::encrypt(&session_key, 4, &serde_json::to_vec(&accepted).unwrap()).unwrap();
+        let accepted_env =
+            Envelope::new(Kind::TaskResult, 4, Some(ack_msg.session_id), accepted_ct);
+        let resp3 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/c2/poll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&accepted_env).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp3.status(), StatusCode::OK);
+        let result_env: Envelope = serde_json::from_slice(
+            &axum::body::to_bytes(resp3.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let result_pt =
+            crypto::decrypt(&session_key, result_env.id, &result_env.encrypted).unwrap();
+        let result_reply: PollReply = serde_json::from_slice(&result_pt).unwrap();
+        assert_eq!(result_reply.result_acks, vec![reply.tasks[0].id]);
+        let task_state: (String, Option<String>) =
+            sqlx::query_as("SELECT status, processing_at FROM c2_tasks WHERE id = ?")
+                .bind(&queued)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(task_state.0, "completed");
+        assert!(task_state.1.is_some());
         let still_one: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM callbacks")
             .fetch_one(&pool)
             .await

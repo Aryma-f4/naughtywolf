@@ -827,7 +827,7 @@ impl Repository {
         for id in ids {
             sqlx::query(
                 "UPDATE c2_tasks SET status = 'processing', \
-                 processing_at = COALESCE(processing_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), \
+                 processing_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                  WHERE id = ? AND session_id = ? AND status IN ('delivering', 'delivered')",
             )

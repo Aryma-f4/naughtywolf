@@ -81,6 +81,7 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+nw-implant = { path = "crates/implant" }
 
 [lib]
 name = "naughtywolf"
