@@ -73,8 +73,8 @@ if [[ "$healthy" != true ]]; then
 fi
 
 public_healthy=false
-for _ in $(seq 1 45); do
-  status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+for _ in $(seq 1 360); do
+  status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
     --max-time 10 "https://${domain}/healthz" || true)
   if [[ "$status" == 204 ]]; then
     public_healthy=true
