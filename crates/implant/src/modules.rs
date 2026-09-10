@@ -258,7 +258,8 @@ async fn user_enum(task: &Task) -> TaskResult {
         })
         .await;
         if run.ok {
-            serde_json::from_slice(&run.stdout).map_err(|e| format!("parse user inventory: {e}"))
+            serde_json::from_slice::<serde_json::Value>(&run.stdout)
+                .map_err(|e| format!("parse user inventory: {e}"))
         } else {
             return bounded_result(run);
         }
