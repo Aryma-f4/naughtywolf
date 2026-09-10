@@ -815,7 +815,9 @@ pub fn callback_detail_page(
                 "<span class=\"muted\">—</span>".to_owned()
             };
             out.push_str(&format!(
-                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr data-task-id=\"{}\" data-task-command=\"{}\"><td><code>{}</code></td><td>{}</td><td data-task-state>{}</td><td>{}</td><td data-task-output>{}</td></tr>",
+                escape_html(&t.id),
+                escape_html(&t.command),
                 escape_html(&t.id[..t.id.len().min(8)]),
                 escape_html(&t.command),
                 state_pill,
@@ -826,6 +828,43 @@ pub fn callback_detail_page(
         format!(
             "<div class=\"table-scroll\"><table class=\"data-table task-history\"><caption>Task history</caption><thead><tr><th scope=\"col\">Task ID</th><th scope=\"col\">Command</th><th scope=\"col\">State</th><th scope=\"col\">Submitted</th><th scope=\"col\">Output</th></tr></thead><tbody>{out}</tbody></table></div>"
         )
+    };
+
+    let persisted_output = {
+        let mut entries = String::new();
+        for task in tasks
+            .iter()
+            .rev()
+            .filter(|task| matches!(task.status.as_str(), "completed" | "error"))
+        {
+            let output = task
+                .result_output
+                .as_deref()
+                .and_then(|encoded| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()
+                })
+                .map(|decoded| String::from_utf8_lossy(&decoded).into_owned())
+                .unwrap_or_default();
+            entries.push_str(&format!(
+                "<div class=\"entry\" data-task-id=\"{}\"><div class=\"meta\">{} - {} at {}</div><div class=\"output\">{}</div></div>",
+                escape_html(&task.id),
+                escape_html(&task.command),
+                escape_html(&task.status),
+                escape_html(task.completed_at.as_deref().unwrap_or("unknown time")),
+                if output.is_empty() {
+                    "(no output)".to_owned()
+                } else {
+                    escape_html(&output)
+                },
+            ));
+        }
+        if entries.is_empty() {
+            "<div class=\"results-placeholder\"><span aria-hidden=\"true\">▣</span><strong>No output yet</strong><p>Task output will appear here as responses arrive.</p></div>".to_owned()
+        } else {
+            entries
+        }
     };
 
     // Command suggestions for the input <datalist>.
@@ -921,7 +960,7 @@ pub fn callback_detail_page(
     );
 
     let content = format!(
-        "<div class=\"callback-detail-shell\">{callback_detail}{module_studio}<div class=\"callback-console-grid\">{session_context}<section class=\"task-history-panel panel\"><header><div><p class=\"eyebrow\">TASK LEDGER</p><h3>Command history</h3></div><span>Saved responses</span></header>{rows}</section><section id=\"task-results\" class=\"panel results-stream\" data-live-output><header><div><p class=\"eyebrow\">LIVE OUTPUT</p><h3>Response stream</h3></div><span class=\"stream-state\"><i></i> Listening</span></header><div id=\"results-log\" class=\"results-log\"><div class=\"results-placeholder\"><span aria-hidden=\"true\">▣</span><strong>No output yet</strong><p>Task output will appear here as responses arrive.</p></div></div></section></div>{tasking_panel}</div>"
+        "<div class=\"callback-detail-shell\">{callback_detail}{module_studio}<div class=\"callback-console-grid\">{session_context}<section class=\"task-history-panel panel\"><header><div><p class=\"eyebrow\">TASK LEDGER</p><h3>Command history</h3></div><span>Saved responses</span></header>{rows}</section><section id=\"task-results\" class=\"panel results-stream\" data-live-output><header><div><p class=\"eyebrow\">LIVE OUTPUT</p><h3>Response stream</h3></div><span class=\"stream-state\"><i></i> Listening</span></header><div id=\"results-log\" class=\"results-log\">{persisted_output}</div></section></div>{tasking_panel}</div>"
     );
 
     app_page("Callback Interact", user, "callbacks", &content)

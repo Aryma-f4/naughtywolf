@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Extension, Json, Router,
@@ -385,8 +389,68 @@ async fn task_results_sse(
 ) -> Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, Infallible>> + Send> {
     use futures::stream;
 
-    let _ = repo.list_tasks_for_session(&session_id).await;
-    Sse::new(stream::empty())
+    let stream = stream::unfold(
+        (
+            repo,
+            session_id,
+            HashSet::<String>::new(),
+            VecDeque::<serde_json::Value>::new(),
+        ),
+        |(repo, session_id, mut seen, mut queued)| async move {
+            loop {
+                if let Some(payload) = queued.pop_front() {
+                    let event = axum::response::sse::Event::default().data(payload.to_string());
+                    return Some((Ok(event), (repo, session_id, seen, queued)));
+                }
+
+                if let Ok(tasks) = repo.list_tasks_for_session(&session_id).await {
+                    for task in tasks.into_iter().rev() {
+                        if seen.contains(&task.id) {
+                            continue;
+                        }
+                        if let Some(payload) = completed_task_payload(&task) {
+                            seen.insert(task.id);
+                            queued.push_back(payload);
+                        }
+                    }
+                }
+
+                if queued.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        },
+    );
+
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+fn completed_task_payload(task: &crate::db::models::C2TaskWithResult) -> Option<serde_json::Value> {
+    if !matches!(task.status.as_str(), "completed" | "error") {
+        return None;
+    }
+
+    let output = task
+        .result_output
+        .as_deref()
+        .and_then(|encoded| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .map(|decoded| String::from_utf8_lossy(&decoded).into_owned())
+        .unwrap_or_default();
+
+    Some(serde_json::json!({
+        "id": task.id,
+        "command": task.command,
+        "status": task.status,
+        "output": output,
+        "completed_at": task.completed_at,
+        "exit_code": task.result_exit_code,
+    }))
 }
 
 #[cfg(test)]
@@ -573,5 +637,32 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(output, b"lab-user");
+    }
+
+    #[test]
+    fn completed_task_payload_replays_persisted_output() {
+        use base64::Engine;
+
+        let task = crate::db::models::C2TaskWithResult {
+            id: "task-1".into(),
+            session_id: "session-1".into(),
+            command: "ls".into(),
+            args_json: serde_json::json!([]),
+            status: "completed".into(),
+            created_at: "2026-09-10T05:22:22Z".into(),
+            processing_at: Some("2026-09-10T05:22:23Z".into()),
+            completed_at: Some("2026-09-10T05:22:24Z".into()),
+            result_output: Some(base64::engine::general_purpose::STANDARD.encode(b"one\ntwo\n")),
+            result_ok: Some(true),
+            result_exit_code: Some(0),
+        };
+
+        let payload = completed_task_payload(&task).unwrap();
+
+        assert_eq!(payload["id"], "task-1");
+        assert_eq!(payload["command"], "ls");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["output"], "one\ntwo\n");
+        assert_eq!(payload["exit_code"], 0);
     }
 }

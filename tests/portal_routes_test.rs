@@ -10,7 +10,7 @@ use naughtywolf::{
     auth::{AuthenticatedUser, middleware::AuthSession, rbac::Role},
     db::{
         self,
-        models::{Callback, CallbackStatus, EventRule, RunState},
+        models::{C2TaskWithResult, Callback, CallbackStatus, EventRule, RunState},
         repositories::Repository,
     },
     evidence::EvidenceStore,
@@ -720,6 +720,51 @@ fn callback_detail_separates_session_history_output_and_command_dock() {
     assert!(body.contains("data-module-command=\"nw/peas-audit\""));
     assert!(body.contains("data-custom-code-form"));
     assert!(body.contains("Automatic exploitation stays disabled"));
+}
+
+#[test]
+fn callback_detail_rehydrates_completed_output_and_command_history() {
+    use base64::Engine;
+
+    let user = AuthenticatedUser {
+        id: "op-id".into(),
+        username: "op-user".into(),
+        role: Role::Operator,
+    };
+    let callback = Callback {
+        id: "callback-1".into(),
+        asset_id: None,
+        operation_id: None,
+        host: "LAB-WS-01".into(),
+        user_name: "analyst".into(),
+        process: "nw-implant".into(),
+        arch: "amd64".into(),
+        os: "linux".into(),
+        protocol: "http".into(),
+        status: CallbackStatus::Active,
+        last_seen: "2026-09-10T05:22:24Z".into(),
+        created_at: "2026-09-10T05:20:00Z".into(),
+    };
+    let tasks = vec![C2TaskWithResult {
+        id: "task-persisted-1".into(),
+        session_id: callback.id.clone(),
+        command: "ls".into(),
+        args_json: serde_json::json!([]),
+        status: "completed".into(),
+        created_at: "2026-09-10T05:22:22Z".into(),
+        processing_at: Some("2026-09-10T05:22:23Z".into()),
+        completed_at: Some("2026-09-10T05:22:24Z".into()),
+        result_output: Some(base64::engine::general_purpose::STANDARD.encode(b"one\ntwo\n")),
+        result_ok: Some(true),
+        result_exit_code: Some(0),
+    }];
+
+    let body = templates::callback_detail_page(&user, &callback, &tasks, "csrf-token");
+
+    assert!(body.contains("data-task-id=\"task-persisted-1\""));
+    assert!(body.contains("data-task-command=\"ls\""));
+    assert!(body.contains("one\ntwo\n"));
+    assert!(!body.contains("No output yet"));
 }
 
 // ── Task 3: Component contracts ───────────────────────────────────────────────

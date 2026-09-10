@@ -13,6 +13,7 @@
 
   let buildTimer = null;
   let buildDismissed = false;
+  let taskEventSource = null;
 
   const entryAnims = () => {
     window.NWMotion?.page(document.querySelector("main"));
@@ -200,27 +201,61 @@
   /* ── Callback detail page (Mythic-style) ────────────────────────────── */
   const initCallbackSSE = () => {
     const form = document.getElementById("task-form");
-    if (!form || form.dataset.bound === "true") return;
+    if (!form) {
+      taskEventSource?.close();
+      taskEventSource = null;
+      return;
+    }
+    if (form.dataset.bound === "true") return;
     form.dataset.bound = "true";
 
     const sseEndpoint = form.dataset.sseEndpoint || null;
     const logEl = document.getElementById("results-log");
 
+    const taskElement = (root, taskId) => [...root.querySelectorAll("[data-task-id]")]
+      .find((element) => element.dataset.taskId === taskId);
+
+    const upsertTaskResult = (data) => {
+      if (!logEl || !data.id) return;
+      logEl.querySelector(".results-placeholder")?.remove();
+      let entry = taskElement(logEl, data.id);
+      if (!entry) {
+        entry = document.createElement("div");
+        entry.className = "entry";
+        entry.dataset.taskId = data.id;
+        entry.append(document.createElement("div"), document.createElement("div"));
+        entry.children[0].className = "meta";
+        entry.children[1].className = "output";
+        logEl.prepend(entry);
+      }
+      entry.children[0].textContent = `${data.command} - ${data.status}${data.completed_at ? ` at ${data.completed_at}` : ""}`;
+      entry.children[1].textContent = data.output || (data.status === "pending" ? "Waiting for callback…" : "(no output)");
+      entry.dataset.taskStatus = data.status;
+
+      const ledgerRow = taskElement(document, data.id);
+      if (ledgerRow && ledgerRow !== entry) {
+        const state = ledgerRow.querySelector("[data-task-state]");
+        const output = ledgerRow.querySelector("[data-task-output]");
+        if (state) {
+          state.textContent = "";
+          const pill = document.createElement("span");
+          pill.className = `status-pill status-${data.status === "completed" ? "success" : "danger"}`;
+          pill.textContent = data.status === "completed" ? "Completed" : "Error";
+          state.appendChild(pill);
+        }
+        if (output) output.textContent = data.output || "—";
+      }
+    };
+
     // SSE connection for real-time task results.
     if (sseEndpoint && logEl) {
+      taskEventSource?.close();
       const evtSource = new EventSource(sseEndpoint);
+      taskEventSource = evtSource;
       evtSource.addEventListener("message", (event) => {
-        const data = JSON.parse(event.data);
-        const entry = document.createElement("div");
-        entry.className = "entry";
-        const meta = document.createElement("div");
-        meta.className = "meta";
-        meta.textContent = `${data.command} - ${data.status} at ${data.completed_at}`;
-        const output = document.createElement("div");
-        output.className = "output";
-        output.textContent = data.output || "(no output)";
-        entry.append(meta, output);
-        logEl.prepend(entry);
+        try {
+          upsertTaskResult(JSON.parse(event.data));
+        } catch (_) { /* ignore malformed events and keep the stream alive */ }
       });
       evtSource.onerror = () => { /* silently reconnect */ };
     }
@@ -246,19 +281,7 @@
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
 
-        // Optimistically add the task to the results stream.
-        const resultsStream = document.querySelector(".results-stream");
-        if (resultsStream) {
-          const placeholder = document.createElement("div");
-          placeholder.className = "entry";
-          // data.command and data.status come from our own JSON API response (same-origin),
-          // not from raw user HTML — safe to set as text.
-          const meta = document.createElement("div");
-          meta.className = "meta";
-          meta.textContent = `${data.command} - ${data.status}`;
-          placeholder.appendChild(meta);
-          resultsStream.prepend(placeholder);
-        }
+        upsertTaskResult(data);
       } catch (err) {
         console.error("Task submission failed:", err);
       }
@@ -275,7 +298,10 @@
   const initCommandHistory = () => {
     const cmdInput = document.getElementById("command");
     if (!cmdInput) return;
-    const history = [];
+    const history = [...document.querySelectorAll("[data-task-command]")]
+      .map((row) => row.dataset.taskCommand)
+      .filter(Boolean)
+      .reverse();
     let historyIndex = -1;
     cmdInput.addEventListener("keydown", (e) => {
       if (e.key === "ArrowUp") {
@@ -300,8 +326,8 @@
     if (form) {
       form.addEventListener("submit", () => {
         if (cmdInput.value.trim()) {
-          history.unshift(cmdInput.value);
-          if (history.length > 50) history.pop();
+          history.push(cmdInput.value);
+          if (history.length > 50) history.shift();
           historyIndex = -1;
         }
       });
