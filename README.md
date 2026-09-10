@@ -6,7 +6,7 @@ A Rust workspace for authorized security labs, with a local web portal for opera
 
 The interface pairs a dark red theme with editorial typography, a custom wolf mark, and responsive layouts. Menu navigation updates the page content while keeping the header and navigation in place.
 
-[Quick start](#quick-start) · [Deploy on Coolify](docs/coolify.md) · [Screenshots](#screenshots) · [Configuration](#configuration) · [Development](#development) · [Native C2 guide](docs/c2-quickstart.md)
+[Architecture](#architecture) · [Quick start](#quick-start) · [Deploy on Coolify](docs/coolify.md) · [Screenshots](#screenshots) · [Configuration](#configuration) · [Development](#development) · [Native C2 guide](docs/c2-quickstart.md) · [Module Studio](docs/modules.md)
 
 ![NaughtyWolf dashboard with the red theme, scoped record counts, and workflow overview](docs/screenshots/dashboard-desktop.jpg)
 
@@ -21,12 +21,22 @@ The interface pairs a dark red theme with editorial typography, a custom wolf ma
 
 The portal and native C2 packages have separate configuration and account stores. **You only need the web portal to run the interface shown here.**
 
+## Architecture
+
+![NaughtyWolf architecture showing the Coolify portal deployment and the separate native runtime](docs/diagrams/naughtywolf-architecture.png)
+
+The Coolify deployment runs the Rust/Axum portal beside an official GSocket transport adapter. Its UI, recon runner, payload builder, callback API, and private raw-TCP listener share a persistent `/data` volume for SQLite records, evidence, and generated payloads. GSocket forwards opaque, already-encrypted NaughtyWolf frames; callback state and tasking remain owned by the portal.
+
+The portal callback routes (`/c2/register` and `/c2/poll`) and the native endpoint (`/c2/checkin`) currently use different HTTP and wire formats. They do not automatically share accounts, sessions, tasks, or callback state. See the **[architecture guide](docs/architecture.md)** for the request flows, deployment boundary, and source-code map.
+
 ## Features
 
 - **Operation records:** define a purpose, track assets, and keep related lab records together.
 - **Scoped overview:** dashboard counts come from persisted records visible to the signed-in user.
 - **Interactive topology:** map operations, assets, registered callbacks, and saved DNS observations. Search, filter, pan, zoom, inspect nodes, or switch to a list.
 - **Integrated reconnaissance:** run DNS or DNS + HTTP/TLS observations against a selected active asset. Results persist in check history, enrich the topology, and leave an audit trail.
+- **Payload creation studio:** configure target, callback, and beacon timing in a four-step wizard, review the non-secret profile, then build or edit native artifacts.
+- **Active callback workspace:** scan session health from a compact status board, open a callback, and keep task history, live output, session context, and the command dock in one view.
 - **Evidence and reporting:** inspect stored artifacts and produce printable operation summaries.
 - **Traceability:** an append-only audit trail records operation, asset, and account changes.
 - **Local access control:** Admin, Operator, and Viewer roles, password hashing, signed sessions, and CSRF-protected forms.
@@ -42,6 +52,27 @@ The portal and native C2 packages have separate configuration and account stores
 Install a current stable Rust toolchain with Cargo and the native compiler/linker required by your platform. The commands below use a POSIX shell and OpenSSL to generate a session secret.
 
 The portal uses **SQLite**. It does not require a separate database server, Node.js, or npm.
+
+### Recommended server resources
+
+NaughtyWolf is a lightweight Rust/Axum service backed by SQLite. For a typical
+authorized lab deployment, use **4 CPU cores and 4 GB RAM**. This gives the web
+portal, callback handling, SQLite, recon jobs, and payload management enough
+headroom to run together comfortably.
+
+| Deployment | CPU | RAM | Suitable for |
+| --- | ---: | ---: | --- |
+| Minimum | 2 cores | 2 GB | Development, demos, and a small lab with a few active callbacks. |
+| Recommended | 4 cores | 4 GB | Normal team use, concurrent portal activity, recon jobs, and dozens of callbacks. |
+| Larger lab | 8 cores | 8 GB or more | More concurrent operators, callbacks, builds, and retained operational data. |
+
+These are practical starting points rather than hard limits; actual usage
+depends on callback frequency, concurrent recon jobs, payload builds, log
+volume, and retained evidence. Keep at least **10 GB of free disk space** for
+the application, SQLite database, logs, evidence, and generated payloads. If
+you compile NaughtyWolf on the same machine, **4 GB RAM is the practical
+minimum for the Rust build**, while 8 GB provides smoother builds. A
+precompiled release binary generally needs fewer resources at runtime.
 
 ### 2. Clone and build the portal
 
@@ -86,7 +117,7 @@ The server exposes a health endpoint at `/healthz`; a healthy process returns HT
 
 ## Your first workflow
 
-For hosted deployment, follow the **[Coolify guide](docs/coolify.md)**: select the Docker Compose build pack, use `/docker-compose.yml`, set the two secrets, assign an HTTPS domain to service `app` on internal port `8080`, and deploy. Database, evidence, and generated payloads persist in the `/data` volume. The image includes Rust and the workspace sources for the existing payload build UI.
+For hosted deployment, follow the **[Coolify guide](docs/coolify.md)**: select the Docker Compose build pack, use `/docker-compose.yml`, set the session, C2, and GSocket secrets, assign an HTTPS domain to service `app` on internal port `8080`, and deploy. Database, evidence, and generated payloads persist in `/data`. The private raw listener on port `4630` is reachable only by the GSocket sidecar.
 
 1. **Define an operation.** As an Admin, open **Operations → Create operation** and enter its name and purpose.
 2. **Record the assets.** Use **Add asset** on an operation to register its scoped targets.
@@ -152,11 +183,11 @@ The desktop dashboard is shown at the top of this README. Original screenshots a
 | Evidence | `/evidence` | Artifact metadata and verified downloads. |
 | Reports | `/reports` | Printable summaries from stored operation records. |
 | Audit | `/audit` | Recorded actions and outcomes. |
-| Callbacks | `/callbacks` | Callback records and task details. |
+| Active Callbacks | `/callbacks` | Session status board, callback inventory, task history, live output, and interaction workspace. |
 | Services | `/services` | Service records. |
 | Eventing | `/eventing` | Event-rule configuration. |
 | Event feed | `/events` | Workspace event records. |
-| Payloads | `/payloads` | Build forms and generated artifacts. |
+| Create Payload | `/payloads` | Four-step native payload wizard and generated artifact library. |
 | Search | `/search` | Search available workspace records. |
 | Administration | `/admin/users` | Local account roles and enabled state. |
 
@@ -182,6 +213,9 @@ Portal settings are read from the process environment or `.env` in the working d
 | `NAUGHTYWOLF_COOKIE_SECURE` | `false` | Set to `true` when serving the portal through HTTPS. |
 | `NAUGHTYWOLF_EVIDENCE_DIR` | `evidence` | Root directory for evidence files. |
 | `NAUGHTYWOLF_C2_PSK` | `dev-psk-change-me` | Shared key for the portal's C2 routes. Replace before using those routes. |
+| `NAUGHTYWOLF_TCP_BIND` | unset | Private raw C2 listener. Compose sets `0.0.0.0:4630` inside its private network. |
+| `NAUGHTYWOLF_TCP_PROTOCOL` | `tcp` | Callback protocol label for the raw listener; Compose uses `gs`. |
+| `GSOCKET_SECRET` | required by Compose | GSocket tunnel secret; keep it different from `NAUGHTYWOLF_C2_PSK`. |
 | `RUST_LOG` | `info,naughtywolf=debug` | Logging filter. |
 
 Relative database and evidence paths resolve from the working directory. Keep that directory consistent between runs.

@@ -29,11 +29,12 @@ pub async fn serve(state: ServerState, config: &crate::config::ServerConfig) -> 
     tracing::info!(bind = %config.bind, "c2 http listener up");
     // Spawn optional TCP transport listener.
     if let Some(tcp_bind) = &config.tcp_bind {
-        let tcp_app = crate::channels::application(state.clone());
-        let tcp_listener = tokio::net::TcpListener::bind(tcp_bind).await?;
-        tracing::info!(tcp_bind, "c2 tcp listener up");
+        let tcp_state = state.clone();
+        let tcp_bind = tcp_bind.clone();
         tokio::spawn(async move {
-            let _ = axum::serve(tcp_listener, tcp_app).await;
+            if let Err(error) = crate::tcp::serve_tcp(tcp_state, tcp_bind).await {
+                tracing::error!(%error, "c2 raw-tcp listener stopped");
+            }
         });
     }
     // Spawn optional DNS listener.

@@ -54,7 +54,7 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
                 ("dashboard", "/dashboard", "Dashboard"),
                 ("topology", "/topology", "Topology"),
                 ("recon", "/recon", "Recon"),
-                ("callbacks", "/callbacks", "Callbacks"),
+                ("callbacks", "/callbacks", "Active Callbacks"),
                 ("operations", "/operations", "Operations"),
                 ("inventory", "/inventory", "Assets"),
                 ("checks", "/checks", "Checks"),
@@ -79,8 +79,9 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
         (
             "System",
             vec![
-                ("payloads", "/payloads", "Payloads"),
+                ("payloads", "/payloads", "Create Payload"),
                 ("search", "/search", "Search"),
+                ("guide", "/guide", "Operator Guide"),
                 ("admin", "/admin/users", "Admin"),
             ],
         ),
@@ -109,13 +110,13 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
     let can_operator = user.role.allows(Role::Operator);
     let quick_links = [
         ("dashboard", "/dashboard", "Dashboard"),
-        ("callbacks", "/callbacks", "Callbacks"),
+        ("callbacks", "/callbacks", "Active"),
         ("events", "/events", "Events"),
-        ("payloads", "/payloads", "Payloads"),
-        ("search", "/search", "Search"),
+        ("payloads", "/payloads", "Create"),
+        ("guide", "/guide", "Guide"),
     ]
     .iter()
-    .filter(|(name, _, _)| *name == "dashboard" || can_operator)
+    .filter(|(name, _, _)| matches!(*name, "dashboard" | "guide") || can_operator)
     .map(|(name, href, label)| {
         let current = (name == &active_nav)
             .then_some(" aria-current=\"page\"")
@@ -136,8 +137,13 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
                     let current = (name == active_nav)
                         .then_some(" aria-current=\"page\"")
                         .unwrap_or("");
+                    let feature_class = if name == "payloads" {
+                        " nav-link-featured"
+                    } else {
+                        ""
+                    };
                     format!(
-                        "<a class=\"nav-link\" href=\"{href}\"{current}><span class=\"nav-icon\" aria-hidden=\"true\">{}</span><span class=\"nav-label\">{label}</span></a>",
+                        "<a class=\"nav-link{feature_class}\" data-nav-item=\"{name}\" href=\"{href}\"{current}><span class=\"nav-icon\" aria-hidden=\"true\">{}</span><span class=\"nav-label\">{label}</span></a>",
                         nav_icon(name),
                     )
                 })
@@ -219,6 +225,41 @@ pub fn dashboard_page(user: &AuthenticatedUser, summary: &DashboardSummary) -> S
             evidence_icon = nav_icon("evidence"),
         ),
     )
+}
+
+pub fn guide_page(user: &AuthenticatedUser) -> String {
+    let body = r##"
+<section class="guide-page" data-guide-page>
+  <header class="guide-hero panel">
+    <div><p class="eyebrow">OPERATOR GUIDE / START HERE</p><h2>From a blank workspace<br>to a traceable assessment.</h2><p>Follow one connected workflow for an authorized lab. Each step points to the exact NaughtyWolf workspace you need next.</p></div>
+    <nav class="guide-jump" aria-label="Guide sections"><a href="#guide-setup">Setup</a><a href="#guide-workflow">Workflow</a><a href="#guide-payload">Payloads</a><a href="#guide-callback">Callbacks</a><a href="#guide-deploy">Deploy</a></nav>
+  </header>
+
+  <section id="guide-setup" class="guide-section panel"><div class="guide-section-index">00</div><div><p class="eyebrow">BEFORE YOU BEGIN</p><h3>Prepare the workspace.</h3><p>Set a stable SQLite database URL and session secret, create an administrator, then start the portal. Keep the same session secret between restarts so signed sessions remain valid.</p><pre><code>cp .env.example .env
+cargo run -p naughtywolf -- user create --username admin --role admin
+cargo run -p naughtywolf -- serve</code></pre><div class="guide-note"><strong>Scope first</strong><span>Use NaughtyWolf only for systems you own or have explicit permission to assess.</span></div></div></section>
+
+  <section id="guide-workflow" class="guide-section"><div class="guide-section-index">01—06</div><div><p class="eyebrow">THE WALKTHROUGH</p><h3>One operation, six deliberate steps.</h3><div class="guide-steps">
+    <article><span>01</span><h4>1. Define scope</h4><p>Create an operation with a clear purpose and boundary. Every asset, check, and record stays attached to that context.</p><a href="/operations/new">Create an operation ↗</a></article>
+    <article><span>02</span><h4>2. Add authorized assets</h4><p>Register a hostname, domain, or IP that belongs to the approved operation. Use a label your team will recognize later.</p><a href="/operations">Open operations ↗</a></article>
+    <article><span>03</span><h4>3. Run reconnaissance</h4><p>Select a scoped asset, choose DNS or DNS plus HTTP/TLS observation, and save the result into check history.</p><a href="/recon">Open recon ↗</a></article>
+    <article><span>04</span><h4>4. Build a payload</h4><p>Choose the exact target platform, enter a reachable callback address, select transport, and review beacon timing.</p><a href="/payloads">Open Payload Studio ↗</a></article>
+    <article><span>05</span><h4>5. Interact with callbacks</h4><p>Open a registered session to run user enumeration, a PEASS assessment, or bounded custom code from Module Studio.</p><a href="/callbacks">Open callbacks ↗</a></article>
+    <article><span>06</span><h4>6. Preserve evidence</h4><p>Review task output, stored artifacts, reports, and the append-only audit trail before closing the operation.</p><a href="/evidence">Review evidence ↗</a></article>
+  </div></div></section>
+
+  <section id="guide-payload" class="guide-section panel"><div class="guide-section-index">P</div><div><p class="eyebrow">PAYLOAD FIELD GUIDE</p><h3>Choose values the target can actually use.</h3><div class="guide-reference">
+    <div><strong>LHOST</strong><p>Use a DNS name such as <code>c2.lab.example</code> when records and TLS are managed, or an IPv4/IPv6 address such as <code>10.20.0.5</code> for a direct lab route. Enter only the host, without <code>http://</code> or a path.</p></div>
+    <div><strong>LPORT</strong><p>Use the port exposed by your listener or reverse proxy. Confirm routing and lab-firewall rules from the target network before building.</p></div>
+    <div><strong>Protocol</strong><p>HTTP uses the portal callback endpoint, TCP uses the raw listener, and GSocket uses its relay with a loopback local forward.</p></div>
+    <div><strong>Timing</strong><p>A shorter interval gives faster feedback but more traffic. Add modest jitter below the base interval to avoid synchronized lab callbacks.</p></div>
+  </div><a class="button" href="/payloads">Build with guided fields <span aria-hidden="true">↗</span></a></div></section>
+
+  <section id="guide-callback" class="guide-section panel"><div class="guide-section-index">M</div><div><p class="eyebrow">MODULE STUDIO</p><h3>Assess, then decide.</h3><p>User enumeration is read-only. PEASS downloads the current official platform asset, reports its SHA-256 and CVE references, and leaves automatic exploitation disabled. Custom code is sent as UTF-8 base64, written to a private temporary file, run with a timeout, and removed afterward.</p><div class="guide-note"><strong>Review the output</strong><span>A privilege-escalation candidate is a lead. Validate host context and impact before taking a privilege-changing action.</span></div><a href="/callbacks">Choose a callback ↗</a></div></section>
+
+  <section id="guide-deploy" class="guide-section"><div class="guide-section-index">D</div><div><p class="eyebrow">DEPLOYMENT</p><h3>Take the same workflow to Coolify.</h3><p>Deploy the root Docker Compose file, configure unique session, C2, and GSocket secrets, attach HTTPS to the app service, and keep the raw listener private to the Compose network.</p><div class="guide-links"><a href="https://github.com/Aryma-f4/naughtywolf/blob/develop/docs/coolify.md" target="_blank" rel="noreferrer">Coolify guide ↗</a><a href="https://github.com/Aryma-f4/naughtywolf/blob/develop/docs/modules.md" target="_blank" rel="noreferrer">Module reference ↗</a></div></div></section>
+</section>"##;
+    app_page("Operator Guide", user, "guide", body)
 }
 
 pub fn operations_page(user: &AuthenticatedUser, operations: &[Operation]) -> String {
@@ -667,7 +708,63 @@ pub fn payloads_page(
     .collect::<String>();
 
     let body = format!(
-        "{error_html}{errors_html}{building_html}<form class=\"form-panel panel\" method=\"post\" action=\"/payloads/generate\" data-payload-form><input type=\"hidden\" name=\"csrf_token\" value=\"{token}\"><div class=\"form-field\"><label for=\"payload-name\">Name</label><input id=\"payload-name\" name=\"name\" value=\"{f_name}\" placeholder=\"linux-implant\" maxlength=\"80\" required></div><div class=\"form-field\"><label for=\"payload-platform\">Target platform</label><select id=\"payload-platform\">{platform_options}</select><p class=\"muted field-hint\" id=\"payload-platform-hint\">{visible_platform}</p><input type=\"hidden\" name=\"os\" id=\"payload-os\" value=\"{f_os}\"><input type=\"hidden\" name=\"arch\" id=\"payload-arch\" value=\"{f_arch}\"><input type=\"hidden\" name=\"target\" id=\"payload-target\" value=\"{f_target}\"></div><div class=\"form-field\"><label for=\"payload-lhost\">Callback host (LHost)</label><input id=\"payload-lhost\" name=\"lhost\" value=\"{f_lhost}\" placeholder=\"127.0.0.1\" required></div><div class=\"form-field\"><label for=\"payload-lport\">Callback port (LPort)</label><input id=\"payload-lport\" name=\"lport\" type=\"number\" value=\"{f_lport}\" min=\"1\" max=\"65535\" required></div><div class=\"form-field\"><label for=\"payload-psk\">Shared secret (NW_PSK)</label><div class=\"input-with-btn\"><input id=\"payload-psk\" name=\"psk\" value=\"{f_psk}\" placeholder=\"share-a-lab-psk\" required><button type=\"button\" class=\"btn btn-sm\" id=\"payload-psk-random\" title=\"Generate random secret\">Random</button></div><p class=\"muted field-hint\">Must match the portal's C2 PSK to receive callbacks.</p></div><div class=\"form-field\"><label for=\"payload-proto\">Protocol</label><select id=\"payload-proto\" name=\"protocol\">{protocol_options}</select><p class=\"muted field-hint\">tcp/gs need the raw TCP listener (NW_TCP_BIND); gs rides TCP through a gsocket tunnel.</p></div><div class=\"form-field\"><label for=\"payload-interval\">Beacon interval (ms)</label><input id=\"payload-interval\" name=\"interval_ms\" type=\"number\" value=\"{f_interval}\" min=\"10\"></div><div class=\"form-field\"><label for=\"payload-jitter\">Jitter (ms)</label><input id=\"payload-jitter\" name=\"jitter_ms\" type=\"number\" value=\"{f_jitter}\" min=\"0\"></div><button type=\"submit\">{btn_label}</button></form><h2>Built payloads</h2>{list}",
+        r#"{error_html}{errors_html}{building_html}
+<section class="payload-studio" aria-labelledby="payload-studio-title">
+  <header class="payload-studio-head panel">
+    <span class="payload-creation-icon" aria-hidden="true">{payload_icon}</span>
+    <div><p class="eyebrow">BUILD STUDIO / NATIVE RUNTIME</p><h2 id="payload-studio-title">Shape the field kit.</h2><p>Choose a target, configure its callback, tune beacon timing, then review the exact build profile.</p></div>
+    <span class="payload-studio-mark">NW / BUILD</span>
+  </header>
+  <form class="payload-wizard panel" method="post" action="/payloads/generate" data-payload-form data-payload-wizard>
+    <input type="hidden" name="csrf_token" value="{token}">
+    <nav class="payload-progress" aria-label="Payload creation progress">
+      <button type="button" data-wizard-tab="0"><span>01</span><strong>Target</strong><small>OS &amp; identity</small></button>
+      <button type="button" data-wizard-tab="1"><span>02</span><strong>Callback</strong><small>Endpoint &amp; protocol</small></button>
+      <button type="button" data-wizard-tab="2"><span>03</span><strong>Timing</strong><small>Beacon behavior</small></button>
+      <button type="button" data-wizard-tab="3"><span>04</span><strong>Review</strong><small>Confirm &amp; build</small></button>
+    </nav>
+    <div class="payload-step" data-payload-step="0">
+      <div class="payload-step-copy"><span>STEP 01</span><h3>Select the target.</h3><p>Name this build and choose the operating system and architecture that will receive it.</p></div>
+      <div class="payload-fields">
+        <div class="form-field"><label for="payload-name">Payload name</label><input id="payload-name" name="name" value="{f_name}" placeholder="finance-lab-linux-amd64" maxlength="80" required><p class="muted field-hint"><strong>Example:</strong> <code>finance-lab-linux-amd64</code>. Use an operation, purpose, and platform label that stays recognizable in the artifact library.</p></div>
+        <div class="form-field"><label for="payload-platform">Target platform</label><select id="payload-platform">{platform_options}</select><p class="muted field-hint" id="payload-platform-hint">{visible_platform}</p><p class="muted field-hint"><strong>Best practice:</strong> match both the operating system and CPU architecture of the authorized host. An amd64 build will not run natively on arm64.</p><input type="hidden" name="os" id="payload-os" value="{f_os}"><input type="hidden" name="arch" id="payload-arch" value="{f_arch}"><input type="hidden" name="target" id="payload-target" value="{f_target}"></div>
+      </div>
+    </div>
+    <div class="payload-step" data-payload-step="1">
+      <div class="payload-step-copy"><span>STEP 02</span><h3>Configure the callback.</h3><p>Point the build at an authorized native runtime and use the same shared secret on both sides.</p></div>
+      <div class="payload-fields payload-fields-grid">
+        <div class="form-field payload-field-wide"><label for="payload-lhost">Callback host (LHost)</label><input id="payload-lhost" name="lhost" value="{f_lhost}" placeholder="c2.lab.example or 10.20.0.5" required><p class="muted field-hint"><strong>Accepted:</strong> A DNS name such as <code>c2.lab.example</code>, or an IPv4 or IPv6 address reachable from the target. Enter the host only—no scheme, port, or URL path.</p></div>
+        <div class="form-field"><label for="payload-lport">Callback port</label><input id="payload-lport" name="lport" type="number" value="{f_lport}" min="1" max="65535" placeholder="8443" required><p class="muted field-hint"><strong>Example:</strong> <code>443</code>, <code>8443</code>, or the private raw-listener port. Choose a port allowed by your lab firewall and exposed by the matching listener.</p></div>
+        <div class="form-field"><label for="payload-proto">Protocol</label><select id="payload-proto" name="protocol">{protocol_options}</select><p class="muted field-hint"><strong>HTTP</strong> connects to the portal, <strong>TCP</strong> needs the raw listener, and <strong>GSocket</strong> uses the relay and a local forward.</p></div>
+        <div class="form-field payload-field-full"><label for="payload-psk">Shared secret (NW_PSK)</label><div class="input-with-btn"><input id="payload-psk" name="psk" value="{f_psk}" placeholder="generate-a-unique-secret-for-this-lab" required><button type="button" class="btn btn-sm btn-ghost" id="payload-psk-random" title="Generate random secret">Generate secret</button></div><p class="muted field-hint"><strong>Best practice:</strong> generate a long unique secret and use the same value on the compatible listener. Do not reuse the GSocket relay secret or commit either secret.</p></div>
+        <div class="payload-gsocket-fields payload-field-full" data-gsocket-fields hidden>
+          <div class="form-field"><label for="payload-gsocket-secret">GSocket tunnel secret</label><div class="input-with-btn"><input id="payload-gsocket-secret" name="gsocket_secret" placeholder="generate-a-separate-relay-secret" disabled><button type="button" class="btn btn-sm btn-ghost" data-gsocket-secret-generate>Generate secret</button></div><p class="muted field-hint"><strong>Best practice:</strong> use a separate random value shared only with gs-netcat. It is never shown in the review or artifact list.</p></div>
+          <div class="form-field"><label for="payload-gsocket-port">Local forward port</label><input id="payload-gsocket-port" name="gsocket_local_port" type="number" value="4630" min="1" max="65535" placeholder="4630" disabled><p class="muted field-hint"><strong>Example:</strong> <code>4630</code>. Choose an unused loopback port; it does not need to be publicly exposed.</p></div>
+          <p class="muted payload-field-full">The callback host is pinned to loopback because gs-netcat owns the relay connection. Install gs-netcat on the authorized lab host or set NW_GS_NETCAT to its path.</p>
+        </div>
+      </div>
+    </div>
+    <div class="payload-step" data-payload-step="2">
+      <div class="payload-step-copy"><span>STEP 03</span><h3>Tune the beacon.</h3><p>Set a predictable lab cadence. Jitter adds a randomized delay around the base interval.</p></div>
+      <div class="payload-fields payload-fields-grid">
+        <div class="form-field"><label for="payload-interval">Beacon interval (ms)</label><input id="payload-interval" name="interval_ms" type="number" value="{f_interval}" min="10" placeholder="5000" required><p class="muted field-hint"><strong>Example:</strong> <code>5000</code> means a five-second base interval. Shorter values give faster feedback and generate more traffic.</p></div>
+        <div class="form-field"><label for="payload-jitter">Jitter (ms)</label><input id="payload-jitter" name="jitter_ms" type="number" value="{f_jitter}" min="0" placeholder="1000" required><p class="muted field-hint"><strong>Example:</strong> <code>1000</code> adds up to ±1 second. Keep jitter below the base interval for predictable lab behavior.</p></div>
+        <aside class="timing-note payload-field-full"><span class="status-dot"></span><div><strong>Runtime note</strong><p>TCP and gsocket profiles require the corresponding native listener. Build output does not create an automatic portal-to-native bridge.</p></div></aside>
+      </div>
+    </div>
+    <div class="payload-step" data-payload-step="3">
+      <div class="payload-step-copy"><span>STEP 04</span><h3>Review the build.</h3><p>Confirm the non-secret profile below. The shared secret is intentionally omitted from this summary.</p></div>
+      <div class="payload-review" data-payload-review>
+        <div><span>Identity</span><strong>{f_name}</strong></div>
+        <div><span>Target</span><strong>{f_os} / {f_arch}</strong></div>
+        <div><span>Callback</span><strong>{review_protocol} · {f_lhost}:{f_lport}</strong></div>
+        <div><span>Timing</span><strong>{f_interval} ms · ±{f_jitter} ms</strong></div>
+      </div>
+    </div>
+    <footer class="payload-wizard-actions"><button type="button" class="btn btn-ghost" data-wizard-back>Back</button><span>Need examples? Read the <a href="/guide#guide-payload">payload field guide</a>. Only build for systems you are authorized to test.</span><button type="button" data-wizard-next>Continue <span aria-hidden="true">→</span></button><button type="submit" data-wizard-build>{btn_label} <span aria-hidden="true">↗</span></button></footer>
+  </form>
+</section>
+<section class="payload-library" aria-labelledby="payload-library-title"><div class="section-heading"><div><p class="eyebrow">ARTIFACT LIBRARY</p><h2 id="payload-library-title">Built payloads</h2></div><span>{build_count:02} FILES</span></div>{list}</section>"#,
         token = escape_html(csrf_token),
         f_name = escape_html(&f_name),
         f_lhost = escape_html(&f_lhost),
@@ -684,6 +781,9 @@ pub fn payloads_page(
             "Build implant"
         },
         protocol_options = protocol_options,
+        review_protocol = escape_html(&f_protocol.to_uppercase()),
+        payload_icon = nav_icon("payloads"),
+        build_count = builds.len(),
     );
     app_page("Payloads", user, "payloads", &body)
 }
@@ -761,7 +861,8 @@ pub fn callback_detail_page(
         .join("\n");
 
     let callback_detail = format!(
-        "<div class=\"callback-header\"><div class=\"callback-meta\"><h2>{}</h2><p class=\"muted\">{}@{} &mdash; {} {}</p></div>{}</div>",
+        "<header class=\"callback-header\"><div class=\"callback-meta\"><p class=\"eyebrow\">INTERACT / {}</p><h2>{}</h2><p class=\"muted\">{}@{} &mdash; {} {}</p></div><div class=\"callback-header-actions\">{}<a class=\"btn btn-ghost\" href=\"/callbacks\">All callbacks</a></div></header>",
+        escape_html(&callback.id[..callback.id.len().min(8)]),
         escape_html(&callback.host),
         escape_html(&callback.user_name),
         escape_html(&callback.host),
@@ -774,32 +875,56 @@ pub fn callback_detail_page(
     );
 
     let tasking_panel = format!(
-        "<div class=\"panel tasking-panel\"><h3>Task This Callback</h3>
+        "<div class=\"command-dock panel\"><div class=\"command-dock-label\"><span aria-hidden=\"true\">&gt;_</span><div><strong>Task this callback</strong><small>Use ↑ and ↓ for command history</small></div></div>
         <form id=\"task-form\" action=\"/c2/sessions/{}/tasks\" method=\"POST\" data-sse-endpoint=\"/c2/sessions/{}/tasks/sse\">
             <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">
-            <div class=\"field-group\">
-                <label for=\"command\">Command</label>
-                <input list=\"command-suggestions\" type=\"text\" id=\"command\" name=\"command\" autocomplete=\"off\" placeholder=\"e.g. whoami\" required>
+            <div class=\"command-input\">
+                <label class=\"sr-only\" for=\"command\">Command</label><span aria-hidden=\"true\">$</span>
+                <input list=\"command-suggestions\" type=\"text\" id=\"command\" name=\"command\" autocomplete=\"off\" placeholder=\"Task an authorized lab agent…\" required>
                 <datalist id=\"command-suggestions\">{}</datalist>
             </div>
-            <div class=\"field-group\">
-                <label for=\"args\">Arguments</label>
-                <input type=\"text\" id=\"args\" name=\"args\" placeholder=\"optional\">
-            </div>
-            <div class=\"form-actions\">
-                <button type=\"submit\" class=\"btn btn-primary\">Execute &rarr;</button>
-                <button type=\"button\" id=\"refresh-btn\" class=\"btn btn-ghost\">Refresh</button>
-            </div>
+            <label class=\"sr-only\" for=\"args\">Arguments</label><input class=\"command-args\" type=\"text\" id=\"args\" name=\"args\" placeholder=\"Arguments (optional)\">
+            <button type=\"button\" id=\"refresh-btn\" class=\"btn btn-ghost\" aria-label=\"Refresh task history\">↻</button>
+            <button type=\"submit\" class=\"btn btn-primary\">Execute <span aria-hidden=\"true\">↗</span></button>
         </form></div>",
         &callback.id, &callback.id, escape_html(csrf_token), suggestions_html
     );
 
+    let session_context = format!(
+        "<aside class=\"session-context panel\"><p class=\"eyebrow\">Session context</p><dl><div><dt>Host</dt><dd>{}</dd></div><div><dt>User</dt><dd>{}</dd></div><div><dt>Process</dt><dd>{}</dd></div><div><dt>Platform</dt><dd>{} / {}</dd></div><div><dt>Protocol</dt><dd>{}</dd></div><div><dt>Last check-in</dt><dd>{}</dd></div></dl><a href=\"/topology\">Locate in topology ↗</a></aside>",
+        escape_html(&callback.host),
+        escape_html(&callback.user_name),
+        escape_html(&callback.process),
+        escape_html(&callback.os),
+        escape_html(&callback.arch),
+        escape_html(&callback.protocol.to_uppercase()),
+        escape_html(&callback.last_seen),
+    );
+
+    let module_studio = format!(
+        r##"<section class="module-studio panel" data-module-studio data-task-endpoint="/c2/sessions/{callback_id}/tasks" data-csrf-token="{csrf}">
+        <header><div><p class="eyebrow">MODULE STUDIO / ASSESSMENT</p><h3>Turn a callback into a clear next step.</h3><p>Run structured discovery, review privilege-escalation candidates, or execute a small operator-authored script.</p></div><span class="module-platform">{os} / {arch}</span></header>
+        <div class="module-grid">
+          <article class="module-card"><span class="module-index">01</span><div><h4>User enumeration</h4><p>Inventory local accounts and login capability with a read-only collector.</p></div><button type="button" class="btn btn-primary" data-module-command="nw/user-enum" data-module-timeout="45000">Enumerate users</button></article>
+          <article class="module-card module-card-featured"><span class="module-index">02</span><div><h4>PEASS assessment</h4><p>Fetch the official latest platform asset, record its SHA-256, and surface possible escalation paths.</p></div><button type="button" class="btn btn-primary" data-module-command="nw/peas-audit" data-module-timeout="300000">Run assessment</button></article>
+          <article class="module-card module-custom"><span class="module-index">03</span><div><h4>Custom code</h4><p>Run up to 24 KiB through a selected interpreter with timeout and output limits.</p></div><button type="button" class="btn btn-ghost" data-code-toggle aria-expanded="false">Open editor</button></article>
+        </div>
+        <form class="custom-code-form" data-custom-code-form hidden>
+          <div class="form-field"><label for="module-language">Interpreter</label><select id="module-language" name="language"><option value="shell">Shell</option><option value="python">Python 3</option><option value="powershell">PowerShell</option></select></div>
+          <div class="form-field"><label for="module-timeout">Timeout</label><select id="module-timeout" name="timeout"><option value="30000">30 seconds</option><option value="60000" selected>60 seconds</option><option value="120000">2 minutes</option></select></div>
+          <div class="form-field module-code-field"><label for="module-source">Source</label><textarea id="module-source" name="source" maxlength="24576" rows="9" spellcheck="false" placeholder="# Authorized lab code…" required></textarea><small><span data-source-count>0</span> / 24,576 characters</small></div>
+          <footer><p><strong>Assessment boundary.</strong> Automatic exploitation stays disabled. Review findings before taking any privilege-changing action.</p><button type="submit" class="btn btn-primary">Run custom code <span aria-hidden="true">↗</span></button></footer>
+        </form>
+        <p class="module-status" data-module-status role="status" aria-live="polite"></p>
+      </section>"##,
+        callback_id = escape_html(&callback.id),
+        csrf = escape_html(csrf_token),
+        os = escape_html(&callback.os.to_uppercase()),
+        arch = escape_html(&callback.arch.to_uppercase()),
+    );
+
     let content = format!(
-        "<div class=\"callback-detail-shell\">{}{}
-        <div id=\"task-results\" class=\"panel results-stream\"><h3>Task Results <span class=\"muted\">(live)</span></h3>
-        <div id=\"results-log\" class=\"results-log\"></div></div>
-        {}</div>",
-        callback_detail, tasking_panel, rows
+        "<div class=\"callback-detail-shell\">{callback_detail}{module_studio}<div class=\"callback-console-grid\">{session_context}<section class=\"task-history-panel panel\"><header><div><p class=\"eyebrow\">TASK LEDGER</p><h3>Command history</h3></div><span>Saved responses</span></header>{rows}</section><section id=\"task-results\" class=\"panel results-stream\" data-live-output><header><div><p class=\"eyebrow\">LIVE OUTPUT</p><h3>Response stream</h3></div><span class=\"stream-state\"><i></i> Listening</span></header><div id=\"results-log\" class=\"results-log\"><div class=\"results-placeholder\"><span aria-hidden=\"true\">▣</span><strong>No output yet</strong><p>Task output will appear here as responses arrive.</p></div></div></section></div>{tasking_panel}</div>"
     );
 
     app_page("Callback Interact", user, "callbacks", &content)
@@ -831,13 +956,18 @@ pub fn event_feed_page(user: &AuthenticatedUser, events: &[AuditEvent]) -> Strin
 }
 
 pub fn callbacks_page(user: &AuthenticatedUser, callbacks: &[Callback]) -> String {
+    let count = |status| callbacks.iter().filter(|c| c.status == status).count();
+    let active = count(CallbackStatus::Active);
+    let beacon = count(CallbackStatus::Beacon);
+    let dormant = count(CallbackStatus::Dormant);
+    let lost = count(CallbackStatus::Lost);
     let rows = callbacks
         .iter()
         .map(|c| {
             let (status_label, status_class) = callback_status(c.status);
             let status = status_pill(status_label, status_class);
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/callbacks/{}\" class=\"btn btn-sm btn-ghost\">Interact &rarr;</a></td></tr>",
+                "<tr class=\"callback-row status-{status_class}\"><td><span class=\"callback-host\"><i aria-hidden=\"true\"></i><strong>{}</strong></span></td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/callbacks/{}\" class=\"btn btn-sm btn-ghost\">Interact &rarr;</a></td></tr>",
                 escape_html(&c.host),
                 escape_html(&c.user_name),
                 escape_html(&c.process),
@@ -852,18 +982,20 @@ pub fn callbacks_page(user: &AuthenticatedUser, callbacks: &[Callback]) -> Strin
         })
         .collect::<String>();
     let table = if callbacks.is_empty() {
-        "<section class=\"empty-state panel\"><p>No callbacks yet. Build a payload and run the implant to see beacons here.</p></section>".to_owned()
+        "<section class=\"empty-state panel callback-empty\"><span class=\"empty-callback-icon\" aria-hidden=\"true\">ϟ</span><h2>No callbacks in view.</h2><p>Create a compatible native payload and run it on an authorized lab host to see sessions here.</p><a class=\"button\" href=\"/payloads\">Create payload ↗</a></section>".to_owned()
     } else {
         format!(
-            "<div class=\"table-scroll\"><table class=\"data-table callbacks-table\"><caption>Active callbacks</caption><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">User</th><th scope=\"col\">Process</th><th scope=\"col\">OS/Arch</th><th scope=\"col\">Proto</th><th scope=\"col\">Status</th><th scope=\"col\">Last seen</th><th scope=\"col\">Op</th><th scope=\"col\">First seen</th><th scope=\"col\">Actions</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<div class=\"callback-table-shell panel\"><div class=\"table-scroll\"><table class=\"data-table callbacks-table\"><caption>Active callbacks</caption><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">User</th><th scope=\"col\">Process</th><th scope=\"col\">OS / Arch</th><th scope=\"col\">Protocol</th><th scope=\"col\">State</th><th scope=\"col\">Last check-in</th><th scope=\"col\">Operation</th><th scope=\"col\">First seen</th><th scope=\"col\"><span class=\"sr-only\">Action</span></th></tr></thead><tbody>{rows}</tbody></table></div></div>"
         )
     };
     app_page(
-        "Callbacks",
+        "Active Callbacks",
         user,
         "callbacks",
         &format!(
-            "<div class=\"page-actions\"><a class=\"button\" href=\"/topology\">Open topology ↗</a></div><p>Inbound C2 sessions and beacons.</p>{table}"
+            "<section class=\"callback-workspace\" data-callback-workspace><header class=\"callback-workspace-head\"><div><p class=\"eyebrow\">SESSION BOARD / LIVE INVENTORY</p><h2>Every callback.<br><em>Ready to inspect.</em></h2><p>Registered sessions, their current state, and the operation context behind each connection.</p></div><div class=\"callback-workspace-actions\"><a class=\"btn btn-ghost\" href=\"/topology\">Open topology</a><a class=\"button\" href=\"/payloads\">Create payload <span aria-hidden=\"true\">↗</span></a></div></header><div class=\"callback-summary\" data-callback-summary><article><span>Total sessions</span><strong>{total:02}</strong><small>Registered callbacks</small></article><article class=\"summary-active\"><span>Active</span><strong>{active:02}</strong><small>Connected now</small></article><article><span>Beaconing</span><strong>{beacon:02}</strong><small>Periodic check-in</small></article><article><span>Dormant / lost</span><strong>{inactive:02}</strong><small>Needs attention</small></article></div>{table}</section>",
+            total = callbacks.len(),
+            inactive = dormant + lost,
         ),
     )
 }
@@ -1083,6 +1215,8 @@ fn page_description(name: &str) -> &'static str {
         "audit" => "Every action leaves a record. Follow it here.",
         "admin" => "The people and permissions behind your workspace.",
         "callbacks" => "Your connections, organized and in context.",
+        "payloads" => "Build a native field kit with every choice in view.",
+        "guide" => "A practical path from first setup to a documented result.",
         "events" => "A running record of workspace activity.",
         "search" => "Find the detail you are looking for.",
         _ => "Your workspace, with every detail in focus.",
@@ -1116,9 +1250,14 @@ fn nav_icon(name: &str) -> String {
         "audit" => r#"<path d="M5 3h14v19l-3-2-4 2-4-2-3 2ZM8 8h8M8 12h8M8 16h5"/>"#,
         "evidence" => r#"<path d="M3 7V4h6l3 3h9v13H3ZM3 10h18"/>"#,
         "reports" => r#"<path d="M5 2h9l5 5v15H5ZM14 2v6h5M8 12h8M8 16h8"/>"#,
-        "payloads" => r#"<path d="m12 3 9 5-9 5-9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/>"#,
+        "payloads" => {
+            r#"<path d="m10.5 4.5 7.5 4.2v8l-7.5 4.3L3 16.7v-8Zm0 8.5L18 8.7M10.5 13 3 8.7m7.5 4.3v8M18.5 2v5M16 4.5h5"/>"#
+        }
         "admin" => r#"<path d="m12 2 8 4v6c0 6-8 10-8 10S4 18 4 12V6Z"/><path d="m8 12 3 3 5-6"/>"#,
         "search" => r#"<circle cx="10.5" cy="10.5" r="7.5"/><path d="m16 16 5 5"/>"#,
+        "guide" => {
+            r#"<path d="M4 4.5A3.5 3.5 0 0 1 7.5 1H12v19H7.5A3.5 3.5 0 0 0 4 23.5Zm16 0A3.5 3.5 0 0 0 16.5 1H12v19h4.5a3.5 3.5 0 0 1 3.5 3.5Z"/>"#
+        }
         _ => r#"<circle cx="12" cy="12" r="8"/>"#,
     };
     format!(
@@ -1160,7 +1299,7 @@ fn status_pill(label: &str, class_name: &'static str) -> String {
 }
 
 const MOTION_ASSETS: &str = r#"<script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script>"#;
-const APP_ASSETS: &str = r#"<link rel="stylesheet" href="/static/workspace.css"><script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script><script defer src="/static/workspace.js"></script><script defer src="/static/admin.js"></script>"#;
+const APP_ASSETS: &str = r#"<link rel="stylesheet" href="/static/workspace.css"><script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script><script defer src="/static/workspace.js"></script><script defer src="/static/payload-wizard.js"></script><script defer src="/static/module_studio.js"></script><script defer src="/static/admin.js"></script>"#;
 
 fn page_shell(title: &str, head_extra: &str, content: &str) -> String {
     format!(

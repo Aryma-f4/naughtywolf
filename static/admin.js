@@ -23,10 +23,14 @@
       btn.addEventListener("click", () => btn.closest("[data-dismissible]")?.remove());
     });
     bindPayloadForm();
+    window.NWModuleStudio?.init(document.querySelector("main"));
+    initCallbackSSE();
+    initCommandHistory();
     window.NWWorkspace?.init(document.querySelector("main"));
   };
 
   const bindPayloadForm = () => {
+    window.NWPayloadWizard?.init(document.querySelector("main"));
     const plat = document.getElementById("payload-platform");
     if (plat) {
       const os = document.getElementById("payload-os");
@@ -203,7 +207,8 @@
   /* ── Callback detail page (Mythic-style) ────────────────────────────── */
   const initCallbackSSE = () => {
     const form = document.getElementById("task-form");
-    if (!form) return;
+    if (!form || form.dataset.bound === "true") return;
+    form.dataset.bound = "true";
 
     const sseEndpoint = form.dataset.sseEndpoint || null;
     const logEl = document.getElementById("results-log");
@@ -312,8 +317,6 @@
 
   window.NW = { navigate };
   initMain();
-  initCallbackSSE();
-  initCommandHistory();
   pollBuilds();
   entryAnims();
 })();

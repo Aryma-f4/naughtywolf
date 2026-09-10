@@ -570,12 +570,37 @@ impl Repository {
         pid: u32,
         session_key: &str,
     ) -> Result<(), AppError> {
+        self.upsert_callback_with_protocol(
+            session_id,
+            hostname,
+            username,
+            os,
+            arch,
+            pid,
+            session_key,
+            "http",
+        )
+        .await
+    }
+
+    pub async fn upsert_callback_with_protocol(
+        &self,
+        session_id: &str,
+        hostname: &str,
+        username: &str,
+        os: &str,
+        arch: &str,
+        pid: u32,
+        session_key: &str,
+        protocol: &str,
+    ) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
         sqlx::query(
-            "INSERT INTO callbacks (id, host, user_name, os, arch, process, status, session_key, last_seen) \
-             VALUES (?, ?, ?, ?, ?, ?, 'active', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+            "INSERT INTO callbacks (id, host, user_name, os, arch, process, protocol, status, session_key, last_seen) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
              ON CONFLICT(id) DO UPDATE SET \
              host = excluded.host, user_name = excluded.user_name, os = excluded.os, \
-             arch = excluded.arch, process = excluded.process, status = 'active', \
+             arch = excluded.arch, process = excluded.process, protocol = excluded.protocol, status = 'active', \
              session_key = excluded.session_key, \
              last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
         )
@@ -585,10 +610,29 @@ impl Repository {
         .bind(os)
         .bind(arch)
         .bind(pid.to_string())
+        .bind(protocol)
         .bind(session_key)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_sessions (id, hostname, username, os, arch, pid, addr, session_key, last_seen) \
+             VALUES (?, ?, ?, ?, ?, ?, '', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+             ON CONFLICT(id) DO UPDATE SET hostname = excluded.hostname, username = excluded.username, \
+             os = excluded.os, arch = excluded.arch, pid = excluded.pid, session_key = excluded.session_key, \
+             last_seen = excluded.last_seen",
+        )
+        .bind(session_id)
+        .bind(hostname)
+        .bind(username)
+        .bind(os)
+        .bind(arch)
+        .bind(pid as i64)
+        .bind(session_key.as_bytes())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
         Ok(())
     }
 

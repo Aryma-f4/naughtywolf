@@ -10,12 +10,15 @@ services:
       NAUGHTYWOLF_EVIDENCE_DIR: /data/evidence
       NAUGHTYWOLF_SESSION_SECRET: ${NAUGHTYWOLF_SESSION_SECRET:?Set a unique session secret of at least 32 bytes}
       NAUGHTYWOLF_C2_PSK: ${NAUGHTYWOLF_C2_PSK:?Set a unique C2 shared key}
+      NAUGHTYWOLF_TCP_BIND: 0.0.0.0:4630
+      NAUGHTYWOLF_TCP_PROTOCOL: gs
       NAUGHTYWOLF_COOKIE_SECURE: ${NAUGHTYWOLF_COOKIE_SECURE:-true}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - naughtywolf-data:/data
     expose:
       - "8080"
+      - "4630"
     init: true
     restart: unless-stopped
     healthcheck:
@@ -24,6 +27,15 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 3
+
+  gsocket:
+    image: hackerschoice/gsocket:latest
+    command: ["gs-netcat", "-s", "${GSOCKET_SECRET:?Set a unique GSocket tunnel secret}", "-l", "-d", "app", "-p", "4630"]
+    depends_on:
+      app:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
 
 volumes:
   naughtywolf-data:

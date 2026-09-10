@@ -61,17 +61,36 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
         .with_expiry(Expiry::OnInactivity(Duration::hours(8)))
         .with_signed(Key::derive_from(&config.session_secret_bytes()));
     let repository = Repository { pool };
+    let c2_psk = Arc::new(config.c2_psk.clone());
     let evidence_store = EvidenceStore::from_config(repository.clone(), &config);
     let app = Router::<Repository>::new()
         .route("/login", post(login_handler))
         .merge(portal::authenticated_router())
         .merge(c2::web_router())
-        .merge(c2::router(Arc::new(config.c2_psk)))
-        .with_state(repository)
+        .merge(c2::router(c2_psk.clone()))
+        .with_state(repository.clone())
         .merge(public_router())
         .layer(axum::Extension(evidence_store))
         .layer(session_layer);
 
+    if let Some(bind) = config.tcp_bind {
+        let tcp_listener = tokio::net::TcpListener::bind(bind).await?;
+        let tcp_repository = repository.clone();
+        let tcp_psk = c2_psk.clone();
+        let tcp_protocol = config.tcp_protocol.clone();
+        tokio::spawn(async move {
+            if let Err(error) = naughtywolf::c2_tcp::serve_tcp_listener(
+                tcp_repository,
+                tcp_psk,
+                tcp_listener,
+                tcp_protocol,
+            )
+            .await
+            {
+                tracing::error!(%error, "portal raw-tcp listener stopped");
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "local standalone server listening");
     axum::serve(listener, app).await?;

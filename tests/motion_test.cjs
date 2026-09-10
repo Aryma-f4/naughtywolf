@@ -12,8 +12,14 @@ function harness(reduced = false) {
     removeAttribute(key) { this.attrs.delete(key); },
     closest: () => page ? main : null,
   });
-  const brand = node(false), heading = node(), card = node();
-  const main = { querySelectorAll: selector => selector.includes('.page-heading') ? [heading] : selector.includes('.overview-hero') ? [card] : [] };
+  const brand = node(false), heading = node(), card = node(), studio = node();
+  const main = { querySelectorAll(selector) {
+    if (selector.includes('.page-heading')) return [heading];
+    const matches = [];
+    if (selector.includes('.overview-hero')) matches.push(card);
+    if (selector.includes('.payload-studio-head')) matches.push(studio);
+    return matches;
+  } };
   const document = { hidden: false, querySelector: () => null, querySelectorAll: () => [brand], addEventListener: (name, fn) => { events[name] = fn; } };
   const engine = options => {
     calls.push(options);
@@ -24,7 +30,7 @@ function harness(reduced = false) {
   engine.setDashoffset = () => 40;
   const window = { anime: engine, matchMedia: () => preference, addEventListener: (name, fn) => { events[name] = fn; } };
   vm.runInNewContext(fs.readFileSync(require.resolve('../static/motion.js'), 'utf8'), { window, document });
-  return { api: window.NWMotion, calls, events, preference, document, main, brand, heading, card, node };
+  return { api: window.NWMotion, calls, events, preference, document, main, brand, heading, card, studio, node };
 }
 
 test('menu/page entrances animate content without replaying the header brand', () => {
@@ -36,6 +42,13 @@ test('menu/page entrances animate content without replaying the header brand', (
   h.api.clearPage();
   assert.equal(h.card.getAttribute('style'), 'color: red');
   assert.equal(h.heading.getAttribute('style'), 'color: red');
+});
+
+test('payload and callback workspaces participate in the finite content reveal', () => {
+  const h = harness();
+  h.api.page(h.main);
+  assert.ok(h.calls.some(call => call.targets.includes(h.studio)));
+  assert.ok(h.calls.every(call => !call.targets.includes(h.brand) || call === h.calls[0]));
 });
 
 test('reduced motion skips entrance, graph, detail and brand animation', () => {

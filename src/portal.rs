@@ -85,6 +85,8 @@ pub fn public_router() -> Router {
         )
         .route("/static/admin.css", get(stylesheet))
         .route("/static/admin.js", get(script))
+        .route("/static/payload-wizard.js", get(payload_wizard_script))
+        .route("/static/module_studio.js", get(module_studio_script))
         .route("/static/motion.js", get(motion_script))
         .route("/static/workspace.js", get(workspace_script))
         .route("/static/workspace.css", get(workspace_style))
@@ -97,6 +99,7 @@ pub fn public_router() -> Router {
 pub fn authenticated_router() -> Router<Repository> {
     Router::new()
         .route("/dashboard", get(dashboard))
+        .route("/guide", get(guide))
         .route("/topology", get(workspace::topology_page))
         .route("/topology/data", get(workspace::topology_data))
         .route("/recon", get(workspace::recon_page))
@@ -141,6 +144,10 @@ async fn dashboard(
     Ok(Html(templates::dashboard_page(&user, &summary)))
 }
 
+async fn guide(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
+    Html(templates::guide_page(&user))
+}
+
 async fn operations(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repository): State<Repository>,
@@ -170,6 +177,10 @@ struct PayloadForm {
     psk: String,
     #[serde(default = "default_protocol")]
     protocol: String,
+    #[serde(default)]
+    gsocket_secret: Option<String>,
+    #[serde(default)]
+    gsocket_local_port: Option<u16>,
     #[serde(default = "default_interval")]
     interval_ms: u64,
     #[serde(default = "default_jitter")]
@@ -503,10 +514,22 @@ async fn generate_payload(
                 .into_response());
         }
     };
+    let supported_protocol = matches!(
+        form.protocol.as_str(),
+        "http" | "https" | "tcp" | "gs" | "dns"
+    );
+    let valid_gsocket = form.protocol != "gs"
+        || (form
+            .gsocket_secret
+            .as_deref()
+            .is_some_and(|secret| !secret.trim().is_empty())
+            && form.gsocket_local_port.is_some_and(|port| port > 0));
     if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
         || form.lhost.trim().is_empty()
         || form.name.trim().is_empty()
         || form.lport == 0
+        || !supported_protocol
+        || !valid_gsocket
     {
         let csrf_token = issue_csrf_token(&session).await?;
         return Ok((
@@ -515,7 +538,7 @@ async fn generate_payload(
                 &user,
                 &crate::payload::list().unwrap_or_default(),
                 &csrf_token,
-                Some("Provide a name, callback host, and port."),
+                Some("Provide a valid name, callback, protocol, and GSocket secret when selected."),
                 None,
                 &crate::payload::building_jobs(),
                 &crate::payload::recent_errors(),
@@ -530,6 +553,8 @@ async fn generate_payload(
         lport: form.lport,
         psk: form.psk,
         protocol: form.protocol,
+        gsocket_secret: form.gsocket_secret,
+        gsocket_local_port: form.gsocket_local_port,
         os: form.os,
         arch: form.arch,
         interval_ms: form.interval_ms,
@@ -1107,6 +1132,28 @@ pub async fn script() -> Response {
             "application/javascript; charset=utf-8",
         )],
         include_str!("../static/admin.js"),
+    )
+        .into_response()
+}
+
+pub async fn payload_wizard_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/payload_wizard.js"),
+    )
+        .into_response()
+}
+
+pub async fn module_studio_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/module_studio.js"),
     )
         .into_response()
 }

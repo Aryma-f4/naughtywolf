@@ -6,6 +6,8 @@ use std::path::PathBuf;
 pub struct Config {
     pub database_url: String,
     pub bind: SocketAddr,
+    pub tcp_bind: Option<SocketAddr>,
+    pub tcp_protocol: String,
     pub evidence_dir: PathBuf,
     pub session_secret: String,
     pub cookie_secure: bool,
@@ -26,6 +28,19 @@ impl Config {
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
                 .parse()
                 .map_err(ConfigError::InvalidBind)?,
+            tcp_bind: env::var("NAUGHTYWOLF_TCP_BIND")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.parse().map_err(ConfigError::InvalidTcpBind))
+                .transpose()?,
+            tcp_protocol: match env::var("NAUGHTYWOLF_TCP_PROTOCOL")
+                .unwrap_or_else(|_| "tcp".into())
+                .as_str()
+            {
+                "tcp" => "tcp".into(),
+                "gs" => "gs".into(),
+                _ => return Err(ConfigError::InvalidTcpProtocol),
+            },
             evidence_dir: env::var("NAUGHTYWOLF_EVIDENCE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("evidence")),
@@ -49,6 +64,8 @@ impl Config {
         Self {
             database_url: "sqlite::memory:".to_string(),
             bind: "127.0.0.1:8080".parse().expect("valid loopback address"),
+            tcp_bind: None,
+            tcp_protocol: "tcp".into(),
             evidence_dir: PathBuf::from("evidence"),
             session_secret: "test-session-secret-not-for-production".to_string(),
             cookie_secure: false,
@@ -75,6 +92,10 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("NAUGHTYWOLF_BIND must be a socket address: {0}")]
     InvalidBind(#[source] std::net::AddrParseError),
+    #[error("NAUGHTYWOLF_TCP_BIND must be a socket address: {0}")]
+    InvalidTcpBind(#[source] std::net::AddrParseError),
+    #[error("NAUGHTYWOLF_TCP_PROTOCOL must be tcp or gs")]
+    InvalidTcpProtocol,
     #[error("{0} must be true, false, 1, or 0")]
     InvalidBoolean(&'static str),
 }

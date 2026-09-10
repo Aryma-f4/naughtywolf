@@ -10,7 +10,7 @@ use axum::{
 use nw_profile::{
     crypto,
     envelope::{Envelope, Kind},
-    msgs::{PollRequest, Register, RegisterAck, Task},
+    msgs::{PollReply, PollRequest, Register, RegisterAck, Task},
 };
 use std::convert::Infallible;
 use uuid::Uuid;
@@ -42,7 +42,178 @@ pub fn router(psk: Arc<Vec<u8>>) -> Router<Repository> {
     Router::<Repository>::new()
         .route("/c2/register", post(register))
         .route("/c2/poll", post(poll))
+        .route("/c2/checkin", post(checkin))
         .layer(Extension(psk))
+}
+
+#[derive(Debug)]
+pub enum C2Error {
+    BadRequest,
+    Unauthorized,
+    Internal,
+}
+
+impl C2Error {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::BadRequest => StatusCode::BAD_REQUEST,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+pub async fn process_sealed(
+    repo: &Repository,
+    psk: &[u8],
+    wire: &[u8],
+    protocol: &str,
+) -> Result<Vec<u8>, C2Error> {
+    let wire = std::str::from_utf8(wire).map_err(|_| C2Error::BadRequest)?;
+    let key = match Envelope::routing_id(wire) {
+        None => session_key(psk),
+        Some(session_id) => {
+            let encoded = repo
+                .session_key_for(&session_id.to_string())
+                .await
+                .map_err(|_| C2Error::Internal)?
+                .ok_or(C2Error::Unauthorized)?;
+            deb64(&encoded).map_err(|_| C2Error::Unauthorized)?
+        }
+    };
+    let env = Envelope::open(&key, wire).map_err(|_| C2Error::Unauthorized)?;
+    let reply = process_envelope(repo, psk, env, protocol).await?;
+    reply
+        .seal(&key)
+        .map(String::into_bytes)
+        .map_err(|_| C2Error::Internal)
+}
+
+async fn process_envelope(
+    repo: &Repository,
+    psk: &[u8],
+    env: Envelope,
+    protocol: &str,
+) -> Result<Envelope, C2Error> {
+    match env.kind {
+        Kind::Register => process_sealed_register(repo, psk, env, protocol).await,
+        Kind::TaskResult | Kind::Heartbeat => process_sealed_poll(repo, env).await,
+        _ => Err(C2Error::BadRequest),
+    }
+}
+
+async fn process_sealed_register(
+    repo: &Repository,
+    psk: &[u8],
+    env: Envelope,
+    protocol: &str,
+) -> Result<Envelope, C2Error> {
+    if env.session_id.is_some() {
+        return Err(C2Error::BadRequest);
+    }
+    let key = session_key(psk);
+    let plaintext =
+        crypto::decrypt(&key, env.id, &env.encrypted).map_err(|_| C2Error::Unauthorized)?;
+    let register: Register = serde_json::from_slice(&plaintext).map_err(|_| C2Error::BadRequest)?;
+    let implant_pub = deb64(&register.session_key).map_err(|_| C2Error::BadRequest)?;
+    let server_keys = crypto::KeyPair::generate();
+    let shared = server_keys
+        .shared_secret(&implant_pub)
+        .map_err(|_| C2Error::Unauthorized)?;
+    let derived = crypto::derive_key(&shared, crypto::SESSION_SALT);
+    let session_id = Uuid::new_v4();
+    repo.upsert_callback_with_protocol(
+        &session_id.to_string(),
+        &register.hostname,
+        &register.username,
+        &register.os,
+        &register.arch,
+        register.pid,
+        &b64(&derived),
+        protocol,
+    )
+    .await
+    .map_err(|_| C2Error::Internal)?;
+    let reply_id = env.id + 1;
+    let ack = RegisterAck {
+        session_id,
+        server_pub: b64(&server_keys.public_key()),
+    };
+    let plaintext = serde_json::to_vec(&ack).map_err(|_| C2Error::Internal)?;
+    let encrypted = crypto::encrypt(&key, reply_id, &plaintext).map_err(|_| C2Error::Internal)?;
+    Ok(Envelope::new(
+        Kind::RegisterAck,
+        reply_id,
+        Some(session_id),
+        encrypted,
+    ))
+}
+
+async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelope, C2Error> {
+    let session_id = env.session_id.ok_or(C2Error::BadRequest)?;
+    let encoded = repo
+        .session_key_for(&session_id.to_string())
+        .await
+        .map_err(|_| C2Error::Internal)?
+        .ok_or(C2Error::Unauthorized)?;
+    let key = deb64(&encoded).map_err(|_| C2Error::Unauthorized)?;
+    let plaintext =
+        crypto::decrypt(&key, env.id, &env.encrypted).map_err(|_| C2Error::Unauthorized)?;
+    let request: PollRequest =
+        serde_json::from_slice(&plaintext).map_err(|_| C2Error::BadRequest)?;
+    repo.touch_callback(&session_id.to_string())
+        .await
+        .map_err(|_| C2Error::Internal)?;
+    for result in request.results {
+        repo.store_task_result(
+            &result.task_id.to_string(),
+            result.ok,
+            &result.stdout,
+            &result.stderr,
+            result.exit_code,
+        )
+        .await
+        .map_err(|_| C2Error::Internal)?;
+    }
+    let tasks = repo
+        .fetch_pending_tasks(&session_id.to_string())
+        .await
+        .map_err(|_| C2Error::Internal)?
+        .into_iter()
+        .filter_map(|task| {
+            Some(Task {
+                id: Uuid::parse_str(&task.id).ok()?,
+                command: task.command,
+                args: serde_json::from_value(task.args_json).ok()?,
+                timeout_ms: task.timeout_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    let kind = if tasks.is_empty() {
+        Kind::Heartbeat
+    } else {
+        Kind::Task
+    };
+    let reply = PollReply {
+        tasks,
+        acks: Vec::new(),
+        push_chunks: Vec::new(),
+    };
+    let reply_id = env.id + 1;
+    let plaintext = serde_json::to_vec(&reply).map_err(|_| C2Error::Internal)?;
+    let encrypted = crypto::encrypt(&key, reply_id, &plaintext).map_err(|_| C2Error::Internal)?;
+    Ok(Envelope::new(kind, reply_id, Some(session_id), encrypted))
+}
+
+async fn checkin(
+    State(repo): State<Repository>,
+    Extension(psk): Extension<Arc<Vec<u8>>>,
+    body: axum::body::Bytes,
+) -> Result<axum::body::Bytes, StatusCode> {
+    process_sealed(&repo, &psk, &body, "http")
+        .await
+        .map(axum::body::Bytes::from)
+        .map_err(|error| error.status())
 }
 
 async fn register(
@@ -312,5 +483,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_one, 1);
+    }
+
+    #[tokio::test]
+    async fn sealed_gsocket_round_trip_preserves_task_identity() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool: pool.clone() };
+        let psk = b"gs-portal-psk";
+        let psk_key = session_key(psk);
+
+        let implant_kp = crypto::KeyPair::generate();
+        let register = Register {
+            hostname: "gs-lab".into(),
+            username: "operator".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            pid: 4242,
+            addr: "127.0.0.1".into(),
+            session_key: b64(&implant_kp.public_key()),
+        };
+        let register_ct =
+            crypto::encrypt(&psk_key, 1, &serde_json::to_vec(&register).unwrap()).unwrap();
+        let register_wire = Envelope::new(Kind::Register, 1, None, register_ct)
+            .seal(&psk_key)
+            .unwrap();
+        let ack_wire = process_sealed(&repo, psk, register_wire.as_bytes(), "gs")
+            .await
+            .unwrap();
+        let ack_env = Envelope::open(&psk_key, std::str::from_utf8(&ack_wire).unwrap()).unwrap();
+        let ack_pt = crypto::decrypt(&psk_key, ack_env.id, &ack_env.encrypted).unwrap();
+        let ack: RegisterAck = serde_json::from_slice(&ack_pt).unwrap();
+
+        let protocol: String = sqlx::query_scalar("SELECT protocol FROM callbacks WHERE id = ?")
+            .bind(ack.session_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(protocol, "gs");
+
+        let shared = implant_kp
+            .shared_secret(&deb64(&ack.server_pub).unwrap())
+            .unwrap();
+        let key = crypto::derive_key(&shared, crypto::SESSION_SALT);
+        let queued = repo
+            .enqueue_task(
+                &ack.session_id.to_string(),
+                "whoami",
+                &serde_json::json!([]),
+                5000,
+            )
+            .await
+            .unwrap();
+        let request = nw_profile::msgs::PollRequest::default();
+        let poll_ct = crypto::encrypt(&key, 2, &serde_json::to_vec(&request).unwrap()).unwrap();
+        let poll_wire = Envelope::new(Kind::TaskResult, 2, Some(ack.session_id), poll_ct)
+            .seal(&key)
+            .unwrap();
+        let reply_wire = process_sealed(&repo, psk, poll_wire.as_bytes(), "gs")
+            .await
+            .unwrap();
+        let reply_env = Envelope::open(&key, std::str::from_utf8(&reply_wire).unwrap()).unwrap();
+        let reply_pt = crypto::decrypt(&key, reply_env.id, &reply_env.encrypted).unwrap();
+        let reply: nw_profile::msgs::PollReply = serde_json::from_slice(&reply_pt).unwrap();
+        assert_eq!(reply.tasks.len(), 1);
+        assert_eq!(reply.tasks[0].id.to_string(), queued);
+
+        let completed = nw_profile::msgs::PollRequest {
+            results: vec![nw_profile::msgs::TaskResult {
+                task_id: reply.tasks[0].id,
+                ok: true,
+                stdout: b"lab-user".to_vec(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            }],
+            ..Default::default()
+        };
+        let result_ct = crypto::encrypt(&key, 3, &serde_json::to_vec(&completed).unwrap()).unwrap();
+        let result_wire = Envelope::new(Kind::TaskResult, 3, Some(ack.session_id), result_ct)
+            .seal(&key)
+            .unwrap();
+        process_sealed(&repo, psk, result_wire.as_bytes(), "gs")
+            .await
+            .unwrap();
+        let output: Vec<u8> =
+            sqlx::query_scalar("SELECT stdout FROM c2_task_results WHERE task_id = ?")
+                .bind(queued)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(output, b"lab-user");
     }
 }

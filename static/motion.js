@@ -43,7 +43,7 @@
     run(main.querySelectorAll('.page-heading > *, .login-brand-copy, .login-card'), {
       opacity: [0, 1], translateY: [12, 0], duration: 650, delay: engine.stagger(65),
     });
-    const sections = main.querySelectorAll('.overview-hero, .metric-card, .field-map, .field-note, .topology-toolbar, .graph-summary, .recon-heading, .recon-stats, .recon-launch, .recon-history, .table-wrap, .form-panel, .empty-state');
+    const sections = main.querySelectorAll('.overview-hero, .metric-card, .field-map, .field-note, .topology-toolbar, .graph-summary, .recon-heading, .recon-stats, .recon-launch, .recon-history, .table-wrap, .form-panel, .empty-state, .payload-studio-head, .payload-wizard, .payload-library, .callback-workspace-head, .callback-summary > article, .callback-table-shell, .callback-console-grid > *, .command-dock');
     run([...sections].slice(0, 24), {
       opacity: [0, 1], translateY: [16, 0], duration: 650,
       delay: (_, index) => 100 + Math.min(index * 45, 360),

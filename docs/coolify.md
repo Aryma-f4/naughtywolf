@@ -1,6 +1,6 @@
 # Deploy NaughtyWolf on Coolify
 
-This repository ships a Docker Compose deployment for the **web portal**: one service, SQLite, persistent storage, and a health check. The native `nw-server` remains a separate deployment described in [the C2 guide](c2-quickstart.md).
+This repository ships a Docker Compose deployment for the **web portal** with SQLite, persistent storage, a health check, and an official GSocket adapter. The native `nw-server` remains a separate deployment described in [the C2 guide](c2-quickstart.md).
 
 ## 1. Connect the repository
 
@@ -19,10 +19,11 @@ Assign the service an HTTPS domain such as **`https://wolf.example.com:8080`**. 
 
 ## 2. Set the secrets
 
-Set these two runtime environment variables in Coolify. Generate a **different** value for each with `openssl rand -hex 32`:
+Set these three runtime environment variables in Coolify. Generate a **different** value for each with `openssl rand -hex 32`:
 
 - `NAUGHTYWOLF_SESSION_SECRET`
 - `NAUGHTYWOLF_C2_PSK`
+- `GSOCKET_SECRET`
 
 Keep their values stable across redeploys. Missing values prevent Compose from starting; the portal also checks that the session secret is at least 32 bytes. No `.env.docker` file or PostgreSQL service is required.
 
@@ -39,6 +40,12 @@ naughtywolf user create --username admin --role admin
 Enter the password at the prompt. Open `/login` on your domain and sign in. There are no default credentials, and redeploying does not reset accounts. Migrations run automatically before the portal starts.
 
 The image supplies the HTTP health check; Compose repeats it explicitly for Coolify. [Coolify's health-check documentation](https://coolify.io/docs/knowledge-base/health-checks) explains why Compose health checks belong in the image or Compose definition.
+
+## GSocket callback transport
+
+Compose starts `hackerschoice/gsocket` with direct `gs-netcat` port-forward arguments. Service `app` listens on private port `4630`; that port is exposed only to the Compose network and is not published on the Coolify host. In **Create Payload**, choose **GSocket tunnel**, enter the same `GSOCKET_SECRET`, and keep the generated local forward port. `NAUGHTYWOLF_C2_PSK` still protects the NaughtyWolf protocol and must match the payload's NW_PSK field.
+
+The authorized lab host running the generated artifact needs `gs-netcat` on `PATH`. Set `NW_GS_NETCAT` to an absolute executable path when it is installed elsewhere. A missing executable is logged and retried on the next beacon cycle.
 
 ## Storage and updates
 
@@ -65,6 +72,7 @@ The image retains Rust 1.90, Cargo, native build tools, and workspace sources at
 ```sh
 export NAUGHTYWOLF_SESSION_SECRET="$(openssl rand -hex 32)"
 export NAUGHTYWOLF_C2_PSK="$(openssl rand -hex 32)"
+export GSOCKET_SECRET="$(openssl rand -hex 32)"
 docker compose -f docker-compose.yml -f docker-compose.local.yml up --build -d
 docker compose exec app naughtywolf user create --username admin --role admin
 ```
@@ -90,3 +98,4 @@ The smoke test creates its own isolated container and volume, checks health/UI/C
 | Coolify reports unhealthy | Inspect service logs and run `curl -i http://127.0.0.1:8080/healthz` inside the container; expect `204`. |
 | Initial Rust build runs out of memory | Give the build host more resources or use a larger dedicated builder. |
 | A cross-target build fails | Install that target's linker/SDK in a derived image; native builds use the included toolchain. |
+| GSocket payload never appears | Confirm the payload and sidecar use the same `GSOCKET_SECRET`, `gs-netcat` exists on the lab host, and the `gsocket` service is running. |

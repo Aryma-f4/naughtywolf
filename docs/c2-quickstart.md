@@ -1,5 +1,11 @@
 # Native C2 quickstart
 
+## GSocket payloads from the portal
+
+The web portal can generate a `gs` transport payload that appears directly in `/callbacks`. Set `GSOCKET_SECRET` and `NAUGHTYWOLF_C2_PSK` to different random values in Coolify, deploy `docker-compose.yml`, then select **GSocket tunnel** in the payload wizard and enter the same GSocket secret.
+
+The generated implant expects `gs-netcat` on the authorized lab host's `PATH` (or at `NW_GS_NETCAT`). It starts a local forward with direct process arguments and connects NaughtyWolf's sealed TCP frames through it. The implant does not download GSocket, invoke a shell, or install persistence. The Compose sidecar follows GSocket's documented TCP-forwarding topology and keeps portal port `4630` private.
+
 The `naughtywolf` web portal and the native C2 workspace are separate entry points. This guide covers the native packages: `nw-server`, `nw-console`, and `nw-implant` live under `crates/`. Use it only in an authorized lab against systems you own or are explicitly permitted to test.
 
 Build the C2 binaries:

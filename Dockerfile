@@ -31,7 +31,7 @@ ENV NAUGHTYWOLF_BIND=0.0.0.0:8080 \
     RUST_LOG=info
 WORKDIR /data
 USER naughtywolf
-EXPOSE 8080
+EXPOSE 8080 4630
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl --fail --silent --show-error --max-time 4 http://127.0.0.1:8080/healthz || exit 1
 ENTRYPOINT ["naughtywolf"]

@@ -10,7 +10,7 @@ use naughtywolf::{
     auth::{AuthenticatedUser, middleware::AuthSession, rbac::Role},
     db::{
         self,
-        models::{EventRule, RunState},
+        models::{Callback, CallbackStatus, EventRule, RunState},
         repositories::Repository,
     },
     evidence::EvidenceStore,
@@ -437,9 +437,10 @@ fn payloads_navigation_remains_role_scoped() {
     assert!(
         !templates::app_page("Payloads", &viewer, "payloads", "").contains("href=\"/payloads\"")
     );
-    assert!(
-        templates::app_page("Payloads", &operator, "payloads", "").contains("href=\"/payloads\"")
-    );
+    let operator_page = templates::app_page("Payloads", &operator, "payloads", "");
+    assert!(operator_page.contains("href=\"/payloads\""));
+    assert!(operator_page.contains(">Create Payload</span>"));
+    assert!(operator_page.contains("nav-link-featured"));
 }
 
 #[test]
@@ -528,6 +529,106 @@ fn payloads_page_renders_build_form_and_built_rows() {
     assert!(body.contains("10.0.0.1:8081"));
     assert!(body.contains("href=\"/payloads/download/linux-amd64.bin\""));
     assert!(body.contains("NW_PSK"));
+    assert!(body.contains("data-payload-wizard"));
+    assert!(body.contains("aria-label=\"Payload creation progress\""));
+    assert_eq!(body.matches("data-payload-step=").count(), 4);
+    assert!(body.contains("data-payload-review"));
+    assert!(body.contains("data-gsocket-fields"));
+    assert!(body.contains("name=\"gsocket_secret\""));
+    assert!(body.contains("name=\"gsocket_local_port\""));
+    assert!(!body.contains("relay-secret-from-test"));
+    assert!(body.contains("A DNS name such as"));
+    assert!(body.contains("c2.lab.example"));
+    assert!(body.contains("or an IPv4 or IPv6 address"));
+    assert!(body.contains("Choose a port allowed by your lab firewall"));
+    assert!(body.contains("Keep jitter below the base interval"));
+}
+
+#[test]
+fn operator_guide_walks_through_the_complete_workflow() {
+    let user = AuthenticatedUser {
+        id: "op-id".into(),
+        username: "op-user".into(),
+        role: Role::Operator,
+    };
+    let body = templates::guide_page(&user);
+
+    assert!(body.contains("data-guide-page"));
+    assert!(body.contains("1. Define scope"));
+    assert!(body.contains("2. Add authorized assets"));
+    assert!(body.contains("3. Run reconnaissance"));
+    assert!(body.contains("4. Build a payload"));
+    assert!(body.contains("5. Interact with callbacks"));
+    assert!(body.contains("6. Preserve evidence"));
+    assert!(body.contains("href=\"/payloads\""));
+    assert!(body.contains("href=\"/callbacks\""));
+}
+
+#[test]
+fn callbacks_page_presents_active_session_workspace() {
+    let user = AuthenticatedUser {
+        id: "op-id".into(),
+        username: "op-user".into(),
+        role: Role::Operator,
+    };
+    let callbacks = vec![Callback {
+        id: "callback-1".into(),
+        asset_id: Some("asset-1".into()),
+        operation_id: Some("operation-1".into()),
+        host: "LAB-WS-01".into(),
+        user_name: "analyst".into(),
+        process: "nw-implant".into(),
+        arch: "amd64".into(),
+        os: "linux".into(),
+        protocol: "http".into(),
+        status: CallbackStatus::Active,
+        last_seen: "2026-09-09T10:00:00Z".into(),
+        created_at: "2026-09-09T09:00:00Z".into(),
+    }];
+
+    let body = templates::callbacks_page(&user, &callbacks);
+
+    assert!(body.contains("data-callback-workspace"));
+    assert!(body.contains("data-callback-summary"));
+    assert!(body.contains("class=\"callback-row"));
+    assert!(body.contains("href=\"/payloads\""));
+    assert!(body.contains("Active Callbacks"));
+}
+
+#[test]
+fn callback_detail_separates_session_history_output_and_command_dock() {
+    let user = AuthenticatedUser {
+        id: "op-id".into(),
+        username: "op-user".into(),
+        role: Role::Operator,
+    };
+    let callback = Callback {
+        id: "callback-1".into(),
+        asset_id: Some("asset-1".into()),
+        operation_id: Some("operation-1".into()),
+        host: "LAB-WS-01".into(),
+        user_name: "analyst".into(),
+        process: "nw-implant".into(),
+        arch: "amd64".into(),
+        os: "linux".into(),
+        protocol: "http".into(),
+        status: CallbackStatus::Active,
+        last_seen: "2026-09-09T10:00:00Z".into(),
+        created_at: "2026-09-09T09:00:00Z".into(),
+    };
+
+    let body = templates::callback_detail_page(&user, &callback, &[], "csrf-token");
+
+    assert!(body.contains("callback-console-grid"));
+    assert!(body.contains("command-dock"));
+    assert!(body.contains("data-live-output"));
+    assert!(body.contains("Session context"));
+    assert!(body.contains("name=\"csrf_token\" value=\"csrf-token\""));
+    assert!(body.contains("data-module-studio"));
+    assert!(body.contains("data-module-command=\"nw/user-enum\""));
+    assert!(body.contains("data-module-command=\"nw/peas-audit\""));
+    assert!(body.contains("data-custom-code-form"));
+    assert!(body.contains("Automatic exploitation stays disabled"));
 }
 
 // ── Task 3: Component contracts ───────────────────────────────────────────────
@@ -618,6 +719,34 @@ async fn anonymous_dashboard_request_is_rejected() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn module_studio_script_is_served_as_javascript() {
+    let response = public_router()
+        .oneshot(
+            Request::get("/static/module_studio.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/javascript; charset=utf-8"
+    );
+}
+
+#[tokio::test]
+async fn signed_in_viewer_can_open_operator_guide() {
+    let response = app_with_logged_in_user(Role::Viewer)
+        .await
+        .oneshot(Request::get("/guide").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_string(response).await.contains("data-guide-page"));
 }
 
 #[tokio::test]
