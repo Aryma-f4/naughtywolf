@@ -806,6 +806,22 @@ async fn callback_detail_renders_persisted_task_history_after_reload() {
         )
         .await
         .unwrap();
+    let operation = repository
+        .create_operation("Callback history", "Reload task history")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO operation_members (operation_id, user_id) VALUES (?, ?)")
+        .bind(&operation.id)
+        .bind(&operator.id)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE callbacks SET operation_id = ? WHERE id = ?")
+        .bind(&operation.id)
+        .bind(&sid)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
     let task_id = repository
         .enqueue_task(&sid, "ls", &serde_json::json!([]), 30_000)
         .await

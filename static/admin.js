@@ -13,7 +13,6 @@
 
   let buildTimer = null;
   let buildDismissed = false;
-  let taskEventSource = null;
 
   const entryAnims = () => {
     window.NWMotion?.page(document.querySelector("main"));
@@ -25,8 +24,7 @@
     });
     bindPayloadForm();
     window.NWModuleStudio?.init(document.querySelector("main"));
-    initCallbackSSE();
-    initCommandHistory();
+    window.NWCallbackWorkspace?.init(document.querySelector("main"));
     window.NWWorkspace?.init(document.querySelector("main"));
   };
 
@@ -197,142 +195,6 @@
     syncTopbar();
     window.addEventListener("scroll", syncTopbar, { passive: true });
   }
-
-  /* ── Callback detail page (Mythic-style) ────────────────────────────── */
-  const initCallbackSSE = () => {
-    const form = document.getElementById("task-form");
-    if (!form) {
-      taskEventSource?.close();
-      taskEventSource = null;
-      return;
-    }
-    if (form.dataset.bound === "true") return;
-    form.dataset.bound = "true";
-
-    const sseEndpoint = form.dataset.sseEndpoint || null;
-    const logEl = document.getElementById("results-log");
-
-    const taskElement = (root, taskId) => [...root.querySelectorAll("[data-task-id]")]
-      .find((element) => element.dataset.taskId === taskId);
-
-    const upsertTaskResult = (data) => {
-      if (!logEl || !data.id) return;
-      logEl.querySelector(".results-placeholder")?.remove();
-      let entry = taskElement(logEl, data.id);
-      if (!entry) {
-        entry = document.createElement("div");
-        entry.className = "entry";
-        entry.dataset.taskId = data.id;
-        entry.append(document.createElement("div"), document.createElement("div"));
-        entry.children[0].className = "meta";
-        entry.children[1].className = "output";
-        logEl.prepend(entry);
-      }
-      entry.children[0].textContent = `${data.command} - ${data.status}${data.completed_at ? ` at ${data.completed_at}` : ""}`;
-      entry.children[1].textContent = data.output || (data.status === "pending" ? "Waiting for callback…" : "(no output)");
-      entry.dataset.taskStatus = data.status;
-
-      const ledgerRow = taskElement(document, data.id);
-      if (ledgerRow && ledgerRow !== entry) {
-        const state = ledgerRow.querySelector("[data-task-state]");
-        const output = ledgerRow.querySelector("[data-task-output]");
-        if (state) {
-          state.textContent = "";
-          const pill = document.createElement("span");
-          pill.className = `status-pill status-${data.status === "completed" ? "success" : "danger"}`;
-          pill.textContent = data.status === "completed" ? "Completed" : "Error";
-          state.appendChild(pill);
-        }
-        if (output) output.textContent = data.output || "—";
-      }
-    };
-
-    // SSE connection for real-time task results.
-    if (sseEndpoint && logEl) {
-      taskEventSource?.close();
-      const evtSource = new EventSource(sseEndpoint);
-      taskEventSource = evtSource;
-      evtSource.addEventListener("message", (event) => {
-        try {
-          upsertTaskResult(JSON.parse(event.data));
-        } catch (_) { /* ignore malformed events and keep the stream alive */ }
-      });
-      evtSource.onerror = () => { /* silently reconnect */ };
-    }
-
-    // Auto-submit task form via fetch (Mythic-style: stay on page).
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const formData = new FormData(form);
-      const command = formData.get("command") || "";
-      const argsStr = formData.get("args") || "";
-      const args = argsStr ? argsStr.split(" ").filter((a) => a.trim()) : [];
-      const csrfToken = formData.get("csrf_token") || "";
-
-      try {
-        const res = await fetch(form.action, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-CSRF-Token": csrfToken,
-          },
-          body: JSON.stringify({ command, args, timeout_ms: 30000 }),
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-
-        upsertTaskResult(data);
-      } catch (err) {
-        console.error("Task submission failed:", err);
-      }
-    });
-
-    // Refresh button reloads tasks.
-    const refreshBtn = document.getElementById("refresh-btn");
-    if (refreshBtn) {
-      refreshBtn.addEventListener("click", () => window.location.reload());
-    }
-  };
-
-  /* ── Command history (Mythic-style: up/down arrow in command input) ─── */
-  const initCommandHistory = () => {
-    const cmdInput = document.getElementById("command");
-    if (!cmdInput) return;
-    const history = [...document.querySelectorAll("[data-task-command]")]
-      .map((row) => row.dataset.taskCommand)
-      .filter(Boolean)
-      .reverse();
-    let historyIndex = -1;
-    cmdInput.addEventListener("keydown", (e) => {
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        if (historyIndex < history.length - 1) {
-          historyIndex++;
-          cmdInput.value = history[history.length - 1 - historyIndex] || "";
-        }
-      } else if (e.key === "ArrowDown") {
-        e.preventDefault();
-        if (historyIndex > 0) {
-          historyIndex--;
-          cmdInput.value = history[history.length - 1 - historyIndex] || "";
-        } else if (historyIndex === 0) {
-          historyIndex = -1;
-          cmdInput.value = "";
-        }
-      }
-    });
-    // Capture submitted commands into history.
-    const form = cmdInput.closest("form");
-    if (form) {
-      form.addEventListener("submit", () => {
-        if (cmdInput.value.trim()) {
-          history.push(cmdInput.value);
-          if (history.length > 50) history.shift();
-          historyIndex = -1;
-        }
-      });
-    }
-  };
 
   window.NW = { navigate };
   initMain();

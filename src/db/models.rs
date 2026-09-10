@@ -181,7 +181,7 @@ impl TaskStatus {
     /// Mythic-style human-readable label + CSS class for task state display.
     pub fn label_class(&self) -> (&'static str, &'static str) {
         match self {
-            Self::Pending => ("Submitted", "neutral"),
+            Self::Pending => ("Queued", "neutral"),
             Self::Delivering => ("Delivering", "neutral"),
             Self::Delivered => ("Delivered", "warning"),
             Self::Processing => ("Processing", "warning"),
@@ -194,7 +194,7 @@ impl TaskStatus {
     /// Parse a status string (from DB) and return the Mythic-style label + CSS class.
     pub fn label_class_from_str(status: &str) -> (&'static str, &'static str) {
         match status {
-            "pending" => ("Submitted", "neutral"),
+            "pending" => ("Queued", "neutral"),
             "delivering" => ("Delivering", "neutral"),
             "delivered" => ("Delivered", "warning"),
             "processing" => ("Processing", "warning"),
@@ -242,6 +242,28 @@ pub struct C2TaskWithResult {
     pub result_ok: Option<bool>,
     pub result_exit_code: Option<i32>,
     pub result_stderr: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct TaskRecord {
+    pub id: String,
+    pub session_id: String,
+    pub command: String,
+    #[sqlx(json)]
+    pub args_json: Value,
+    pub timeout_ms: i64,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub processing_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub operator_id: Option<String>,
+    pub operator_name: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub cancellation_requested_at: Option<String>,
+    pub result_stdout: Option<Vec<u8>>,
+    pub result_stderr: Option<Vec<u8>>,
+    pub result_exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

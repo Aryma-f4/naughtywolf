@@ -66,7 +66,6 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
     let app = Router::<Repository>::new()
         .route("/login", post(login_handler))
         .merge(portal::authenticated_router())
-        .merge(c2::web_router())
         .merge(c2::router(c2_psk.clone()))
         .with_state(repository.clone())
         .merge(public_router())

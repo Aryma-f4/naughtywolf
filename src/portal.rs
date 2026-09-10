@@ -1,5 +1,5 @@
 use axum::{
-    Extension, Form, Json, Router,
+    Extension, Form, Router,
     extract::{FromRequest, Path, Query, Request, State},
     http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
@@ -92,6 +92,14 @@ pub fn public_router() -> Router {
         .route("/static/motion.js", get(motion_script))
         .route("/static/workspace.js", get(workspace_script))
         .route("/static/workspace.css", get(workspace_style))
+        .route(
+            "/static/callback-workspace.js",
+            get(callback_workspace_script),
+        )
+        .route(
+            "/static/callback-workspace.css",
+            get(callback_workspace_style),
+        )
         .route("/static/anime.min.js", get(anime_script))
         .route("/payloads/download/{token}", get(public_download_payload))
 }
@@ -101,6 +109,7 @@ pub fn public_router() -> Router {
 /// this router with the public routes.
 pub fn authenticated_router() -> Router<Repository> {
     Router::new()
+        .merge(crate::callback_workspace::router())
         .route("/dashboard", get(dashboard))
         .route("/guide", get(guide))
         .route("/topology", get(workspace::topology_page))
@@ -122,7 +131,6 @@ pub fn authenticated_router() -> Router<Repository> {
         .route("/payloads/edit/{file}", get(edit_payload))
         .route("/callbacks", get(callbacks))
         .route("/callbacks/{session_id}", get(callback_detail))
-        .route("/c2/sessions/{session_id}/tasks", get(tasks_json))
         .route("/eventing", get(eventing).post(create_event_rule))
         .route("/events", get(events_feed))
         .route("/services", get(services))
@@ -688,52 +696,22 @@ async fn callbacks(
 async fn callback_detail(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repository): State<Repository>,
+    session: Session,
     Path(session_id): Path<String>,
 ) -> Result<Html<String>, AppError> {
     user.require(Role::Operator)?;
     let callback = repository
-        .find_callback(&session_id)
+        .find_callback_visible_to(&session_id, &user.id, user.role == Role::Admin)
         .await?
         .ok_or(AppError::NotFound)?;
     let tasks = repository.list_tasks_for_session(&session_id).await?;
-    let csrf_token = Uuid::new_v4().to_string();
+    let csrf_token = issue_csrf_token(&session).await?;
     Ok(Html(templates::callback_detail_page(
         &user,
         &callback,
         &tasks,
         &csrf_token,
     )))
-}
-
-/// JSON API for listing tasks for a callback session.
-async fn tasks_json(
-    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
-    State(repository): State<Repository>,
-    Path(session_id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    user.require(Role::Operator)?;
-    let tasks = repository.list_tasks_for_session(&session_id).await?;
-    let arr: Vec<serde_json::Value> = tasks
-        .iter()
-        .map(|t| {
-            let (label, cls) = crate::db::models::TaskStatus::label_class_from_str(&t.status);
-            serde_json::json!({
-                "id": t.id,
-                "command": t.command,
-                "args": t.args_json,
-                "status": t.status,
-                "state_label": label,
-                "state_class": cls,
-                "created_at": t.created_at,
-                "processing_at": t.processing_at,
-                "completed_at": t.completed_at,
-                "result_output": t.result_output,
-                "result_ok": t.result_ok,
-                "result_exit_code": t.result_exit_code,
-            })
-        })
-        .collect();
-    Ok(Json(serde_json::json!({ "tasks": arr })))
 }
 
 /// Mythic-style event feed page showing operation-wide audit events.
@@ -1237,6 +1215,25 @@ async fn workspace_style() -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../static/workspace.css"),
+    )
+        .into_response()
+}
+
+async fn callback_workspace_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/callback-workspace.js"),
+    )
+        .into_response()
+}
+
+async fn callback_workspace_style() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../static/callback-workspace.css"),
     )
         .into_response()
 }

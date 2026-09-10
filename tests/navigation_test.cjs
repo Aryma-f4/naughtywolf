@@ -5,7 +5,7 @@ const fs = require('node:fs');
 
 // Run the shipped script with only the browser/network boundary simulated.
 function harness() {
-  const clicks = {}, events = {}, requests = [], pushes = [], animations = [];
+  const clicks = {}, events = {}, requests = [], pushes = [], animations = [], callbackInits = [];
   const elements = new Map();
   let main;
   class Element {
@@ -41,6 +41,7 @@ function harness() {
     location, scrollTo: () => { window.scrolls++; }, scrolls: 0,
     matchMedia: () => ({ matches: false }),
     addEventListener: (type, fn) => { events[type] = fn; },
+    NWCallbackWorkspace: { init: root => callbackInits.push(root) },
   };
   const context = {
     document, window, location, URL, AbortController, anime,
@@ -53,7 +54,7 @@ function harness() {
   animations.length = 0;
   const flush = () => new Promise(resolve => setImmediate(resolve));
   return {
-    requests, pushes, navLinks, animations, elements, window, events, get main() { return main; },
+    requests, pushes, navLinks, animations, elements, window, events, callbackInits, get main() { return main; },
     click(href, attrs = {}) {
       const e = { button: 0, target: new Element('a', { href, ...attrs }), preventDefault() { this.prevented = true; } };
       clicks.click(e); return e;
@@ -67,6 +68,16 @@ function harness() {
     }, flush,
   };
 }
+
+test('page initialization delegates callback task state to the persistent workspace client', async () => {
+  const h = harness();
+  assert.equal(h.callbackInits.length, 1);
+  assert.equal(h.callbackInits[0], h.main);
+  h.click('/operations');
+  await h.reply(0, 'Operations');
+  assert.equal(h.callbackInits.length, 2);
+  assert.equal(h.callbackInits[1], h.main);
+});
 
 test('Back navigation does not create another history entry', async () => {
   const h = harness(); h.window.location.pathname = '/operations';

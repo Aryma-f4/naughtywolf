@@ -1,0 +1,28 @@
+use axum::{
+    Router,
+    routing::{get, post},
+};
+
+use crate::db::repositories::Repository;
+
+pub mod tasks;
+
+pub fn router() -> Router<Repository> {
+    Router::new()
+        .route(
+            "/api/callbacks/{session_id}/tasks",
+            get(tasks::list_tasks).post(tasks::enqueue_task),
+        )
+        .route(
+            "/api/callbacks/{session_id}/tasks/{task_id}/retry",
+            post(tasks::retry_task),
+        )
+        .route(
+            "/api/callbacks/{session_id}/tasks/{task_id}/cancel",
+            post(tasks::cancel_task),
+        )
+        .route(
+            "/api/callbacks/{session_id}/events",
+            get(tasks::task_events),
+        )
+}

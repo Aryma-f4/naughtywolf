@@ -910,22 +910,6 @@ pub fn callback_detail_page(
         }
     );
 
-    let tasking_panel = format!(
-        "<div class=\"command-dock panel\"><div class=\"command-dock-label\"><span aria-hidden=\"true\">&gt;_</span><div><strong>Task this callback</strong><small>Use ↑ and ↓ for command history</small></div></div>
-        <form id=\"task-form\" action=\"/c2/sessions/{}/tasks\" method=\"POST\" data-sse-endpoint=\"/c2/sessions/{}/tasks/sse\">
-            <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">
-            <div class=\"command-input\">
-                <label class=\"sr-only\" for=\"command\">Command</label><span aria-hidden=\"true\">$</span>
-                <input list=\"command-suggestions\" type=\"text\" id=\"command\" name=\"command\" autocomplete=\"off\" placeholder=\"Task an authorized lab agent…\" required>
-                <datalist id=\"command-suggestions\">{}</datalist>
-            </div>
-            <label class=\"sr-only\" for=\"args\">Arguments</label><input class=\"command-args\" type=\"text\" id=\"args\" name=\"args\" placeholder=\"Arguments (optional)\">
-            <button type=\"button\" id=\"refresh-btn\" class=\"btn btn-ghost\" aria-label=\"Refresh task history\">↻</button>
-            <button type=\"submit\" class=\"btn btn-primary\">Execute <span aria-hidden=\"true\">↗</span></button>
-        </form></div>",
-        &callback.id, &callback.id, escape_html(csrf_token), suggestions_html
-    );
-
     let session_context = format!(
         "<aside class=\"session-context panel\"><p class=\"eyebrow\">Session context</p><dl><div><dt>Host</dt><dd>{}</dd></div><div><dt>User</dt><dd>{}</dd></div><div><dt>Process</dt><dd>{}</dd></div><div><dt>Platform</dt><dd>{} / {}</dd></div><div><dt>Protocol</dt><dd>{}</dd></div><div><dt>Last check-in</dt><dd>{}</dd></div></dl><a href=\"/topology\">Locate in topology ↗</a></aside>",
         escape_html(&callback.host),
@@ -937,8 +921,37 @@ pub fn callback_detail_page(
         escape_html(&callback.last_seen),
     );
 
+    let online = callback.is_online(time::OffsetDateTime::now_utc());
+    let tasking_panel = format!(
+        r##"<section class="callback-tasking panel" data-callback-tasking data-live-output
+          data-tasks-endpoint="/api/callbacks/{callback_id}/tasks"
+          data-events-endpoint="/api/callbacks/{callback_id}/events"
+          data-csrf-token="{csrf}" data-online="{online}">
+          <header class="callback-tasking-title"><div><p class="eyebrow">TASKING / PERSISTENT LEDGER</p><h3>Tasking</h3><p>Authoritative callback history, reconciled after every connection.</p></div><div><span class="connection-label">Connection</span><span class="stream-state" data-connection-state role="status">Connecting</span></div></header>
+          <nav class="callback-tabs" aria-label="Callback workspace tabs"><a aria-current="page" href="#tasking">Tasking</a><span>Processes</span><span>Files</span><span>Metadata</span></nav>
+          <p class="offline-queue" data-offline-queue hidden></p>
+          <div class="task-filters">
+            <label>Search task history<input type="search" data-task-search placeholder="Command, operator, or output"></label>
+            <label>State<select data-task-state-filter><option value="">All states</option><option value="pending">Queued</option><option value="delivering">Delivering</option><option value="delivered">Delivered</option><option value="processing">Processing</option><option value="completed">Completed</option><option value="error">Error</option><option value="cancelled">Cancelled</option></select></label>
+            <label>Errors<select data-task-error-filter><option value="">All output</option><option value="errors">Errors only</option></select></label>
+          </div>
+          <div class="callback-console-grid"><aside class="session-context-wrap">{session_context}</aside><div class="task-timeline"><div class="task-empty" data-task-empty><strong>No task history yet</strong><p>Submit a command from the dock below.</p></div><div class="task-card-list" data-task-list></div><button class="btn btn-ghost load-older" type="button" data-load-older hidden>Load older</button></div></div>
+          <noscript><section class="task-history-panel">{rows}</section><section id="task-results">{persisted_output}</section></noscript>
+          <div class="command-dock panel"><div class="command-dock-label"><span aria-hidden="true">&gt;_</span><div><strong>Task this callback</strong><small>Use ↑ and ↓ for persisted command history</small></div></div>
+            <form id="task-form" data-task-form><input type="hidden" name="csrf_token" value="{csrf}"><div class="command-input"><label class="sr-only" for="command">Command</label><span aria-hidden="true">$</span><input list="command-suggestions" type="text" id="command" data-command-input autocomplete="off" placeholder="Task an authorized lab agent…" required><datalist id="command-suggestions">{suggestions}</datalist></div><label class="sr-only" for="args">Arguments</label><input class="command-args" type="text" id="args" data-command-arguments placeholder="Arguments (optional)"><button type="submit" class="btn btn-primary">Execute <span aria-hidden="true">↗</span></button></form>
+          </div>
+        </section>"##,
+        callback_id = escape_html(&callback.id),
+        csrf = escape_html(csrf_token),
+        online = online,
+        session_context = session_context,
+        rows = rows,
+        persisted_output = persisted_output,
+        suggestions = suggestions_html,
+    );
+
     let module_studio = format!(
-        r##"<section class="module-studio panel" data-module-studio data-task-endpoint="/c2/sessions/{callback_id}/tasks" data-csrf-token="{csrf}">
+        r##"<section class="module-studio panel" data-module-studio data-task-endpoint="/api/callbacks/{callback_id}/tasks" data-csrf-token="{csrf}">
         <header><div><p class="eyebrow">MODULE STUDIO / ASSESSMENT</p><h3>Turn a callback into a clear next step.</h3><p>Run structured discovery, review privilege-escalation candidates, or execute a small operator-authored script.</p></div><span class="module-platform">{os} / {arch}</span></header>
         <div class="module-grid">
           <article class="module-card"><span class="module-index">01</span><div><h4>User enumeration</h4><p>Inventory local accounts and login capability with a read-only collector.</p></div><button type="button" class="btn btn-primary" data-module-command="nw/user-enum" data-module-timeout="45000">Enumerate users</button></article>
@@ -960,7 +973,7 @@ pub fn callback_detail_page(
     );
 
     let content = format!(
-        "<div class=\"callback-detail-shell\">{callback_detail}{module_studio}<div class=\"callback-console-grid\">{session_context}<section class=\"task-history-panel panel\"><header><div><p class=\"eyebrow\">TASK LEDGER</p><h3>Command history</h3></div><span>Saved responses</span></header>{rows}</section><section id=\"task-results\" class=\"panel results-stream\" data-live-output><header><div><p class=\"eyebrow\">LIVE OUTPUT</p><h3>Response stream</h3></div><span class=\"stream-state\"><i></i> Listening</span></header><div id=\"results-log\" class=\"results-log\">{persisted_output}</div></section></div>{tasking_panel}</div>"
+        "<div class=\"callback-detail-shell\">{callback_detail}{tasking_panel}{module_studio}</div>"
     );
 
     app_page("Callback Interact", user, "callbacks", &content)
@@ -1335,7 +1348,7 @@ fn status_pill(label: &str, class_name: &'static str) -> String {
 }
 
 const MOTION_ASSETS: &str = r#"<script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script>"#;
-const APP_ASSETS: &str = r#"<link rel="stylesheet" href="/static/workspace.css"><script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script><script defer src="/static/workspace.js"></script><script defer src="/static/payload-wizard.js"></script><script defer src="/static/module_studio.js"></script><script defer src="/static/admin.js"></script>"#;
+const APP_ASSETS: &str = r#"<link rel="stylesheet" href="/static/workspace.css"><link rel="stylesheet" href="/static/callback-workspace.css"><script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script><script defer src="/static/workspace.js"></script><script defer src="/static/payload-wizard.js"></script><script defer src="/static/module_studio.js"></script><script defer src="/static/callback-workspace.js"></script><script defer src="/static/admin.js"></script>"#;
 
 fn page_shell(title: &str, head_extra: &str, content: &str) -> String {
     format!(

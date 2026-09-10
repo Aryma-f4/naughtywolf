@@ -9,7 +9,7 @@ use crate::{
     auth::rbac::Role,
     db::models::{
         Asset, AssetStatus, AuditEvent, Callback, CheckRun, EventRule, Evidence, InstalledService,
-        Operation, OperationStatus, RunState,
+        Operation, OperationStatus, RunState, TaskRecord,
     },
     error::AppError,
 };
@@ -561,6 +561,31 @@ impl Repository {
         query.map_err(|_| AppError::Internal)
     }
 
+    pub async fn find_callback_visible_to(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Option<Callback>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, Callback>("SELECT * FROM callbacks WHERE id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await
+        } else {
+            sqlx::query_as::<_, Callback>(
+                "SELECT callbacks.* FROM callbacks \
+                 JOIN operation_members ON operation_members.operation_id = callbacks.operation_id \
+                 WHERE callbacks.id = ? AND operation_members.user_id = ?",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
     /// Record or refresh a beacon identified by its assigned session id.
     pub async fn upsert_callback(
         &self,
@@ -779,6 +804,83 @@ impl Repository {
         .await
         .map_err(|_| AppError::Internal)?;
         Ok(task_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_task_with_audit(
+        &self,
+        session_id: &str,
+        command: &str,
+        args_json: &serde_json::Value,
+        timeout_ms: u64,
+        operator_id: &str,
+        operator_name: &str,
+        parent_task_id: Option<&str>,
+        audit_action: &str,
+    ) -> Result<String, AppError> {
+        let task_id = Uuid::new_v4().to_string();
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_tasks \
+             (id, session_id, command, args_json, timeout_ms, status, operator_id, parent_task_id) \
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+        )
+        .bind(&task_id)
+        .bind(session_id)
+        .bind(command)
+        .bind(args_json)
+        .bind(timeout_ms as i64)
+        .bind(operator_id)
+        .bind(parent_task_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_audit \
+             (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+             VALUES (?, ?, ?, ?, ?, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(operator_id)
+        .bind(operator_name)
+        .bind(audit_action)
+        .bind(session_id)
+        .bind(format!("task {task_id}: {command}"))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+        Ok(task_id)
+    }
+
+    pub async fn retry_task_with_audit(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        operator_id: &str,
+        operator_name: &str,
+    ) -> Result<String, AppError> {
+        let original: Option<(String, serde_json::Value, i64)> = sqlx::query_as(
+            "SELECT command, args_json, timeout_ms FROM c2_tasks WHERE id = ? AND session_id = ?",
+        )
+        .bind(task_id)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        let Some((command, arguments, timeout_ms)) = original else {
+            return Err(AppError::NotFound);
+        };
+        self.enqueue_task_with_audit(
+            session_id,
+            &command,
+            &arguments,
+            timeout_ms.max(0) as u64,
+            operator_id,
+            operator_name,
+            Some(task_id),
+            "task_retried",
+        )
+        .await
     }
 
     /// Return work until its delivery is acknowledged by the owning callback.
@@ -1073,6 +1175,88 @@ impl Repository {
              LEFT JOIN c2_task_results r ON r.task_id = t.id
              WHERE t.session_id = ?
              ORDER BY t.created_at DESC, t.id DESC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_task_page(
+        &self,
+        session_id: &str,
+        before: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>, AppError> {
+        let projection = "SELECT t.id, t.session_id, t.command, t.args_json, t.timeout_ms, t.status, \
+                    t.created_at, t.updated_at, t.processing_at, t.completed_at, \
+                    t.operator_id, u.username AS operator_name, t.parent_task_id, \
+                    t.cancellation_requested_at, r.stdout AS result_stdout, \
+                    r.stderr AS result_stderr, r.exit_code AS result_exit_code \
+             FROM c2_tasks t \
+             LEFT JOIN users u ON u.id = t.operator_id \
+             LEFT JOIN c2_task_results r ON r.task_id = t.id";
+        let rows = if let Some((created_at, id)) = before {
+            sqlx::query_as::<_, TaskRecord>(&format!(
+                "{projection} WHERE t.session_id = ? AND (t.created_at, t.id) < (?, ?) \
+                 ORDER BY t.created_at DESC, t.id DESC LIMIT ?"
+            ))
+            .bind(session_id)
+            .bind(created_at)
+            .bind(id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, TaskRecord>(&format!(
+                "{projection} WHERE t.session_id = ? \
+                 ORDER BY t.created_at DESC, t.id DESC LIMIT ?"
+            ))
+            .bind(session_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn find_task_record(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TaskRecord>, AppError> {
+        sqlx::query_as::<_, TaskRecord>(
+            "SELECT t.id, t.session_id, t.command, t.args_json, t.timeout_ms, t.status, \
+                    t.created_at, t.updated_at, t.processing_at, t.completed_at, \
+                    t.operator_id, u.username AS operator_name, t.parent_task_id, \
+                    t.cancellation_requested_at, r.stdout AS result_stdout, \
+                    r.stderr AS result_stderr, r.exit_code AS result_exit_code \
+             FROM c2_tasks t \
+             LEFT JOIN users u ON u.id = t.operator_id \
+             LEFT JOIN c2_task_results r ON r.task_id = t.id \
+             WHERE t.session_id = ? AND t.id = ?",
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_all_task_records(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TaskRecord>, AppError> {
+        sqlx::query_as::<_, TaskRecord>(
+            "SELECT t.id, t.session_id, t.command, t.args_json, t.timeout_ms, t.status, \
+                    t.created_at, t.updated_at, t.processing_at, t.completed_at, \
+                    t.operator_id, u.username AS operator_name, t.parent_task_id, \
+                    t.cancellation_requested_at, r.stdout AS result_stdout, \
+                    r.stderr AS result_stderr, r.exit_code AS result_exit_code \
+             FROM c2_tasks t \
+             LEFT JOIN users u ON u.id = t.operator_id \
+             LEFT JOIN c2_task_results r ON r.task_id = t.id \
+             WHERE t.session_id = ? ORDER BY t.created_at DESC, t.id DESC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
