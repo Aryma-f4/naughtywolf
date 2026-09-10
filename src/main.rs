@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Form, Router,
+    Extension, Form, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Redirect},
@@ -70,6 +70,7 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
         .merge(c2::router(c2_psk.clone()))
         .with_state(repository.clone())
         .merge(public_router())
+        .layer(Extension(c2_psk.clone()))
         .layer(axum::Extension(evidence_store))
         .layer(session_layer);
 

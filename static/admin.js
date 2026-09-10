@@ -47,13 +47,6 @@
       plat.addEventListener("change", sync);
       sync();
     }
-    const rnd = document.getElementById("payload-psk-random");
-    if (rnd) {
-      rnd.addEventListener("click", () => {
-        const p = document.getElementById("payload-psk");
-        if (p) p.value = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().slice(0, 12);
-      });
-    }
   };
 
   const buildCard = (() => {

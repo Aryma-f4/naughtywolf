@@ -601,7 +601,6 @@ fn payloads_page_renders_build_form_and_built_rows() {
         protocol: "http".into(),
         lhost: "10.0.0.1".into(),
         lport: 8081,
-        psk: "x".into(),
         interval_ms: 1000,
         jitter_ms: 200,
         target: String::new(),
@@ -618,6 +617,9 @@ fn payloads_page_renders_build_form_and_built_rows() {
     assert!(body.contains("href=\"/payloads/download/550e8400-e29b-41d4-a716-446655440000\""));
     assert!(!body.contains("href=\"/payloads/download/linux-amd64.bin\""));
     assert!(body.contains("NW_PSK"));
+    assert!(body.contains("active server secret automatically"));
+    assert!(!body.contains("name=\"psk\""));
+    assert!(!body.contains("payload-psk-random"));
     assert!(body.contains("data-payload-wizard"));
     assert!(body.contains("aria-label=\"Payload creation progress\""));
     assert_eq!(body.matches("data-payload-step=").count(), 4);

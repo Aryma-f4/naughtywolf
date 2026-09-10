@@ -56,6 +56,8 @@ try:
     docker("exec", name, "sh", "-ec",
            "test -w /app/target && test -w /usr/local/cargo && test -w /usr/local/rustup; "
            "rustc --version; cargo metadata --manifest-path /app/Cargo.toml --no-deps --offline --format-version 1 >/dev/null; "
+           "! readelf -l /usr/local/libexec/nw-implant-musl-smoke | grep -q 'Requesting program interpreter'; "
+           "set +e; NW_ENDPOINT=http://127.0.0.1:8080 NW_PSK=$NAUGHTYWOLF_C2_PSK timeout 3s /usr/local/libexec/nw-implant-musl-smoke; code=$?; set -e; test \"$code\" -eq 124; "
            "printf 'int main(void) { return 0; }' > /tmp/nw-cross-probe.c; "
            "musl-gcc /tmp/nw-cross-probe.c -o /tmp/nw-cross-probe-musl; "
            "x86_64-w64-mingw32-gcc /tmp/nw-cross-probe.c -o /tmp/nw-cross-probe.exe; "
@@ -67,7 +69,7 @@ try:
     assert "smoke-admin" in docker("exec", name, "naughtywolf", "user", "list").stdout
     assert docker("exec", name, "cat", "/data/evidence/smoke.txt").stdout == "evidence-persisted"
     assert docker("exec", name, "cat", "/data/payloads/smoke.txt").stdout == "payload-persisted"
-    print("PASS: health, UI assets, non-root CLI, cross-build toolchains, and data persistence after replacement")
+    print("PASS: health, UI assets, musl implant startup, cross-build toolchains, and data persistence after replacement")
 except Exception:
     print(docker("logs", "--tail", "40", name, check=False).stdout, file=sys.stderr)
     raise

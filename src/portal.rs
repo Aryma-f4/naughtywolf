@@ -175,8 +175,6 @@ struct PayloadForm {
     lhost: String,
     #[serde(default)]
     lport: u16,
-    #[serde(default)]
-    psk: String,
     #[serde(default = "default_protocol")]
     protocol: String,
     #[serde(default)]
@@ -493,6 +491,7 @@ async fn payloads(
 
 async fn generate_payload(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    Extension(c2_psk): Extension<std::sync::Arc<Vec<u8>>>,
     session: Session,
     request: Request,
 ) -> Result<Response, AppError> {
@@ -553,7 +552,6 @@ async fn generate_payload(
         name: form.name,
         lhost: form.lhost,
         lport: form.lport,
-        psk: form.psk,
         protocol: form.protocol,
         gsocket_secret: form.gsocket_secret,
         gsocket_local_port: form.gsocket_local_port,
@@ -565,7 +563,7 @@ async fn generate_payload(
     };
     tokio::spawn(async move {
         let file = crate::payload::predict_file(&req);
-        match crate::payload::build(&req).await {
+        match crate::payload::build(&req, c2_psk.as_slice()).await {
             Ok(meta) => tracing::info!(payload = %meta.file, size = meta.size, "implant built"),
             Err(e) => {
                 crate::payload::record_build_error(&file, &e.to_string());

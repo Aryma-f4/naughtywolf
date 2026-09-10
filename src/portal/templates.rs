@@ -641,7 +641,7 @@ pub fn payloads_page(
         )
     };
 
-    let (f_os, f_arch, f_target, f_name, f_lhost, f_lport, f_psk, f_protocol, f_interval, f_jitter) =
+    let (f_os, f_arch, f_target, f_name, f_lhost, f_lport, f_protocol, f_interval, f_jitter) =
         match editor {
             Some(m) => (
                 m.os.clone(),
@@ -650,7 +650,6 @@ pub fn payloads_page(
                 m.name.clone(),
                 m.lhost.clone(),
                 m.lport,
-                m.psk.clone(),
                 m.protocol.clone(),
                 m.interval_ms,
                 m.jitter_ms,
@@ -662,7 +661,6 @@ pub fn payloads_page(
                 String::new(),
                 String::new(),
                 8081,
-                String::new(),
                 "http".into(),
                 1000,
                 200,
@@ -736,7 +734,7 @@ pub fn payloads_page(
         <div class="form-field payload-field-wide"><label for="payload-lhost">Callback host (LHost)</label><input id="payload-lhost" name="lhost" value="{f_lhost}" placeholder="c2.lab.example or 10.20.0.5" required><p class="muted field-hint"><strong>Accepted:</strong> A DNS name such as <code>c2.lab.example</code>, or an IPv4 or IPv6 address reachable from the target. Enter the host only—no scheme, port, or URL path.</p></div>
         <div class="form-field"><label for="payload-lport">Callback port</label><input id="payload-lport" name="lport" type="number" value="{f_lport}" min="1" max="65535" placeholder="8443" required><p class="muted field-hint"><strong>Example:</strong> <code>443</code>, <code>8443</code>, or the private raw-listener port. Choose a port allowed by your lab firewall and exposed by the matching listener.</p></div>
         <div class="form-field"><label for="payload-proto">Protocol</label><select id="payload-proto" name="protocol">{protocol_options}</select><p class="muted field-hint"><strong>HTTP</strong> connects to the portal, <strong>TCP</strong> needs the raw listener, and <strong>GSocket</strong> uses the relay and a local forward.</p></div>
-        <div class="form-field payload-field-full"><label for="payload-psk">Shared secret (NW_PSK)</label><div class="input-with-btn"><input id="payload-psk" name="psk" value="{f_psk}" placeholder="generate-a-unique-secret-for-this-lab" required><button type="button" class="btn btn-sm btn-ghost" id="payload-psk-random" title="Generate random secret">Generate secret</button></div><p class="muted field-hint"><strong>Best practice:</strong> generate a long unique secret and use the same value on the compatible listener. Do not reuse the GSocket relay secret or commit either secret.</p></div>
+        <aside class="timing-note payload-field-full"><span class="status-dot"></span><div><strong>Shared secret (NW_PSK)</strong><p>The build uses the active server secret automatically, so the implant and NaughtyWolf listener cannot drift out of sync.</p></div></aside>
         <div class="payload-gsocket-fields payload-field-full" data-gsocket-fields hidden>
           <div class="form-field"><label for="payload-gsocket-secret">GSocket tunnel secret</label><div class="input-with-btn"><input id="payload-gsocket-secret" name="gsocket_secret" placeholder="generate-a-separate-relay-secret" disabled><button type="button" class="btn btn-sm btn-ghost" data-gsocket-secret-generate>Generate secret</button></div><p class="muted field-hint"><strong>Best practice:</strong> use a separate random value shared only with gs-netcat. It is never shown in the review or artifact list.</p></div>
           <div class="form-field"><label for="payload-gsocket-port">Local forward port</label><input id="payload-gsocket-port" name="gsocket_local_port" type="number" value="4630" min="1" max="65535" placeholder="4630" disabled><p class="muted field-hint"><strong>Example:</strong> <code>4630</code>. Choose an unused loopback port; it does not need to be publicly exposed.</p></div>
@@ -769,7 +767,6 @@ pub fn payloads_page(
         f_name = escape_html(&f_name),
         f_lhost = escape_html(&f_lhost),
         f_lport = f_lport,
-        f_psk = escape_html(&f_psk),
         f_interval = f_interval,
         f_jitter = f_jitter,
         f_os = escape_html(&f_os),
