@@ -763,6 +763,24 @@ impl std::error::Error for AnyError {}
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn long_running_command() -> (String, Vec<String>) {
+        ("sh".into(), vec!["-c".into(), "sleep 30".into()])
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> (String, Vec<String>) {
+        (
+            "cmd.exe".into(),
+            vec![
+                "/D".into(),
+                "/S".into(),
+                "/C".into(),
+                "ping -n 31 127.0.0.1 > nul".into(),
+            ],
+        )
+    }
+
     fn runtime() -> BeaconRuntime {
         BeaconRuntime::new(
             Profile {
@@ -809,10 +827,11 @@ mod tests {
     #[tokio::test]
     async fn accepted_batch_runs_independently_and_kill_suppresses_queued_work() {
         let runtime = Arc::new(runtime());
+        let (command, args) = long_running_command();
         let victim = Task {
             id: Uuid::new_v4(),
-            command: "sleep".into(),
-            args: vec!["30".into()],
+            command,
+            args,
             timeout_ms: 60_000,
         };
         let kill = Task {
@@ -848,10 +867,11 @@ mod tests {
     #[tokio::test]
     async fn killtask_cancels_an_accepted_task_before_it_is_scheduled() {
         let runtime = Arc::new(runtime());
+        let (command, args) = long_running_command();
         let victim = Task {
             id: Uuid::new_v4(),
-            command: "sleep".into(),
-            args: vec!["30".into()],
+            command,
+            args,
             timeout_ms: 60_000,
         };
         let kill = Task {

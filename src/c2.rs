@@ -476,8 +476,40 @@ mod tests {
     use axum::http::Request;
     use axum::routing::post;
     use nw_implant::runtime::{BeaconRuntime, Profile};
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tower::ServiceExt;
+
+    #[cfg(unix)]
+    fn lifecycle_command(started: &Path, finished: &Path) -> (String, serde_json::Value) {
+        (
+            "sh".into(),
+            serde_json::json!([
+                "-c",
+                "printf started > \"$1\"; sleep 3; printf finished > \"$2\"",
+                "nw-lifecycle-test",
+                started,
+                finished,
+            ]),
+        )
+    }
+
+    #[cfg(windows)]
+    fn lifecycle_command(started: &Path, finished: &Path) -> (String, serde_json::Value) {
+        (
+            "cmd.exe".into(),
+            serde_json::json!([
+                "/D",
+                "/S",
+                "/C",
+                format!(
+                    "type nul > \"{}\" & ping -n 4 127.0.0.1 > nul & type nul > \"{}\"",
+                    started.display(),
+                    finished.display(),
+                ),
+            ]),
+        )
+    }
 
     fn b64(b: &[u8]) -> String {
         use base64::Engine;
@@ -749,8 +781,12 @@ mod tests {
         .expect("implant registration");
 
         state.drop_delivery.store(true, Ordering::SeqCst);
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let started = barrier_dir.path().join("started");
+        let finished = barrier_dir.path().join("finished");
+        let (command, args) = lifecycle_command(&started, &finished);
         let victim = repo
-            .enqueue_task(&session_id, "sleep", &serde_json::json!(["30"]), 60_000)
+            .enqueue_task(&session_id, &command, &args, 60_000)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -760,6 +796,22 @@ mod tests {
         })
         .await
         .expect("first delivery response was lost");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status: String = sqlx::query_scalar("SELECT status FROM c2_tasks WHERE id = ?")
+                    .bind(&victim)
+                    .fetch_one(&repo.pool)
+                    .await
+                    .unwrap();
+                if status == "processing" && started.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("implant must acknowledge and start the real child before cancellation");
 
         let cancellation = repo
             .request_task_cancellation(&session_id, &victim, "operator-1", "alice")
@@ -796,6 +848,12 @@ mod tests {
         assert_eq!(result.1, b"task cancelled");
         assert_eq!(result.2, -1);
         assert_eq!(terminal_audit_count(&repo, &victim).await, 1);
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !finished.exists(),
+            "the already-started victim must not reach its post-wait side effect"
+        );
 
         runtime.trigger_stop();
         let _ = beacon.await;
