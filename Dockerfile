@@ -15,8 +15,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM sources AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends \
+        binutils-mingw-w64-x86-64 \
+        ca-certificates \
+        curl \
+        gcc-mingw-w64-x86-64 \
+        musl-tools \
     && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-pc-windows-gnu x86_64-unknown-linux-musl \
     && groupadd --gid 10001 naughtywolf \
     && useradd --uid 10001 --gid naughtywolf --create-home naughtywolf \
     && mkdir -p /data/evidence /data/payloads /app/target \
@@ -28,6 +34,9 @@ ENV NAUGHTYWOLF_BIND=0.0.0.0:8080 \
     NAUGHTYWOLF_DATABASE_URL=sqlite:/data/naughtywolf.db?mode=rwc \
     NAUGHTYWOLF_EVIDENCE_DIR=/data/evidence \
     NAUGHTYWOLF_COOKIE_SECURE=true \
+    CC_x86_64_unknown_linux_musl=musl-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
     RUST_LOG=info
 WORKDIR /data
 USER naughtywolf

@@ -56,6 +56,10 @@ try:
     docker("exec", name, "sh", "-ec",
            "test -w /app/target && test -w /usr/local/cargo && test -w /usr/local/rustup; "
            "rustc --version; cargo metadata --manifest-path /app/Cargo.toml --no-deps --offline --format-version 1 >/dev/null; "
+           "printf 'int main(void) { return 0; }' > /tmp/nw-cross-probe.c; "
+           "musl-gcc /tmp/nw-cross-probe.c -o /tmp/nw-cross-probe-musl; "
+           "x86_64-w64-mingw32-gcc /tmp/nw-cross-probe.c -o /tmp/nw-cross-probe.exe; "
+           "x86_64-w64-mingw32-dlltool --version >/dev/null; "
            "printf evidence-persisted > /data/evidence/smoke.txt; printf payload-persisted > /data/payloads/smoke.txt")
     docker("stop", name)
     docker("rm", name)
@@ -63,7 +67,7 @@ try:
     assert "smoke-admin" in docker("exec", name, "naughtywolf", "user", "list").stdout
     assert docker("exec", name, "cat", "/data/evidence/smoke.txt").stdout == "evidence-persisted"
     assert docker("exec", name, "cat", "/data/payloads/smoke.txt").stdout == "payload-persisted"
-    print("PASS: health, UI assets, non-root CLI, build toolchain, and data persistence after replacement")
+    print("PASS: health, UI assets, non-root CLI, cross-build toolchains, and data persistence after replacement")
 except Exception:
     print(docker("logs", "--tail", "40", name, check=False).stdout, file=sys.stderr)
     raise
