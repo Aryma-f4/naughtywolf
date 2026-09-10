@@ -695,10 +695,7 @@ async fn callback_detail(
         .find_callback(&session_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let tasks = repository
-        .list_tasks_for_session(&session_id)
-        .await
-        .unwrap_or_default();
+    let tasks = repository.list_tasks_for_session(&session_id).await?;
     let csrf_token = Uuid::new_v4().to_string();
     Ok(Html(templates::callback_detail_page(
         &user,
@@ -715,10 +712,7 @@ async fn tasks_json(
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     user.require(Role::Operator)?;
-    let tasks = repository
-        .list_tasks_for_session(&session_id)
-        .await
-        .unwrap_or_default();
+    let tasks = repository.list_tasks_for_session(&session_id).await?;
     let arr: Vec<serde_json::Value> = tasks
         .iter()
         .map(|t| {

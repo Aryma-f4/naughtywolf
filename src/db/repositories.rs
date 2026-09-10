@@ -768,11 +768,13 @@ impl Repository {
     ) -> Result<Vec<crate::db::models::C2TaskWithResult>, AppError> {
         sqlx::query_as::<_, crate::db::models::C2TaskWithResult>(
             "SELECT t.id, t.session_id, t.command, t.args_json, t.status, t.created_at,
-                    t.processing_at, t.completed_at, t.result_output, t.result_ok, r.exit_code
+                    t.processing_at, t.completed_at, t.result_output, t.result_ok,
+                    r.exit_code AS result_exit_code,
+                    r.stderr AS result_stderr
              FROM c2_tasks t
              LEFT JOIN c2_task_results r ON r.task_id = t.id
              WHERE t.session_id = ?
-             ORDER BY t.created_at DESC",
+             ORDER BY t.created_at DESC, t.id DESC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)

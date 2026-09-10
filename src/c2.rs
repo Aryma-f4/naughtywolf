@@ -655,6 +655,7 @@ mod tests {
             result_output: Some(base64::engine::general_purpose::STANDARD.encode(b"one\ntwo\n")),
             result_ok: Some(true),
             result_exit_code: Some(0),
+            result_stderr: Some(Vec::new()),
         };
 
         let payload = completed_task_payload(&task).unwrap();

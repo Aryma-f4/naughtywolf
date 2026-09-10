@@ -10,6 +10,45 @@ async fn test_repository() -> Repository {
     Repository { pool }
 }
 
+async fn repository_fixture() -> (Repository, ()) {
+    (test_repository().await, ())
+}
+
+async fn insert_callback_fixture(repo: &Repository, host: &str) -> String {
+    let sid = uuid::Uuid::new_v4().to_string();
+    repo.upsert_callback(
+        &sid,
+        host,
+        "test-user",
+        "linux",
+        "amd64",
+        1,
+        "test-session-key",
+    )
+    .await
+    .unwrap();
+    sid
+}
+
+#[tokio::test]
+async fn callback_task_history_projects_the_persisted_exit_code() {
+    let (repo, _) = repository_fixture().await;
+    let sid = insert_callback_fixture(&repo, "history-host").await;
+    let task_id = repo
+        .enqueue_task(&sid, "ls", &serde_json::json!([]), 30_000)
+        .await
+        .unwrap();
+    repo.store_task_result(&task_id, true, b"one\ntwo\n", b"", 0)
+        .await
+        .unwrap();
+
+    let tasks = repo.list_tasks_for_session(&sid).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].result_exit_code, Some(0));
+    assert_eq!(tasks[0].result_stderr.as_deref(), Some(&b""[..]));
+    assert_eq!(tasks[0].status, "completed");
+}
+
 async fn create_user(repo: &Repository, id: &str, role: Role) {
     sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, ?)")
         .bind(id)

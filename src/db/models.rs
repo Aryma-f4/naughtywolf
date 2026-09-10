@@ -207,6 +207,7 @@ pub struct C2TaskWithResult {
     pub result_output: Option<String>,
     pub result_ok: Option<bool>,
     pub result_exit_code: Option<i32>,
+    pub result_stderr: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]

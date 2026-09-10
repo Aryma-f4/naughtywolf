@@ -757,6 +757,7 @@ fn callback_detail_rehydrates_completed_output_and_command_history() {
         result_output: Some(base64::engine::general_purpose::STANDARD.encode(b"one\ntwo\n")),
         result_ok: Some(true),
         result_exit_code: Some(0),
+        result_stderr: Some(Vec::new()),
     }];
 
     let body = templates::callback_detail_page(&user, &callback, &tasks, "csrf-token");
@@ -765,6 +766,51 @@ fn callback_detail_rehydrates_completed_output_and_command_history() {
     assert!(body.contains("data-task-command=\"ls\""));
     assert!(body.contains("one\ntwo\n"));
     assert!(!body.contains("No output yet"));
+}
+
+#[tokio::test]
+async fn callback_detail_renders_persisted_task_history_after_reload() {
+    let repository = test_repository().await;
+    let operator = create_user(&repository, "history-operator", Role::Operator).await;
+    let sid = uuid::Uuid::new_v4().to_string();
+    repository
+        .upsert_callback(
+            &sid,
+            "history-host",
+            "test-user",
+            "linux",
+            "amd64",
+            1,
+            "test-session-key",
+        )
+        .await
+        .unwrap();
+    let task_id = repository
+        .enqueue_task(&sid, "ls", &serde_json::json!([]), 30_000)
+        .await
+        .unwrap();
+    repository
+        .store_task_result(&task_id, true, b"one\ntwo\n", b"", 0)
+        .await
+        .unwrap();
+    let app = app_with_user_and_repository(repository, operator).await;
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/callbacks/{sid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(body.contains(&task_id));
+        assert!(body.contains("Completed"));
+        assert!(body.contains("one\ntwo\n"));
+    }
 }
 
 // ── Task 3: Component contracts ───────────────────────────────────────────────
