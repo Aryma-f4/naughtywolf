@@ -342,9 +342,7 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
 
     let built = built_binary(&req.target);
     let dest = PathBuf::from(PAYLOAD_DIR).join(file);
-    tokio::fs::copy(&built, &dest)
-        .await
-        .with_context(|| format!("copy built implant to {dest:?}"))?;
+    publish_artifact(&built, &dest).await?;
 
     let mut meta = PayloadMeta {
         file: file.to_owned(),
@@ -391,7 +389,10 @@ fn list_from_dir(dir: &Path) -> Result<Vec<PayloadMeta>> {
         let entry = entry?;
         let path = entry.path();
         let fname = entry.file_name().to_string_lossy().to_string();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json" || extension == "tmp")
+        {
             continue;
         }
         let sidecar = dir.join(format!("{fname}.json"));
@@ -443,6 +444,27 @@ fn write_metadata_atomic(sidecar: &Path, meta: &PayloadMeta) -> Result<()> {
     if let Err(error) = std::fs::rename(&temporary, sidecar) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
+    }
+    Ok(())
+}
+
+async fn publish_artifact(source: &Path, destination: &Path) -> Result<()> {
+    let directory = destination
+        .parent()
+        .context("payload destination has no parent directory")?;
+    let filename = destination
+        .file_name()
+        .context("payload destination has no filename")?
+        .to_string_lossy();
+    let temporary = directory.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
+    if let Err(error) = tokio::fs::copy(source, &temporary).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error)
+            .with_context(|| format!("copy built implant to temporary file {temporary:?}"));
+    }
+    if let Err(error) = tokio::fs::rename(&temporary, destination).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error).with_context(|| format!("publish built implant at {destination:?}"));
     }
     Ok(())
 }
@@ -506,6 +528,7 @@ pub fn random_psk() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek};
 
     #[test]
     fn sanitize_keeps_identifier_chars() {
@@ -673,5 +696,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(persisted.public_id, ids[0]);
+    }
+
+    #[test]
+    fn payload_listing_ignores_atomic_publish_temporary_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("artifact.json.550e8400.tmp"),
+            b"sensitive metadata",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("artifact.550e8400.tmp"), b"partial").unwrap();
+
+        assert!(list_from_dir(temp.path()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn artifact_publish_atomically_replaces_the_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("new-build");
+        let destination = temp.path().join("payload.bin");
+        std::fs::write(&source, b"new-complete-payload").unwrap();
+        std::fs::write(&destination, b"old-complete-payload").unwrap();
+        let mut active_download = std::fs::File::open(&destination).unwrap();
+
+        publish_artifact(&source, &destination).await.unwrap();
+
+        let mut old_bytes = Vec::new();
+        active_download.rewind().unwrap();
+        active_download.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, b"old-complete-payload");
+        assert_eq!(std::fs::read(destination).unwrap(), b"new-complete-payload");
     }
 }

@@ -107,6 +107,7 @@ async fn public_payload_download_requires_the_matching_uuid_not_a_login() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     assert!(
         response.headers()["content-disposition"]
             .to_str()
