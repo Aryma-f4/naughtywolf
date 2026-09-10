@@ -59,17 +59,22 @@ async fn body_string(response: Response) -> String {
 
 #[tokio::test]
 async fn public_payload_download_requires_the_matching_uuid_not_a_login() {
-    let token = "550e8400-e29b-41d4-a716-446655440000";
+    let token = uuid::Uuid::new_v4().to_string();
     let wrong_token = "550e8400-e29b-41d4-a716-446655440001";
-    let file = "public-download-route-test.bin";
+    let file = format!("public-download-route-test-{token}.bin");
     let dir = std::path::Path::new("payloads");
     std::fs::create_dir_all(dir).unwrap();
-    let artifact = dir.join(file);
+    let artifact = dir.join(&file);
     let sidecar = dir.join(format!("{file}.json"));
     let _cleanup = PayloadArtifactCleanup {
         paths: vec![artifact.clone(), sidecar.clone()],
     };
-    std::fs::write(&artifact, b"public-payload-bytes").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&artifact)
+        .and_then(|mut output| std::io::Write::write_all(&mut output, b"public-payload-bytes"))
+        .unwrap();
     std::fs::write(
         &sidecar,
         serde_json::to_vec(&serde_json::json!({
@@ -102,16 +107,18 @@ async fn public_payload_download_requires_the_matching_uuid_not_a_login() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "no-store");
-    assert_eq!(
-        response.headers()["content-disposition"],
-        "attachment; filename=\"public-download-route-test.bin\""
+    assert!(
+        response.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains(&file)
     );
     assert_eq!(
         to_bytes(response.into_body(), usize::MAX).await.unwrap(),
         "public-payload-bytes"
     );
 
-    for unavailable in [file, wrong_token] {
+    for unavailable in [&file, wrong_token] {
         let response = public_router()
             .oneshot(
                 Request::get(format!("/payloads/download/{unavailable}"))

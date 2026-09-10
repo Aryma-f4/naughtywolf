@@ -94,6 +94,44 @@ pub fn building_jobs() -> Vec<BuildJob> {
 /// `(file, error, at)` for recent failed builds, surfaced in the payload UI.
 static RECENT_ERRORS: LazyLock<Mutex<Vec<(String, String, String)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+static PAYLOAD_METADATA_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static PUBLIC_DOWNLOAD_INDEX: LazyLock<Mutex<PublicDownloadIndex>> =
+    LazyLock::new(|| Mutex::new(PublicDownloadIndex::default()));
+static PUBLIC_INDEX_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[derive(Default)]
+struct PublicDownloadIndex {
+    loaded: bool,
+    entries: HashMap<Uuid, (PathBuf, String)>,
+}
+
+impl PublicDownloadIndex {
+    fn replace(&mut self, dir: &Path, metadata: &[PayloadMeta]) {
+        self.entries.clear();
+        for meta in metadata {
+            if let Some(public_id) = valid_public_uuid(&meta.public_id) {
+                self.entries
+                    .insert(public_id, (dir.join(&meta.file), meta.file.clone()));
+            }
+        }
+        self.loaded = true;
+    }
+
+    fn register(&mut self, dir: &Path, meta: &PayloadMeta) {
+        if !self.loaded {
+            return;
+        }
+        if let Some(public_id) = valid_public_uuid(&meta.public_id) {
+            self.entries
+                .insert(public_id, (dir.join(&meta.file), meta.file.clone()));
+        }
+    }
+
+    fn resolve(&self, token: &str) -> Option<(PathBuf, String)> {
+        let public_id = valid_public_uuid(token)?;
+        self.entries.get(&public_id).cloned()
+    }
+}
 
 pub fn record_build_error(file: &str, err: &str) {
     if let Ok(mut v) = RECENT_ERRORS.lock() {
@@ -308,7 +346,7 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
         .await
         .with_context(|| format!("copy built implant to {dest:?}"))?;
 
-    let meta = PayloadMeta {
+    let mut meta = PayloadMeta {
         file: file.to_owned(),
         name: name.to_owned(),
         os: req.os.clone(),
@@ -324,22 +362,30 @@ async fn do_build(req: &BuildRequest, name: &str, file: &str) -> Result<PayloadM
         size: std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0),
         built_at: chrono::Utc::now().to_rfc3339(),
     };
-    let sidecar = PathBuf::from(PAYLOAD_DIR).join(format!("{file}.json"));
-    tokio::fs::write(&sidecar, serde_json::to_vec_pretty(&meta)?)
-        .await
-        .context("write payload metadata")?;
+    store_payload_metadata(Path::new(PAYLOAD_DIR), &mut meta)?;
+    if let Ok(mut index) = PUBLIC_DOWNLOAD_INDEX.lock() {
+        index.register(Path::new(PAYLOAD_DIR), &meta);
+    }
     Ok(meta)
 }
 
 pub fn list() -> Result<Vec<PayloadMeta>> {
     let dir = Path::new(PAYLOAD_DIR);
-    list_from_dir(dir)
+    let metadata = list_from_dir(dir)?;
+    let mut index = PUBLIC_DOWNLOAD_INDEX
+        .lock()
+        .map_err(|_| anyhow::anyhow!("public download index lock poisoned"))?;
+    index.replace(dir, &metadata);
+    Ok(metadata)
 }
 
 fn list_from_dir(dir: &Path) -> Result<Vec<PayloadMeta>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
+    let _guard = PAYLOAD_METADATA_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("payload metadata lock poisoned"))?;
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -355,14 +401,50 @@ fn list_from_dir(dir: &Path) -> Result<Vec<PayloadMeta>> {
         } else {
             fallback_meta(&fname, &path)
         };
-        if Uuid::parse_str(&meta.public_id).is_err() {
-            meta.public_id = Uuid::new_v4().to_string();
-            std::fs::write(&sidecar, serde_json::to_vec_pretty(&meta)?)?;
+        meta.file = fname;
+        let public_id = valid_public_uuid(&meta.public_id)
+            .unwrap_or_else(Uuid::new_v4)
+            .to_string();
+        if meta.public_id != public_id {
+            meta.public_id = public_id;
+            write_metadata_atomic(&sidecar, &meta)?;
         }
         out.push(meta);
     }
     out.sort_by(|a, b| b.built_at.cmp(&a.built_at));
     Ok(out)
+}
+
+fn valid_public_uuid(value: &str) -> Option<Uuid> {
+    Uuid::parse_str(value)
+        .ok()
+        .filter(|id| id.get_version() == Some(uuid::Version::Random))
+}
+
+fn store_payload_metadata(dir: &Path, meta: &mut PayloadMeta) -> Result<()> {
+    let _guard = PAYLOAD_METADATA_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("payload metadata lock poisoned"))?;
+    let sidecar = dir.join(format!("{}.json", meta.file));
+    let existing_id = std::fs::read(&sidecar)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PayloadMeta>(&bytes).ok())
+        .and_then(|existing| valid_public_uuid(&existing.public_id));
+    let public_id = existing_id
+        .or_else(|| valid_public_uuid(&meta.public_id))
+        .unwrap_or_else(Uuid::new_v4);
+    meta.public_id = public_id.to_string();
+    write_metadata_atomic(&sidecar, meta)
+}
+
+fn write_metadata_atomic(sidecar: &Path, meta: &PayloadMeta) -> Result<()> {
+    let temporary = sidecar.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(meta)?)?;
+    if let Err(error) = std::fs::rename(&temporary, sidecar) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn fallback_meta(fname: &str, path: &Path) -> PayloadMeta {
@@ -396,30 +478,24 @@ pub fn download_path(file: &str) -> Option<PathBuf> {
 /// Resolve an unguessable public download token to the artifact it names.
 /// The path comes from the directory entry, never from sidecar-controlled data.
 pub fn public_download(token: &str) -> Option<(PathBuf, String)> {
-    public_download_from_dir(Path::new(PAYLOAD_DIR), token)
-}
-
-fn public_download_from_dir(dir: &Path, token: &str) -> Option<(PathBuf, String)> {
-    let token = Uuid::parse_str(token).ok()?.to_string();
-    for entry in std::fs::read_dir(dir).ok()? {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if !path.is_file() || path.extension().is_some_and(|ext| ext == "json") {
-            continue;
-        }
-        let filename = entry.file_name().to_string_lossy().to_string();
-        let sidecar = dir.join(format!("{filename}.json"));
-        let Ok(bytes) = std::fs::read(sidecar) else {
-            continue;
-        };
-        let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        if metadata.get("public_id").and_then(|id| id.as_str()) == Some(token.as_str()) {
-            return Some((path, filename));
-        }
+    valid_public_uuid(token)?;
+    if let Ok(index) = PUBLIC_DOWNLOAD_INDEX.lock()
+        && index.loaded
+    {
+        return index.resolve(token);
     }
-    None
+
+    let _load_guard = PUBLIC_INDEX_LOAD_LOCK.lock().ok()?;
+    if let Ok(index) = PUBLIC_DOWNLOAD_INDEX.lock()
+        && index.loaded
+    {
+        return index.resolve(token);
+    }
+    let dir = Path::new(PAYLOAD_DIR);
+    let metadata = list_from_dir(dir).ok()?;
+    let mut index = PUBLIC_DOWNLOAD_INDEX.lock().ok()?;
+    index.replace(dir, &metadata);
+    index.resolve(token)
 }
 
 /// Fresh random PSK for the build form default.
@@ -510,7 +586,10 @@ mod tests {
 
         let first = list_from_dir(temp.path()).unwrap();
         let public_id = first[0].public_id.clone();
-        assert!(Uuid::parse_str(&public_id).is_ok());
+        assert_eq!(
+            Uuid::parse_str(&public_id).unwrap().get_version(),
+            Some(uuid::Version::Random)
+        );
         assert_eq!(list_from_dir(temp.path()).unwrap()[0].public_id, public_id);
 
         let persisted: serde_json::Value =
@@ -519,19 +598,80 @@ mod tests {
     }
 
     #[test]
-    fn public_download_skips_unrelated_artifacts_without_metadata() {
+    fn rebuilding_a_payload_preserves_its_public_uuid() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("orphan.bin"), b"orphan").unwrap();
-        let token = "550e8400-e29b-41d4-a716-446655440000";
-        let file = "wanted.bin";
-        std::fs::write(temp.path().join(file), b"wanted").unwrap();
+        let file = "stable.windows.amd64";
+        let artifact = temp.path().join(file);
+        std::fs::write(&artifact, b"old").unwrap();
+        let original_id = "550e8400-e29b-41d4-a716-446655440000";
+        let mut original = fallback_meta(file, &artifact);
+        original.public_id = original_id.into();
         std::fs::write(
             temp.path().join(format!("{file}.json")),
-            serde_json::to_vec(&serde_json::json!({ "public_id": token })).unwrap(),
+            serde_json::to_vec_pretty(&original).unwrap(),
         )
         .unwrap();
 
-        let (_, filename) = public_download_from_dir(temp.path(), token).unwrap();
-        assert_eq!(filename, "wanted.bin");
+        let mut rebuilt = fallback_meta(file, &artifact);
+        rebuilt.public_id = Uuid::new_v4().to_string();
+        store_payload_metadata(temp.path(), &mut rebuilt).unwrap();
+
+        assert_eq!(rebuilt.public_id, original_id);
+        let persisted: PayloadMeta = serde_json::from_slice(
+            &std::fs::read(temp.path().join(format!("{file}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.public_id, original_id);
+    }
+
+    #[test]
+    fn public_download_index_resolves_v4_tokens_without_sidecar_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = "indexed.bin";
+        let artifact = temp.path().join(file);
+        std::fs::write(&artifact, b"indexed").unwrap();
+        let token = "550e8400-e29b-41d4-a716-446655440000";
+        let mut meta = fallback_meta(file, &artifact);
+        meta.public_id = token.into();
+        let mut index = PublicDownloadIndex::default();
+        index.replace(temp.path(), &[meta]);
+
+        let (_, filename) = index.resolve(token).unwrap();
+        assert_eq!(filename, file);
+        assert!(
+            index
+                .resolve("00000000-0000-0000-0000-000000000000")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_legacy_backfill_publishes_one_uuid() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = "concurrent.linux.amd64";
+        std::fs::write(temp.path().join(file), b"payload").unwrap();
+        let workers = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let dir = temp.path().to_owned();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    list_from_dir(&dir).unwrap()[0].public_id.clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(ids.iter().all(|id| id == &ids[0]));
+        let persisted: PayloadMeta = serde_json::from_slice(
+            &std::fs::read(temp.path().join(format!("{file}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.public_id, ids[0]);
     }
 }

@@ -6,6 +6,8 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 use tower_sessions::Session;
 use uuid::Uuid;
 
@@ -600,20 +602,75 @@ async fn public_download_payload(Path(token): Path<String>) -> Result<Response, 
     let Some((path, filename)) = crate::payload::public_download(&token) else {
         return Err(AppError::NotFound);
     };
-    let data = tokio::fs::read(&path)
+    let served = ServeFile::new(path)
+        .oneshot(Request::new(axum::body::Body::empty()))
         .await
-        .map_err(|_| AppError::NotFound)?;
-    Ok(axum::response::Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CACHE_CONTROL, "no-store")
-        .header("x-content-type-options", "nosniff")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\""),
-        )
-        .body(axum::body::Body::from(data))
-        .unwrap())
+        .map_err(|_| AppError::Internal)?;
+    if served.status() == StatusCode::NOT_FOUND {
+        return Err(AppError::NotFound);
+    }
+    let (parts, body) = served.into_parts();
+    let mut response = Response::from_parts(parts, axum::body::Body::new(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        content_disposition(&filename).map_err(|_| AppError::Internal)?,
+    );
+    Ok(response)
+}
+
+fn content_disposition(
+    filename: &str,
+) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    let fallback = filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ' ') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let encoded = filename
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric()
+                || matches!(
+                    *byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'&'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+            {
+                char::from(*byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+    ))
 }
 
 async fn callbacks(
@@ -1190,4 +1247,24 @@ async fn workspace_style() -> Response {
         include_str!("../static/workspace.css"),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod public_download_tests {
+    use super::*;
+
+    #[test]
+    fn content_disposition_cannot_inject_headers_from_a_legacy_filename() {
+        let value = content_disposition("legacy\"\r\nX-Evil: yes-猫.bin")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        assert!(!value.contains('\r'));
+        assert!(!value.contains('\n'));
+        assert!(!value.contains("X-Evil:"));
+        assert!(value.starts_with("attachment; filename=\"legacy___X-Evil_ yes-_.bin\""));
+        assert!(value.contains("filename*=UTF-8''legacy%22%0D%0AX-Evil%3A%20yes-%E7%8C%AB.bin"));
+    }
 }
