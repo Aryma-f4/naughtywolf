@@ -695,7 +695,7 @@ impl Repository {
                 .await
                 .map_err(|_| AppError::Internal)?;
         for row in &rows {
-            sqlx::query("UPDATE c2_tasks SET status = 'delivered', processing_at = datetime('now') WHERE id = ?")
+            sqlx::query("UPDATE c2_tasks SET status = 'delivered', processing_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")
                 .bind(&row.id)
                 .execute(&self.pool)
                 .await
@@ -715,7 +715,7 @@ impl Repository {
     ) -> Result<(), AppError> {
         let status = if ok { "completed" } else { "error" };
         sqlx::query(
-            "UPDATE c2_tasks SET status = ?, completed_at = datetime('now'),
+            "UPDATE c2_tasks SET status = ?, completed_at = datetime('now'), updated_at = datetime('now'),
              result_output = ?, result_ok = ? WHERE id = ?",
         )
         .bind(status)

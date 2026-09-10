@@ -148,6 +148,7 @@ pub enum TaskStatus {
     Processing,
     Completed,
     Error,
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -160,6 +161,7 @@ impl TaskStatus {
             Self::Processing => ("Processing", "warning"),
             Self::Completed => ("Completed", "success"),
             Self::Error => ("Error", "danger"),
+            Self::Cancelled => ("Cancelled", "danger"),
         }
     }
 
@@ -172,6 +174,7 @@ impl TaskStatus {
             "processing" => ("Processing", "warning"),
             "completed" => ("Completed", "success"),
             "error" => ("Error", "danger"),
+            "cancelled" => ("Cancelled", "danger"),
             _ => ("Unknown", "neutral"),
         }
     }
@@ -191,6 +194,11 @@ pub struct C2Task {
     pub completed_at: Option<String>,
     pub result_output: Option<String>,
     pub result_ok: Option<bool>,
+    pub result_exit_code: Option<i32>,
+    pub operator_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub updated_at: String,
+    pub cancellation_requested_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
@@ -208,6 +216,45 @@ pub struct C2TaskWithResult {
     pub result_ok: Option<bool>,
     pub result_exit_code: Option<i32>,
     pub result_stderr: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ProcessSnapshot {
+    pub session_id: String,
+    pub task_id: String,
+    pub schema_version: String,
+    #[sqlx(json)]
+    pub snapshot_json: Value,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct FileSnapshot {
+    pub session_id: String,
+    pub path: String,
+    pub task_id: String,
+    pub schema_version: String,
+    #[sqlx(json)]
+    pub snapshot_json: Value,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct FileTransfer {
+    pub id: String,
+    pub session_id: String,
+    pub task_id: Option<String>,
+    pub direction: String,
+    pub remote_path: String,
+    pub storage_key: String,
+    pub expected_size: Option<i64>,
+    pub received_bytes: i64,
+    pub sha256: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
