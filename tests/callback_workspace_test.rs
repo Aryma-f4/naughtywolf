@@ -433,6 +433,41 @@ async fn task_events_begin_with_an_authoritative_complete_snapshot() {
 }
 
 #[tokio::test]
+async fn task_events_terminate_when_reconciliation_reads_fail() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "stream-failure-operator", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    repo.enqueue_task(&session_id, "pwd", &serde_json::json!([]), 30_000)
+        .await
+        .unwrap();
+    let app = authenticated_app(repo.clone(), operator).await;
+    let response = app
+        .oneshot(
+            Request::get(format!("/api/callbacks/{session_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("initial task snapshot")
+        .expect("initial body item")
+        .expect("initial event bytes");
+    sqlx::query("DROP TABLE c2_tasks")
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("repository failure must not leave a stale stream connected");
+    assert!(next.is_none(), "repository failure must terminate SSE");
+}
+
+#[tokio::test]
 async fn tasking_tab_exposes_persistent_controls_and_local_assets() {
     let repo = test_repository().await;
     let operator = create_user(&repo, "tab-operator", Role::Operator).await;

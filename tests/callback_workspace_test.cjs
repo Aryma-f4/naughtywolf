@@ -25,7 +25,7 @@ class Element {
   addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
   dispatch(type, values = {}) {
     const event = { target: this, preventDefault() { this.defaultPrevented = true; }, ...values };
-    for (const listener of this.listeners[type] || []) listener(event);
+    event.pending = Promise.all((this.listeners[type] || []).map(listener => listener(event)));
     return event;
   }
   matches(selector) {
@@ -164,3 +164,59 @@ test('SSE reconnect refetches the first page and upserts by ID', async () => {
   assert.equal(root.querySelectorAll('[data-task-card]').length, 1);
   assert.equal(root.querySelector('[data-task-stdout]').textContent, 'after reconnect');
 });
+
+test('closing during the initial fetch prevents a late EventSource connection', async () => {
+  const root = skeleton();
+  let resolveFetch;
+  const deps = dependencies();
+  deps.fetch = () => new Promise(resolve => { resolveFetch = resolve; });
+  const workspace = createWorkspace(root, deps);
+
+  workspace.close();
+  resolveFetch({ ok: true, json: async () => ({ tasks: [], next_before: null }) });
+  await workspace.ready;
+
+  assert.equal(deps.source, undefined);
+});
+
+test('task submission failure is handled and shows actionable retry status', async () => {
+  const root = skeleton();
+  const deps = dependencies();
+  let calls = 0;
+  deps.fetch = async () => {
+    calls++;
+    if (calls === 1) return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+    return { ok: false, status: 503 };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  root.querySelector('[data-command-input]').value = 'whoami';
+
+  const event = root.querySelector('[data-task-form]').dispatch('submit');
+  await event.pending;
+
+  assert.match(root.querySelector('[data-connection-state]').textContent, /Unable to submit task.*retry/i);
+});
+
+for (const action of ['retry', 'cancel']) {
+  test(`${action} failure is handled and shows actionable retry status`, async () => {
+    const root = skeleton();
+    const deps = dependencies();
+    let calls = 0;
+    deps.fetch = async () => {
+      calls++;
+      if (calls === 1) return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+      throw new Error('offline');
+    };
+    const workspace = createWorkspace(root, deps);
+    await workspace.ready;
+    workspace.upsert(task({ status: action === 'retry' ? 'completed' : 'pending', state_label: action === 'retry' ? 'Completed' : 'Queued' }));
+    const card = root.querySelector('[data-task-card]');
+    const button = card.querySelectorAll('[data-task-action]').find(candidate => candidate.dataset.taskAction === action);
+
+    const event = root.querySelector('[data-task-list]').dispatch('click', { target: button });
+    await event.pending;
+
+    assert.match(root.querySelector('[data-connection-state]').textContent, new RegExp(`Unable to ${action} task.*retry`, 'i'));
+  });
+}

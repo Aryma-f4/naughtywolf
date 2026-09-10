@@ -291,16 +291,18 @@ pub async fn task_events(
                 }
 
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                if let Ok(records) = repository.list_all_task_records(&session_id).await {
-                    for record in records.into_iter().rev() {
-                        let view = TaskView::from(record);
-                        let Ok(serialized) = serde_json::to_string(&view) else {
-                            continue;
-                        };
-                        if known.get(&view.id) != Some(&serialized) {
-                            known.insert(view.id, serialized.clone());
-                            queued.push_back(serialized);
-                        }
+                let records = match repository.list_all_task_records(&session_id).await {
+                    Ok(records) => records,
+                    Err(_) => return None,
+                };
+                for record in records.into_iter().rev() {
+                    let view = TaskView::from(record);
+                    let Ok(serialized) = serde_json::to_string(&view) else {
+                        continue;
+                    };
+                    if known.get(&view.id) != Some(&serialized) {
+                        known.insert(view.id, serialized.clone());
+                        queued.push_back(serialized);
                     }
                 }
             }

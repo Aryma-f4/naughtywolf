@@ -13,6 +13,13 @@
 
   let buildTimer = null;
   let buildDismissed = false;
+  let callbackWorkspace = null;
+
+  const closeCallbackWorkspace = () => {
+    const workspace = callbackWorkspace;
+    callbackWorkspace = null;
+    workspace?.close();
+  };
 
   const entryAnims = () => {
     window.NWMotion?.page(document.querySelector("main"));
@@ -24,7 +31,8 @@
     });
     bindPayloadForm();
     window.NWModuleStudio?.init(document.querySelector("main"));
-    window.NWCallbackWorkspace?.init(document.querySelector("main"));
+    closeCallbackWorkspace();
+    callbackWorkspace = window.NWCallbackWorkspace?.init(document.querySelector("main")) || null;
     window.NWWorkspace?.init(document.querySelector("main"));
   };
 
@@ -145,6 +153,7 @@
       const nextMain = doc.querySelector("main");
       if (!nextMain || !currentMain) throw new Error("Page content is unavailable");
       window.NWMotion?.clearPage();
+      closeCallbackWorkspace();
       currentMain.replaceWith(nextMain);
       const title = doc.querySelector("title")?.textContent;
       if (title) document.title = title;

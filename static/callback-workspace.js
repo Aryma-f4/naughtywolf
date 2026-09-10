@@ -23,6 +23,7 @@
     let reconnecting = false;
     let historyIndex = -1;
     let draft = "";
+    let closed = false;
 
     const element = (tag, className, text) => {
       const node = doc.createElement(tag);
@@ -175,7 +176,7 @@
     };
 
     const connect = () => {
-      if (!root.dataset.eventsEndpoint || !EventStream) return;
+      if (closed || !root.dataset.eventsEndpoint || !EventStream) return;
       eventSource = new EventStream(root.dataset.eventsEndpoint);
       eventSource.addEventListener("task", event => {
         try { upsert(JSON.parse(event.data)); } catch (_) { /* ignore malformed snapshots */ }
@@ -221,30 +222,39 @@
       const command = commandInput.value.trim();
       if (!command) return;
       const argumentsList = commandArguments.value.trim() ? commandArguments.value.trim().split(/\s+/) : [];
-      const response = await request(root.dataset.tasksEndpoint, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "content-type": "application/json", "x-csrf-token": root.dataset.csrfToken },
-        body: JSON.stringify({ command, arguments: argumentsList, timeout_ms: 30000 }),
-      });
-      if (!response.ok) throw new Error(`Task submission failed (${response.status})`);
-      upsert(await response.json());
-      commandInput.value = "";
-      commandArguments.value = "";
-      historyIndex = -1;
+      try {
+        const response = await request(root.dataset.tasksEndpoint, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json", "x-csrf-token": root.dataset.csrfToken },
+          body: JSON.stringify({ command, arguments: argumentsList, timeout_ms: 30000 }),
+        });
+        if (!response.ok) throw new Error(`Task submission failed (${response.status})`);
+        upsert(await response.json());
+        commandInput.value = "";
+        commandArguments.value = "";
+        historyIndex = -1;
+      } catch (_) {
+        setConnection("Unable to submit task — check connection and retry.");
+      }
     });
 
     list?.addEventListener("click", async event => {
       const button = event.target.closest?.("[data-task-action]");
       const card = button?.closest?.("[data-task-card]");
       if (!button || !card) return;
-      const response = await request(`${root.dataset.tasksEndpoint}/${encodeURIComponent(card.dataset.taskId)}/${button.dataset.taskAction}`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "x-csrf-token": root.dataset.csrfToken },
-      });
-      if (!response.ok) throw new Error(`Task action failed (${response.status})`);
-      upsert(await response.json());
+      const action = button.dataset.taskAction;
+      try {
+        const response = await request(`${root.dataset.tasksEndpoint}/${encodeURIComponent(card.dataset.taskId)}/${action}`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "x-csrf-token": root.dataset.csrfToken },
+        });
+        if (!response.ok) throw new Error(`Task action failed (${response.status})`);
+        upsert(await response.json());
+      } catch (_) {
+        setConnection(`Unable to ${action} task — check connection and retry.`);
+      }
     });
 
     if (offlineQueue) {
@@ -256,7 +266,15 @@
       .then(() => connect())
       .catch(() => setConnection("History unavailable — retry"));
 
-    return { ready, upsert, close: () => eventSource?.close() };
+    return {
+      ready,
+      upsert,
+      close() {
+        if (closed) return;
+        closed = true;
+        eventSource?.close();
+      },
+    };
   }
 
   const api = {
