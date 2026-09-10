@@ -781,25 +781,71 @@ impl Repository {
         Ok(task_id)
     }
 
-    /// Fetch pending tasks for a session, marking fetched tasks as 'delivering' then 'delivered'.
+    /// Return work until its delivery is acknowledged by the owning callback.
+    pub async fn tasks_for_delivery(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::db::models::C2Task>, AppError> {
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        let rows: Vec<crate::db::models::C2Task> = sqlx::query_as(
+            "SELECT * FROM c2_tasks WHERE session_id = ? AND status IN ('pending', 'delivered') \
+             ORDER BY created_at, id",
+        )
+        .bind(session_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "UPDATE c2_tasks SET status = 'delivered', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE session_id = ? AND status = 'pending'",
+        )
+        .bind(session_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+        Ok(rows)
+    }
+
+    /// Advance acknowledged deliveries without allowing cross-session ids.
+    pub async fn acknowledge_tasks(&self, session_id: &str, ids: &[Uuid]) -> Result<(), AppError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        for id in ids {
+            let owner: Option<String> =
+                sqlx::query_scalar("SELECT session_id FROM c2_tasks WHERE id = ?")
+                    .bind(id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(|_| AppError::Internal)?;
+            if owner.as_deref() != Some(session_id) {
+                return Err(AppError::NotFound);
+            }
+        }
+        for id in ids {
+            sqlx::query(
+                "UPDATE c2_tasks SET status = 'processing', \
+                 processing_at = COALESCE(processing_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE id = ? AND session_id = ? AND status IN ('delivering', 'delivered')",
+            )
+            .bind(id.to_string())
+            .bind(session_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        }
+        transaction.commit().await.map_err(|_| AppError::Internal)
+    }
+
+    /// Backward-compatible name retained for callers outside the callback poll path.
     pub async fn fetch_pending_tasks(
         &self,
         session_id: &str,
     ) -> Result<Vec<crate::db::models::C2Task>, AppError> {
-        let rows: Vec<crate::db::models::C2Task> =
-            sqlx::query_as("SELECT * FROM c2_tasks WHERE session_id = ? AND status = 'pending'")
-                .bind(session_id)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|_| AppError::Internal)?;
-        for row in &rows {
-            sqlx::query("UPDATE c2_tasks SET status = 'delivered', processing_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")
-                .bind(&row.id)
-                .execute(&self.pool)
-                .await
-                .map_err(|_| AppError::Internal)?;
-        }
-        Ok(rows)
+        self.tasks_for_delivery(session_id).await
     }
 
     /// Store a task result and mark the task as completed or error (Mythic-style).
@@ -811,52 +857,206 @@ impl Repository {
         stderr: &[u8],
         exit_code: i32,
     ) -> Result<(), AppError> {
-        let status = if ok { "completed" } else { "error" };
-        sqlx::query(
-            "UPDATE c2_tasks SET status = ?, completed_at = datetime('now'), updated_at = datetime('now'),
-             result_output = ?, result_ok = ? WHERE id = ?",
+        let session_id: String = sqlx::query_scalar("SELECT session_id FROM c2_tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)?
+            .ok_or(AppError::NotFound)?;
+        self.store_task_result_for_session(&session_id, task_id, ok, stdout, stderr, exit_code)
+            .await
+            .and_then(|stored| {
+                if stored {
+                    Ok(())
+                } else {
+                    Err(AppError::NotFound)
+                }
+            })
+    }
+
+    /// Atomically store one owned result. Replays are acknowledged without a
+    /// second result write or terminal audit entry.
+    pub async fn store_task_result_for_session(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        ok: bool,
+        stdout: &[u8],
+        stderr: &[u8],
+        exit_code: i32,
+    ) -> Result<bool, AppError> {
+        use base64::Engine;
+
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, cancellation_requested_at FROM c2_tasks WHERE id = ? AND session_id = ?",
         )
-        .bind(status)
-        .bind({
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(stdout)
-        })
-        .bind(if ok { 1 } else { 0 })
         .bind(task_id)
-        .execute(&self.pool)
+        .bind(session_id)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
+        let Some((current, cancellation_requested_at)) = row else {
+            return Ok(false);
+        };
+        if matches!(current.as_str(), "completed" | "error" | "cancelled") {
+            transaction.commit().await.map_err(|_| AppError::Internal)?;
+            return Ok(true);
+        }
 
+        let status = if ok {
+            "completed"
+        } else if cancellation_requested_at.is_some() {
+            "cancelled"
+        } else {
+            "error"
+        };
         sqlx::query(
-            "INSERT OR REPLACE INTO c2_task_results
-             (task_id, ok, stdout, stderr, exit_code, completed_at)
-             VALUES (?, ?, ?, ?, ?, datetime('now'))",
+            "INSERT INTO c2_task_results (task_id, ok, stdout, stderr, exit_code, completed_at) \
+             VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
         )
         .bind(task_id)
         .bind(if ok { 1 } else { 0 })
         .bind(stdout)
         .bind(stderr)
         .bind(exit_code)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
-
-        // Audit log
-        let action = if ok { "task_completed" } else { "task_error" };
         sqlx::query(
-            "INSERT INTO c2_audit (operator_id, operator_name, action, target_session, details, succeeded, timestamp)
-             VALUES (?, ?, ?, NULL, ?, ?, datetime('now'))",
+            "UPDATE c2_tasks SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), result_output = ?, \
+             result_ok = ?, result_exit_code = ? WHERE id = ? AND session_id = ?",
         )
-        .bind("")
-        .bind("system")
-        .bind(action)
-        .bind(format!("task {} {}", task_id, if ok { "completed" } else { "errored" }))
+        .bind(status)
+        .bind(base64::engine::general_purpose::STANDARD.encode(stdout))
         .bind(if ok { 1 } else { 0 })
-        .execute(&self.pool)
+        .bind(exit_code)
+        .bind(task_id)
+        .bind(session_id)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
+        let action = match status {
+            "completed" => "task_completed",
+            "cancelled" => "task_cancelled",
+            _ => "task_error",
+        };
+        sqlx::query(
+            "INSERT INTO c2_audit (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+             VALUES ('', 'system', ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(action)
+        .bind(session_id)
+        .bind(format!("task {task_id}"))
+        .bind(if ok || status == "cancelled" { 1 } else { 0 })
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+        Ok(true)
+    }
 
-        Ok(())
+    pub async fn request_task_cancellation(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        operator_id: &str,
+        operator_name: &str,
+    ) -> Result<crate::db::models::TaskCancellation, AppError> {
+        use crate::db::models::TaskCancellation;
+
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, cancellation_requested_at FROM c2_tasks WHERE id = ? AND session_id = ?",
+        )
+        .bind(task_id)
+        .bind(session_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        let Some((status, cancellation_requested_at)) = row else {
+            return Err(AppError::NotFound);
+        };
+        if matches!(status.as_str(), "completed" | "error" | "cancelled") {
+            transaction.commit().await.map_err(|_| AppError::Internal)?;
+            return Ok(TaskCancellation::AlreadyTerminal);
+        }
+        if status == "pending" {
+            sqlx::query(
+                "UPDATE c2_tasks SET status = 'cancelled', cancellation_requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE id = ? AND session_id = ? AND status = 'pending'",
+            )
+            .bind(task_id)
+            .bind(session_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+            sqlx::query(
+                "INSERT INTO c2_audit (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+                 VALUES (?, ?, 'task_cancelled', ?, ?, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            )
+            .bind(operator_id)
+            .bind(operator_name)
+            .bind(session_id)
+            .bind(format!("task {task_id}"))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+            transaction.commit().await.map_err(|_| AppError::Internal)?;
+            return Ok(TaskCancellation::Cancelled);
+        }
+
+        if cancellation_requested_at.is_some() {
+            let control_task_id: String = sqlx::query_scalar(
+                "SELECT id FROM c2_tasks WHERE session_id = ? AND parent_task_id = ? AND command = 'nw/killtask' \
+                 ORDER BY created_at, id LIMIT 1",
+            )
+            .bind(session_id)
+            .bind(task_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+            transaction.commit().await.map_err(|_| AppError::Internal)?;
+            return Ok(TaskCancellation::Requested { control_task_id });
+        }
+
+        let control_task_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "UPDATE c2_tasks SET cancellation_requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND session_id = ?",
+        )
+        .bind(task_id)
+        .bind(session_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_tasks (id, session_id, command, args_json, timeout_ms, status, operator_id, parent_task_id) \
+             VALUES (?, ?, 'nw/killtask', ?, 10000, 'pending', ?, ?)",
+        )
+        .bind(&control_task_id)
+        .bind(session_id)
+        .bind(serde_json::json!([task_id]))
+        .bind(operator_id)
+        .bind(task_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_audit (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+             VALUES (?, ?, 'task_cancellation_requested', ?, ?, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(operator_id)
+        .bind(operator_name)
+        .bind(session_id)
+        .bind(format!("task {task_id}"))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+        Ok(TaskCancellation::Requested { control_task_id })
     }
 
     /// List tasks for a session with their results (for the callback detail page).

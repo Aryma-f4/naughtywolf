@@ -3,19 +3,29 @@
 //! the result comes back over the real HTTP channel.
 
 use std::io::{Read, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use axum::{
+    Router,
+    body::Bytes,
     extract::{Request, State},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
+    routing::post,
 };
 use nw_implant::runtime::{BeaconRuntime, Profile};
+use nw_profile::{
+    crypto,
+    envelope::{Envelope, Kind},
+    msgs::{PollReply, PollRequest, Register, RegisterAck, Task},
+};
 use nw_server::{ServerState, queue::TaskQueue, server, session::SessionRegistry};
+use uuid::Uuid;
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -23,6 +33,189 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+#[derive(Clone)]
+struct AckTestServer {
+    psk: Arc<Vec<u8>>,
+    session: Arc<Mutex<Option<(Uuid, [u8; crypto::KEY_LEN])>>>,
+    task: Task,
+    polls: Arc<AtomicUsize>,
+    result_deliveries: Arc<AtomicUsize>,
+    accepted_seen: Arc<AtomicBool>,
+    result_ack_sent: Arc<AtomicBool>,
+    empty_after_ack: Arc<AtomicBool>,
+}
+
+async fn ack_test_checkin(
+    State(state): State<AckTestServer>,
+    body: Bytes,
+) -> Result<Bytes, StatusCode> {
+    let wire = std::str::from_utf8(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if Envelope::routing_id(wire).is_none() {
+        let psk_key = crypto::derive_key(&state.psk, b"nw-m1-salt");
+        let env = Envelope::open(&psk_key, wire).map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let plaintext = crypto::decrypt(&psk_key, env.id, &env.encrypted)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let register: Register =
+            serde_json::from_slice(&plaintext).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let implant_pub = {
+            use base64::Engine;
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(register.session_key)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| StatusCode::BAD_REQUEST)?
+        };
+        let server_keys = crypto::KeyPair::generate();
+        let shared = server_keys
+            .shared_secret(&implant_pub)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let session_key = crypto::derive_key(&shared, crypto::SESSION_SALT);
+        let session_id = Uuid::new_v4();
+        *state.session.lock().unwrap() = Some((session_id, session_key));
+        let ack = RegisterAck {
+            session_id,
+            server_pub: {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(server_keys.public_key())
+            },
+        };
+        let reply_id = env.id + 1;
+        let encrypted = crypto::encrypt(
+            &psk_key,
+            reply_id,
+            &serde_json::to_vec(&ack).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let reply = Envelope::new(Kind::RegisterAck, reply_id, Some(session_id), encrypted)
+            .seal(&psk_key)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(Bytes::from(reply));
+    }
+
+    let (session_id, key) = state
+        .session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .copied()
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let env = Envelope::open(&key, wire).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let plaintext =
+        crypto::decrypt(&key, env.id, &env.encrypted).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let request: PollRequest =
+        serde_json::from_slice(&plaintext).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if request.accepted_task_ids.contains(&state.task.id) {
+        state.accepted_seen.store(true, Ordering::SeqCst);
+    }
+    let mut result_acks = Vec::new();
+    if request
+        .results
+        .iter()
+        .any(|result| result.task_id == state.task.id)
+    {
+        let delivery = state.result_deliveries.fetch_add(1, Ordering::SeqCst) + 1;
+        if delivery >= 2 {
+            result_acks.push(state.task.id);
+            state.result_ack_sent.store(true, Ordering::SeqCst);
+        }
+    } else if state.result_ack_sent.load(Ordering::SeqCst) {
+        state.empty_after_ack.store(true, Ordering::SeqCst);
+    }
+    let poll = state.polls.fetch_add(1, Ordering::SeqCst) + 1;
+    let tasks = if poll <= 2 {
+        vec![state.task.clone()]
+    } else {
+        Vec::new()
+    };
+    let reply = PollReply {
+        tasks,
+        result_acks,
+        acks: Vec::new(),
+        push_chunks: Vec::new(),
+    };
+    let reply_id = env.id + 1;
+    let encrypted = crypto::encrypt(
+        &key,
+        reply_id,
+        &serde_json::to_vec(&reply).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let wire = Envelope::new(Kind::Heartbeat, reply_id, Some(session_id), encrypted)
+        .seal(&key)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Bytes::from(wire))
+}
+
+#[tokio::test]
+async fn duplicate_delivery_executes_once_and_results_wait_for_ack() {
+    let port = free_port();
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let side_effect = std::env::temp_dir().join(format!(
+        "nw-ack-once-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let _ = std::fs::remove_file(&side_effect);
+    let state = AckTestServer {
+        psk: Arc::new(b"ack-e2e-psk".to_vec()),
+        session: Arc::new(Mutex::new(None)),
+        task: Task {
+            id: Uuid::new_v4(),
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("printf x >> '{}'", side_effect.display()),
+            ],
+            timeout_ms: 5_000,
+        },
+        polls: Arc::new(AtomicUsize::new(0)),
+        result_deliveries: Arc::new(AtomicUsize::new(0)),
+        accepted_seen: Arc::new(AtomicBool::new(false)),
+        result_ack_sent: Arc::new(AtomicBool::new(false)),
+        empty_after_ack: Arc::new(AtomicBool::new(false)),
+    };
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let app = Router::new()
+        .route("/c2/checkin", post(ack_test_checkin))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let runtime = Arc::new(BeaconRuntime::new(
+        Profile {
+            endpoint,
+            interval: Duration::from_millis(40),
+            jitter: Duration::ZERO,
+            hostname: "acklab".into(),
+            username: "tester".into(),
+            os: "test-os".into(),
+            arch: "test-arch".into(),
+            pid: 123,
+            addr: "127.0.0.1".into(),
+        },
+        state.psk.as_ref().clone(),
+    ));
+    let beacon_runtime = runtime.clone();
+    let beacon = tokio::spawn(async move { beacon_runtime.run().await });
+
+    let mut waited = Duration::ZERO;
+    while !state.empty_after_ack.load(Ordering::SeqCst) {
+        assert!(
+            waited < Duration::from_secs(10),
+            "result was not retried and acknowledged"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        waited += Duration::from_millis(40);
+    }
+    runtime.trigger_stop();
+    let _ = beacon.await;
+    server.abort();
+
+    assert!(state.accepted_seen.load(Ordering::SeqCst));
+    assert!(state.result_deliveries.load(Ordering::SeqCst) >= 2);
+    assert_eq!(std::fs::read(&side_effect).unwrap(), b"x");
+    std::fs::remove_file(side_effect).ok();
 }
 
 #[tokio::test]

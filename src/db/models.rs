@@ -244,6 +244,13 @@ pub struct C2TaskWithResult {
     pub result_stderr: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskCancellation {
+    Cancelled,
+    Requested { control_task_id: String },
+    AlreadyTerminal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ProcessSnapshot {
     pub session_id: String,

