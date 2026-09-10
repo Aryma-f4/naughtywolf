@@ -1,0 +1,27 @@
+services:
+  app:
+    environment:
+      NAUGHTYWOLF_COOKIE_SECURE: "true"
+    ports:
+      - "0.0.0.0:4630:4630"
+    networks:
+      - default
+      - coolify
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: coolify
+      traefik.http.middlewares.naughtywolf-redirect.redirectscheme.scheme: https
+      traefik.http.middlewares.naughtywolf-gzip.compress: "true"
+      traefik.http.routers.naughtywolf-http.entrypoints: http
+      traefik.http.routers.naughtywolf-http.middlewares: naughtywolf-redirect
+      traefik.http.routers.naughtywolf-http.rule: Host(`gateofbabylon.space`)
+      traefik.http.routers.naughtywolf-https.entrypoints: https
+      traefik.http.routers.naughtywolf-https.middlewares: naughtywolf-gzip
+      traefik.http.routers.naughtywolf-https.rule: Host(`gateofbabylon.space`)
+      traefik.http.routers.naughtywolf-https.tls: "true"
+      traefik.http.routers.naughtywolf-https.tls.certresolver: letsencrypt
+      traefik.http.services.naughtywolf.loadbalancer.server.port: "8080"
+
+networks:
+  coolify:
+    external: true

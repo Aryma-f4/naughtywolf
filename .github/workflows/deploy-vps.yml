@@ -1,0 +1,55 @@
+name: Deploy NaughtyWolf VPS
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: naughtywolf-vps-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out deployment commit
+        uses: actions/checkout@v4
+
+      - name: Validate deployment files
+        env:
+          NAUGHTYWOLF_SESSION_SECRET: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          NAUGHTYWOLF_C2_PSK: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          GSOCKET_SECRET: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+        run: |
+          bash -n deploy/vps/deploy.sh
+          bash tests/vps_deploy_test.sh
+          docker compose \
+            --file docker-compose.yml \
+            --file deploy/vps/docker-compose.yml \
+            config --quiet
+
+      - name: Configure pinned SSH access
+        env:
+          VPS_DEPLOY_KEY: ${{ secrets.VPS_DEPLOY_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VPS_DEPLOY_KEY" > ~/.ssh/naughtywolf_deploy
+          chmod 600 ~/.ssh/naughtywolf_deploy
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy exact commit and verify health
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/naughtywolf_deploy \
+            -o BatchMode=yes \
+            ubuntu@43.156.147.197 \
+            "set -eu; cd /opt/naughtywolf; git fetch --prune origin develop; git checkout --force --detach '$DEPLOY_SHA'; exec ./deploy/vps/deploy.sh '$DEPLOY_SHA'"
