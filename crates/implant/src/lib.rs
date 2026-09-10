@@ -1,5 +1,6 @@
 pub mod download;
 pub mod evasion;
+pub mod metadata;
 pub mod modules;
 pub mod runner;
 pub mod runtime;

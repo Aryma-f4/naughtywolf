@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::FromRow;
 
+use nw_profile::control::CallbackCapabilities;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum OperationStatus {
@@ -133,10 +135,34 @@ pub struct Callback {
     pub process: String,
     pub arch: String,
     pub os: String,
+    pub os_version: Option<String>,
+    pub executable_path: Option<String>,
+    pub local_addr: Option<String>,
+    pub implant_version: Option<String>,
+    pub interval_ms: Option<i64>,
+    pub jitter_ms: Option<i64>,
+    #[sqlx(json(nullable))]
+    pub capabilities_json: Option<CallbackCapabilities>,
     pub protocol: String,
     pub status: CallbackStatus,
     pub last_seen: String,
     pub created_at: String,
+}
+
+impl Callback {
+    /// A callback is online while it remains within three reported beacon
+    /// intervals, with a 30-second floor for short-interval or legacy agents.
+    pub fn is_online(&self, now: time::OffsetDateTime) -> bool {
+        let Ok(last_seen) = chrono::DateTime::parse_from_rfc3339(&self.last_seen) else {
+            return false;
+        };
+        let interval_ms = self.interval_ms.unwrap_or_default().max(0) as i128;
+        let online_window_ms = interval_ms.saturating_mul(3).max(30_000);
+        let now_ms = now.unix_timestamp_nanos() / 1_000_000;
+        let elapsed_ms = now_ms - i128::from(last_seen.timestamp_millis());
+
+        elapsed_ms <= online_window_ms
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]

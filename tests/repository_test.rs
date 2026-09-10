@@ -1,5 +1,8 @@
 use naughtywolf::db::repositories::Repository;
-use naughtywolf::{auth::rbac::Role, db::models::CheckRunState};
+use naughtywolf::{
+    auth::rbac::Role,
+    db::models::{Callback, CallbackStatus, CheckRunState},
+};
 use serde_json::json;
 
 async fn test_repository() -> Repository {
@@ -28,6 +31,100 @@ async fn insert_callback_fixture(repo: &Repository, host: &str) -> String {
     .await
     .unwrap();
     sid
+}
+
+fn callback_seen_at_epoch(interval_ms: Option<i64>) -> Callback {
+    Callback {
+        id: "callback-liveness".into(),
+        asset_id: None,
+        operation_id: None,
+        host: "liveness-host".into(),
+        user_name: "test-user".into(),
+        process: "nw-implant".into(),
+        arch: "x86_64".into(),
+        os: "linux".into(),
+        os_version: None,
+        executable_path: None,
+        local_addr: None,
+        implant_version: None,
+        interval_ms,
+        jitter_ms: None,
+        capabilities_json: None,
+        protocol: "https".into(),
+        status: CallbackStatus::Active,
+        last_seen: "1970-01-01T00:00:00Z".into(),
+        created_at: "1970-01-01T00:00:00Z".into(),
+    }
+}
+
+#[test]
+fn callback_liveness_uses_a_thirty_second_minimum_window() {
+    let callback = callback_seen_at_epoch(Some(1_000));
+
+    assert!(callback.is_online(time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2)));
+    assert!(!callback.is_online(time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(31)));
+}
+
+#[test]
+fn callback_liveness_scales_with_the_reported_beacon_interval() {
+    let callback = callback_seen_at_epoch(Some(20_000));
+
+    assert!(callback.is_online(time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60)));
+    assert!(!callback.is_online(time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(61)));
+}
+
+#[tokio::test]
+async fn extended_callback_registration_persists_typed_metadata() {
+    let repo = test_repository().await;
+    let sid = uuid::Uuid::new_v4().to_string();
+    let register = nw_profile::msgs::Register {
+        hostname: "metadata-host".into(),
+        username: "metadata-user".into(),
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        pid: 4242,
+        addr: "unknown".into(),
+        os_version: Some("Test Linux 1".into()),
+        executable_path: Some("/opt/naughtywolf/nw-implant".into()),
+        local_addr: Some("10.0.0.42".into()),
+        implant_version: Some("0.1.0".into()),
+        interval_ms: Some(20_000),
+        jitter_ms: Some(1_500),
+        capabilities: Some(nw_profile::control::CallbackCapabilities {
+            process_browser: true,
+            file_browser: false,
+            file_transfer: true,
+            task_ack: true,
+        }),
+        session_key: "implant-public-key".into(),
+    };
+
+    repo.upsert_callback_registration(&sid, &register, "derived-session-key", "https")
+        .await
+        .unwrap();
+
+    let callback = repo.find_callback(&sid).await.unwrap().unwrap();
+    assert_eq!(callback.os_version.as_deref(), Some("Test Linux 1"));
+    assert_eq!(
+        callback.executable_path.as_deref(),
+        Some("/opt/naughtywolf/nw-implant")
+    );
+    assert_eq!(callback.local_addr.as_deref(), Some("10.0.0.42"));
+    assert_eq!(callback.implant_version.as_deref(), Some("0.1.0"));
+    assert_eq!(callback.interval_ms, Some(20_000));
+    assert_eq!(callback.jitter_ms, Some(1_500));
+    let capabilities = callback.capabilities_json.unwrap();
+    assert!(capabilities.process_browser);
+    assert!(!capabilities.file_browser);
+    assert!(capabilities.file_transfer);
+    assert!(capabilities.task_ack);
+
+    let session_addr: String = sqlx::query_scalar("SELECT addr FROM c2_sessions WHERE id = ?")
+        .bind(&sid)
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+    assert_eq!(session_addr, "10.0.0.42");
 }
 
 #[tokio::test]

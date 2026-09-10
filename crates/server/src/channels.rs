@@ -281,6 +281,13 @@ mod tests {
             arch: "x86_64".into(),
             pid: 42,
             addr: "10.0.0.5".into(),
+            os_version: None,
+            executable_path: None,
+            local_addr: None,
+            implant_version: None,
+            interval_ms: None,
+            jitter_ms: None,
+            capabilities: None,
             session_key: base64_encode(&implant_kp.public_key()),
         };
         let reg_plain = serde_json::to_vec(&reg).unwrap();

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::control::CallbackCapabilities;
+
 /// Sent inside a Register envelope (encrypted) by implant -> server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Register {
@@ -10,6 +12,20 @@ pub struct Register {
     pub arch: String,
     pub pid: u32,
     pub addr: String,
+    #[serde(default)]
+    pub os_version: Option<String>,
+    #[serde(default)]
+    pub executable_path: Option<String>,
+    #[serde(default)]
+    pub local_addr: Option<String>,
+    #[serde(default)]
+    pub implant_version: Option<String>,
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
+    #[serde(default)]
+    pub jitter_ms: Option<u64>,
+    #[serde(default)]
+    pub capabilities: Option<CallbackCapabilities>,
     /// The AES-256 session key to use after handshake, base64. In a full-
     /// forward-secrecy build this is an x25519 public key; M1 uses a
     /// pre-shared profile key so this is the derived session key.
@@ -111,5 +127,30 @@ mod tests {
         let j = serde_json::to_string(&t).unwrap();
         let back: Task = serde_json::from_str(&j).unwrap();
         assert_eq!(back.command, "whoami");
+    }
+
+    #[test]
+    fn legacy_register_shape_deserializes_without_workspace_metadata() {
+        let legacy = serde_json::json!({
+            "hostname": "legacy-host",
+            "username": "legacy-user",
+            "os": "linux",
+            "arch": "x86_64",
+            "pid": 42,
+            "addr": "10.0.0.8",
+            "session_key": "legacy-key"
+        });
+
+        let register: Register = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(register.hostname, "legacy-host");
+        assert_eq!(register.addr, "10.0.0.8");
+        assert!(register.os_version.is_none());
+        assert!(register.executable_path.is_none());
+        assert!(register.local_addr.is_none());
+        assert!(register.implant_version.is_none());
+        assert!(register.interval_ms.is_none());
+        assert!(register.jitter_ms.is_none());
+        assert!(register.capabilities.is_none());
     }
 }

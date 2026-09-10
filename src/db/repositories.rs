@@ -2,6 +2,8 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use nw_profile::msgs::Register;
+
 use crate::{
     audit::AuditEntry,
     auth::rbac::Role,
@@ -594,14 +596,102 @@ impl Repository {
         session_key: &str,
         protocol: &str,
     ) -> Result<(), AppError> {
+        self.upsert_callback_record(
+            session_id,
+            hostname,
+            username,
+            os,
+            arch,
+            pid,
+            "",
+            session_key,
+            protocol,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Persist an implant's extended registration while retaining the legacy
+    /// upsert entry points used by older integrations.
+    pub async fn upsert_callback_registration(
+        &self,
+        session_id: &str,
+        register: &Register,
+        session_key: &str,
+        protocol: &str,
+    ) -> Result<(), AppError> {
+        let local_addr = register
+            .local_addr
+            .as_deref()
+            .or_else(|| (register.addr != "unknown").then_some(register.addr.as_str()));
+        let capabilities = register
+            .capabilities
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| AppError::Internal)?;
+
+        self.upsert_callback_record(
+            session_id,
+            &register.hostname,
+            &register.username,
+            &register.os,
+            &register.arch,
+            register.pid,
+            local_addr.unwrap_or(&register.addr),
+            session_key,
+            protocol,
+            register.os_version.as_deref(),
+            register.executable_path.as_deref(),
+            local_addr,
+            register.implant_version.as_deref(),
+            register.interval_ms.map(u64_to_i64),
+            register.jitter_ms.map(u64_to_i64),
+            capabilities.as_ref(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_callback_record(
+        &self,
+        session_id: &str,
+        hostname: &str,
+        username: &str,
+        os: &str,
+        arch: &str,
+        pid: u32,
+        addr: &str,
+        session_key: &str,
+        protocol: &str,
+        os_version: Option<&str>,
+        executable_path: Option<&str>,
+        local_addr: Option<&str>,
+        implant_version: Option<&str>,
+        interval_ms: Option<i64>,
+        jitter_ms: Option<i64>,
+        capabilities_json: Option<&serde_json::Value>,
+    ) -> Result<(), AppError> {
         let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        let process = pid.to_string();
         sqlx::query(
-            "INSERT INTO callbacks (id, host, user_name, os, arch, process, protocol, status, session_key, last_seen) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+            "INSERT INTO callbacks (id, host, user_name, os, arch, process, protocol, status, session_key, last_seen, \
+                                     os_version, executable_path, local_addr, implant_version, interval_ms, jitter_ms, capabilities_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
              host = excluded.host, user_name = excluded.user_name, os = excluded.os, \
              arch = excluded.arch, process = excluded.process, protocol = excluded.protocol, status = 'active', \
              session_key = excluded.session_key, \
+             os_version = excluded.os_version, executable_path = excluded.executable_path, \
+             local_addr = excluded.local_addr, implant_version = excluded.implant_version, \
+             interval_ms = excluded.interval_ms, jitter_ms = excluded.jitter_ms, \
+             capabilities_json = excluded.capabilities_json, \
              last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
         )
         .bind(session_id)
@@ -609,17 +699,24 @@ impl Repository {
         .bind(username)
         .bind(os)
         .bind(arch)
-        .bind(pid.to_string())
+        .bind(&process)
         .bind(protocol)
         .bind(session_key)
+        .bind(os_version)
+        .bind(executable_path)
+        .bind(local_addr)
+        .bind(implant_version)
+        .bind(interval_ms)
+        .bind(jitter_ms)
+        .bind(capabilities_json)
         .execute(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
         sqlx::query(
             "INSERT INTO c2_sessions (id, hostname, username, os, arch, pid, addr, session_key, last_seen) \
-             VALUES (?, ?, ?, ?, ?, ?, '', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
              ON CONFLICT(id) DO UPDATE SET hostname = excluded.hostname, username = excluded.username, \
-             os = excluded.os, arch = excluded.arch, pid = excluded.pid, session_key = excluded.session_key, \
+             os = excluded.os, arch = excluded.arch, pid = excluded.pid, addr = excluded.addr, session_key = excluded.session_key, \
              last_seen = excluded.last_seen",
         )
         .bind(session_id)
@@ -628,6 +725,7 @@ impl Repository {
         .bind(os)
         .bind(arch)
         .bind(pid as i64)
+        .bind(addr)
         .bind(session_key.as_bytes())
         .execute(&mut *transaction)
         .await
@@ -1300,6 +1398,10 @@ impl Repository {
             .await
             .map_err(|_| AppError::Internal)
     }
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    value.try_into().unwrap_or(i64::MAX)
 }
 
 async fn insert_audit(

