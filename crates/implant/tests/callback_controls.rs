@@ -419,6 +419,36 @@ fn filesystem_list_is_bounded_at_the_contract_limit() {
     assert_eq!(error.code(), "result_too_large");
 }
 
+#[cfg(unix)]
+#[test]
+fn filesystem_dispatch_rejects_a_directory_whose_serialized_result_exceeds_byte_cap() {
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let mut directory = tree.path().canonicalize().unwrap();
+    for _ in 0..4 {
+        directory = directory.join("d".repeat(180));
+        fs::create_dir(&directory).unwrap();
+    }
+    for index in 0..2_200 {
+        fs::write(
+            directory.join(format!("entry-{index:04}-{}", "n".repeat(110))),
+            [],
+        )
+        .unwrap();
+    }
+    let task = Task {
+        id: Uuid::new_v4(),
+        command: "nw/fs-list".to_owned(),
+        args: vec![directory.to_string_lossy().into_owned()],
+        timeout_ms: 30_000,
+    };
+
+    let result = nw_implant::filesystem::execute(&task).expect("filesystem handler");
+    assert!(!result.ok);
+    assert!(result.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&result.stderr).unwrap();
+    assert_eq!(error["code"], "result_too_large");
+}
+
 #[test]
 fn filesystem_dispatch_is_exact_and_validates_arguments_before_access() {
     let tree = tempfile::tempdir().expect("fresh filesystem fixture");

@@ -5,6 +5,7 @@ pub const PROCESS_KILL_SCHEMA_V1: &str = "nw.process-kill.v1";
 pub const FILE_LIST_SCHEMA_V1: &str = "nw.fs-list.v1";
 pub const FILE_MUTATION_SCHEMA_V1: &str = "nw.fs-mutation.v1";
 pub const MAX_FILE_LIST_ENTRIES: usize = 4096;
+pub const MAX_FILE_LIST_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProcessEntry {

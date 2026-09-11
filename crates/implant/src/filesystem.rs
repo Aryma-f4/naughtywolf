@@ -8,7 +8,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use nw_profile::{
     control::{
         FILE_LIST_SCHEMA_V1, FILE_MUTATION_SCHEMA_V1, FileControlError, FileEntry, FileListV1,
-        FileMutationV1, MAX_FILE_LIST_ENTRIES,
+        FileMutationV1, MAX_FILE_LIST_BYTES, MAX_FILE_LIST_ENTRIES,
     },
     msgs::{Task, TaskResult},
 };
@@ -335,7 +335,7 @@ fn failure(task: &Task, code: &str, message: impl Into<String>) -> TaskResult {
 pub fn execute(task: &Task) -> Option<TaskResult> {
     let result = match task.command.as_str() {
         "nw/fs-list" => match task.args.as_slice() {
-            [path] => list(path).and_then(serialize),
+            [path] => list(path).and_then(serialize_file_list),
             _ => return Some(invalid_arguments(task, "usage: nw/fs-list <absolute-path>")),
         },
         "nw/fs-stat" => match task.args.as_slice() {
@@ -389,6 +389,55 @@ fn serialize(value: impl serde::Serialize) -> Result<Vec<u8>, FileControlError> 
     serde_json::to_vec(&value).map_err(|_| FileControlError::IoFailure)
 }
 
+fn serialize_file_list(value: FileListV1) -> Result<Vec<u8>, FileControlError> {
+    // Entry count and platform path/name limits bound the typed allocation.
+    // Serialize once, then refuse transport output above the shared hard cap.
+    let serialized = serialize(value)?;
+    if serialized.len() > MAX_FILE_LIST_BYTES {
+        return Err(FileControlError::ResultTooLarge);
+    }
+    Ok(serialized)
+}
+
 fn invalid_arguments(task: &Task, usage: &str) -> TaskResult {
     failure(task, "invalid_arguments", usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serialize_file_list;
+    use nw_profile::control::{
+        FILE_LIST_SCHEMA_V1, FileControlError, FileEntry, FileListV1, MAX_FILE_LIST_BYTES,
+    };
+
+    fn fixture(owner: String) -> FileListV1 {
+        FileListV1 {
+            schema: FILE_LIST_SCHEMA_V1.to_owned(),
+            captured_at: "2026-09-10T12:35:00.000Z".to_owned(),
+            path: "/fixture".to_owned(),
+            entries: vec![FileEntry {
+                name: "entry".to_owned(),
+                path: "/fixture/entry".to_owned(),
+                kind: "file".to_owned(),
+                size: 0,
+                modified_at: None,
+                permissions: None,
+                owner: Some(owner),
+            }],
+        }
+    }
+
+    #[test]
+    fn filesystem_list_serialization_accepts_exact_byte_cap_and_rejects_one_more() {
+        let base = serde_json::to_vec(&fixture(String::new())).unwrap().len();
+        let at_limit = fixture("x".repeat(MAX_FILE_LIST_BYTES - base));
+        let serialized = serialize_file_list(at_limit).expect("exact cap is accepted");
+        assert_eq!(serialized.len(), MAX_FILE_LIST_BYTES);
+
+        let over_limit = fixture("x".repeat(MAX_FILE_LIST_BYTES - base + 1));
+        assert_eq!(
+            serialize_file_list(over_limit).unwrap_err(),
+            FileControlError::ResultTooLarge
+        );
+    }
 }

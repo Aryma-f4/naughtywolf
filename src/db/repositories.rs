@@ -1086,6 +1086,11 @@ impl Repository {
             transaction.commit().await.map_err(|_| AppError::Internal)?;
             return Ok(true);
         }
+        if command == "nw/fs-list" && stdout.len() > nw_profile::control::MAX_FILE_LIST_BYTES {
+            return Err(AppError::Validation(
+                "filesystem list result exceeds byte limit".to_owned(),
+            ));
+        }
 
         let process_snapshot = if ok && command == "nw/process-list" {
             let snapshot: nw_profile::control::ProcessListV1 = serde_json::from_slice(stdout)

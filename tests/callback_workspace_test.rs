@@ -106,6 +106,19 @@ fn filesystem_snapshot_fixture(path: &str, captured_at: &str) -> Vec<u8> {
     .unwrap()
 }
 
+fn padded_filesystem_result(schema: &str, total_bytes: usize) -> Vec<u8> {
+    let prefix = format!(
+        r#"{{"schema":"{schema}","captured_at":"2026-09-10T12:36:00Z","path":"/srv/files","entries":[],"padding":""#
+    );
+    let suffix = r#""}"#;
+    assert!(prefix.len() + suffix.len() <= total_bytes);
+    format!(
+        "{prefix}{}{suffix}",
+        "x".repeat(total_bytes - prefix.len() - suffix.len())
+    )
+    .into_bytes()
+}
+
 async fn login(session: Session, Extension(user): Extension<AuthenticatedUser>) -> StatusCode {
     AuthSession { session }.login(&user).await.unwrap();
     StatusCode::NO_CONTENT
@@ -628,6 +641,92 @@ async fn filesystem_projection_rejects_more_than_the_contract_entry_limit() {
             .await
             .unwrap();
     assert_eq!(result_count, 0);
+}
+
+#[tokio::test]
+async fn filesystem_result_byte_cap_is_checked_before_parsing_or_persistence() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-byte-limit", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+
+    let boundary_task = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-list",
+            &serde_json::json!(["/srv/files"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    let boundary =
+        padded_filesystem_result("nw.fs-list.v2", nw_profile::control::MAX_FILE_LIST_BYTES);
+    assert!(
+        repo.store_task_result_for_session(&session_id, &boundary_task, true, &boundary, &[], 0,)
+            .await
+            .unwrap()
+    );
+    let stored_boundary: Vec<u8> =
+        sqlx::query_scalar("SELECT stdout FROM c2_task_results WHERE task_id = ?")
+            .bind(&boundary_task)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_boundary, boundary);
+
+    let over_limit_payloads = [
+        padded_filesystem_result(
+            "nw.fs-list.v1",
+            nw_profile::control::MAX_FILE_LIST_BYTES + 1,
+        ),
+        padded_filesystem_result(
+            "nw.fs-list.v2",
+            nw_profile::control::MAX_FILE_LIST_BYTES + 1,
+        ),
+        vec![b'!'; nw_profile::control::MAX_FILE_LIST_BYTES + 1],
+    ];
+    for payload in over_limit_payloads {
+        let task_id = repo
+            .enqueue_task(
+                &session_id,
+                "nw/fs-list",
+                &serde_json::json!(["/srv/files"]),
+                30_000,
+            )
+            .await
+            .unwrap();
+        let error = repo
+            .store_task_result_for_session(&session_id, &task_id, true, &payload, &[], 0)
+            .await
+            .unwrap_err();
+        match error {
+            naughtywolf::AppError::Validation(message) => {
+                assert_eq!(message, "filesystem list result exceeds byte limit")
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        let result_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM c2_task_results WHERE task_id = ?")
+                .bind(&task_id)
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(result_count, 0);
+        let task_state: (String, i64) = sqlx::query_as(
+            "SELECT status, (SELECT COUNT(*) FROM c2_audit WHERE details = 'task ' || c2_tasks.id AND action = 'task_completed') FROM c2_tasks WHERE id = ?",
+        )
+        .bind(&task_id)
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(task_state, ("pending".to_owned(), 0));
+    }
+    assert!(
+        repo.latest_file_snapshot(&session_id, "/srv/files")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

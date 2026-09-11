@@ -26,3 +26,15 @@
 - Full regression output: implant callback controls 16/16 (Tasking/process behavior included); callback workspace 23/23; Node DOM workspace 20/20. `cargo clippy -p nw-profile -p nw-implant -p naughtywolf --all-targets` exit 0 with only pre-existing warnings; `git diff --check` clean.
 - Files changed in this round: `Cargo.lock`, `crates/implant/Cargo.toml`, `crates/implant/src/filesystem.rs`, `crates/implant/tests/callback_controls.rs`, `crates/profile/src/control.rs`, `src/db/repositories.rs`, `tests/callback_workspace_test.rs`, and this report.
 - Concern: `cargo check -p nw-implant --target x86_64-pc-windows-gnu` remains environment-blocked with `E0463: can't find crate for core`; Windows code is cfg-isolated and backed by Windows-specific source/tests, but this host cannot perform the target compile. No push performed.
+
+## Fix Round 2 — Serialized Directory Byte Bound
+
+- RED command/output: after adding exact boundary tests first, `cargo test -p nw-implant filesystem_list_serialization_accepts_exact_byte_cap_and_rejects_one_more -- --nocapture` failed with `E0432` for missing `serialize_file_list` and shared `MAX_FILE_LIST_BYTES`; no test ran.
+- GREEN (shared contract): `MAX_FILE_LIST_BYTES` is exactly `2 * 1024 * 1024`, matching the existing implant output ceiling, and is consumed by both implant and server.
+- GREEN (implant): `nw/fs-list` serializes the already count-bounded typed result once, accepts exactly 2 MiB, and returns stable `result_too_large` at 2 MiB + 1. A deep-path, 2,200-entry fresh temporary directory proves dispatch returns no stdout and the stable error instead of emitting oversized transport data.
+- Peak-bound note: the permitted fallback serializer temporarily holds the typed list plus its one JSON serialization; that construction is deterministically bounded by 4,096 entries and platform filesystem path/name/metadata limits. Only serialized results at or below 2 MiB can leave the implant.
+- GREEN (server): filesystem-list stdout length is checked before any serde parse, result persistence, terminal state, audit, or snapshot projection. Exact-cap future-schema JSON is stored byte-for-byte and returns `true` for ACK; 2 MiB + 1 valid current-schema, valid future-schema, and malformed payloads all return exact validation `filesystem list result exceeds byte limit`, leave tasks pending, and create no result, terminal audit, or projection.
+- Focused output: serializer boundary 1/1; real directory dispatch cap 1/1; repository pre-parse/persistence cap 1/1.
+- Task 7 output: profile control 4/4; implant filesystem integration 11/11; repository/API filesystem 10/10; `node --check static/callback-workspace.js` exit 0.
+- Full regression output: implant callback controls 17/17; callback workspace 24/24; Node DOM workspace 20/20. No Tasking, Processes, filesystem UI, or normal future-schema raw-result regression changed.
+- Files changed in this round: `crates/profile/src/control.rs`, `crates/implant/src/filesystem.rs`, `crates/implant/tests/callback_controls.rs`, `src/db/repositories.rs`, `tests/callback_workspace_test.rs`, and this report. No push performed.
