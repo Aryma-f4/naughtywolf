@@ -5,6 +5,7 @@ use axum::{
 
 use crate::db::repositories::Repository;
 
+pub mod files;
 pub mod processes;
 pub mod tasks;
 
@@ -37,5 +38,19 @@ pub fn router() -> Router<Repository> {
         .route(
             "/api/callbacks/{session_id}/processes/{pid}/kill",
             post(processes::kill),
+        )
+        .route("/api/callbacks/{session_id}/files", get(files::snapshot))
+        .route("/api/callbacks/{session_id}/files/list", post(files::list))
+        .route(
+            "/api/callbacks/{session_id}/files/mkdir",
+            post(files::mkdir),
+        )
+        .route(
+            "/api/callbacks/{session_id}/files/move",
+            post(files::move_path),
+        )
+        .route(
+            "/api/callbacks/{session_id}/files/delete",
+            post(files::delete),
         )
 }

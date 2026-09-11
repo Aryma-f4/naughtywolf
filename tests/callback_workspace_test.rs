@@ -88,6 +88,24 @@ fn process_snapshot_fixture(captured_at: &str) -> Vec<u8> {
     .unwrap()
 }
 
+fn filesystem_snapshot_fixture(path: &str, captured_at: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema": "nw.fs-list.v1",
+        "captured_at": captured_at,
+        "path": path,
+        "entries": [{
+            "name": "<img src=x onerror=alert(1)>.txt",
+            "path": format!("{path}/<img src=x onerror=alert(1)>.txt"),
+            "kind": "file",
+            "size": 4,
+            "modified_at": "2026-09-10T11:00:00Z",
+            "permissions": "0644",
+            "owner": "operator"
+        }]
+    }))
+    .unwrap()
+}
+
 async fn login(session: Session, Extension(user): Extension<AuthenticatedUser>) -> StatusCode {
     AuthSession { session }.login(&user).await.unwrap();
     StatusCode::NO_CONTENT
@@ -344,6 +362,344 @@ async fn older_process_snapshot_result_cannot_replace_newer_projection() {
 }
 
 #[tokio::test]
+async fn filesystem_list_result_atomically_upserts_normalized_monotonic_projection() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-projection", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let newer_task = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-list",
+            &serde_json::json!(["/srv//lab/../files/"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    let older_task = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-list",
+            &serde_json::json!(["/srv/files"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+
+    repo.store_task_result_for_session(
+        &session_id,
+        &newer_task,
+        true,
+        &filesystem_snapshot_fixture("/srv/files", "2026-09-10T12:35:00Z"),
+        &[],
+        0,
+    )
+    .await
+    .unwrap();
+    repo.store_task_result_for_session(
+        &session_id,
+        &older_task,
+        true,
+        &filesystem_snapshot_fixture("/srv/files", "2026-09-10T12:34:00Z"),
+        &[],
+        0,
+    )
+    .await
+    .unwrap();
+
+    let snapshot = repo
+        .latest_file_snapshot(&session_id, "/srv/files")
+        .await
+        .unwrap()
+        .expect("persisted filesystem projection");
+    assert_eq!(snapshot.path, "/srv/files");
+    assert_eq!(snapshot.task_id, newer_task);
+    assert_eq!(snapshot.schema_version, "nw.fs-list.v1");
+    assert_eq!(snapshot.captured_at, "2026-09-10T12:35:00Z");
+    assert_eq!(snapshot.snapshot_json["entries"][0]["size"], 4);
+}
+
+#[tokio::test]
+async fn filesystem_list_result_rejects_path_mismatch_without_any_result_write() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-invalid", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let task_id = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-list",
+            &serde_json::json!(["/srv/files"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+
+    let error = repo
+        .store_task_result_for_session(
+            &session_id,
+            &task_id,
+            true,
+            &filesystem_snapshot_fixture("/srv/other", "2026-09-10T12:35:00Z"),
+            &[],
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, naughtywolf::AppError::Validation(_)));
+    let result_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM c2_task_results WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    let snapshot_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM c2_file_snapshots WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert_eq!((result_count, snapshot_count), (0, 0));
+}
+
+#[tokio::test]
+async fn filesystem_mutation_result_must_match_the_exact_task_target_atomically() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-result", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let task_id = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-delete",
+            &serde_json::json!(["/srv/exact", "true"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    let mismatched = br#"{"schema":"nw.fs-mutation.v1","action":"delete","path":"/srv/other","destination":null,"recursive":true,"completed_at":"2026-09-10T12:35:00Z"}"#;
+
+    let error = repo
+        .store_task_result_for_session(&session_id, &task_id, true, mismatched, &[], 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, naughtywolf::AppError::Validation(_)));
+    let result_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM c2_task_results WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert_eq!(result_count, 0);
+
+    let valid_task = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-delete",
+            &serde_json::json!(["/srv/exact", "true"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    let valid = br#"{"schema":"nw.fs-mutation.v1","action":"delete","path":"/srv/exact","destination":null,"recursive":true,"completed_at":"2026-09-10T12:35:01Z"}"#;
+    assert!(
+        repo.store_task_result_for_session(&session_id, &valid_task, true, valid, &[], 0)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn filesystem_routes_require_role_scope_csrf_and_audit_exact_paths() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-owner", Role::Operator).await;
+    let outsider = create_user(&repo, "filesystem-outsider", Role::Operator).await;
+    let viewer = create_user(&repo, "filesystem-viewer", Role::Viewer).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let owner_app = authenticated_app(repo.clone(), operator).await;
+
+    let missing_csrf = owner_app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/files/mkdir"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"path":"/srv/exact <target>"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::BAD_REQUEST);
+
+    let hidden = authenticated_app(repo.clone(), outsider)
+        .await
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/files/delete"))
+                .header("content-type", "application/json")
+                .header("x-csrf-token", "not-disclosed")
+                .body(Body::from(
+                    r#"{"path":"/srv/exact <target>","recursive":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    let viewer_denied = authenticated_app(repo.clone(), viewer)
+        .await
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/files/list"))
+                .header("content-type", "application/json")
+                .header("x-csrf-token", "not-disclosed")
+                .body(Body::from(r#"{"path":"/srv"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer_denied.status(), StatusCode::FORBIDDEN);
+
+    let page = owner_app
+        .clone()
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csrf = csrf_token(&response_text(page).await);
+    let cases = [
+        (
+            "list",
+            r#"{"path":"/srv/files"}"#,
+            "nw/fs-list",
+            serde_json::json!(["/srv/files"]),
+        ),
+        (
+            "mkdir",
+            r#"{"path":"/srv/exact <target>"}"#,
+            "nw/fs-mkdir",
+            serde_json::json!(["/srv/exact <target>"]),
+        ),
+        (
+            "move",
+            r#"{"source":"/srv/exact <target>","destination":"/srv/moved & safe"}"#,
+            "nw/fs-move",
+            serde_json::json!(["/srv/exact <target>", "/srv/moved & safe"]),
+        ),
+        (
+            "delete",
+            r#"{"path":"/srv/moved & safe","recursive":true}"#,
+            "nw/fs-delete",
+            serde_json::json!(["/srv/moved & safe", "true"]),
+        ),
+    ];
+    for (route, body, command, arguments) in cases {
+        let response = owner_app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/callbacks/{session_id}/files/{route}"))
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}");
+        let task = json(response).await;
+        assert_eq!(task["command"], command);
+        assert_eq!(task["arguments"], arguments);
+    }
+    let audits: Vec<(String, String)> = sqlx::query_as(
+        "SELECT action, details FROM c2_audit WHERE target_session = ? AND action LIKE 'filesystem_%' ORDER BY id",
+    )
+    .bind(&session_id)
+    .fetch_all(&repo.pool)
+    .await
+    .unwrap();
+    assert_eq!(audits.len(), 4);
+    assert!(
+        audits
+            .iter()
+            .any(|(action, details)| action == "filesystem_mkdir_enqueued"
+                && details.contains("exact path /srv/exact <target>"))
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|(action, details)| action == "filesystem_move_enqueued"
+                && details.contains("source /srv/exact <target>")
+                && details.contains("destination /srv/moved & safe"))
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|(action, details)| action == "filesystem_delete_enqueued"
+                && details.contains("exact path /srv/moved & safe")
+                && details.contains("recursive true"))
+    );
+}
+
+#[tokio::test]
+async fn filesystem_routes_reject_invalid_paths_and_non_boolean_recursion_before_enqueue() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-validation", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let app = authenticated_app(repo.clone(), operator).await;
+    let page = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csrf = csrf_token(&response_text(page).await);
+
+    for body in [
+        r#"{"path":""}"#,
+        r#"{"path":"bad\u0000path"}"#,
+        r#"{"path":"relative/path"}"#,
+        r#"{"path":"/srv/files","recursive":"true"}"#,
+        r#"{"path":"/srv/files","recursive":1}"#,
+    ] {
+        let route = if body.contains("recursive") {
+            "delete"
+        } else {
+            "mkdir"
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/callbacks/{session_id}/files/{route}"))
+                    .header("content-type", "application/json")
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+            ),
+            "{body}: {}",
+            response.status()
+        );
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM c2_tasks")
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn process_kill_success_enqueues_a_linked_refresh_after_completion() {
     let repo = test_repository().await;
     let operator = create_user(&repo, "process-refresh", Role::Operator).await;
@@ -404,11 +760,9 @@ async fn process_control_mutations_require_scope_and_csrf_and_audit_exact_pid() 
     let missing_kill_csrf = owner_app
         .clone()
         .oneshot(
-            Request::post(format!(
-                "/api/callbacks/{session_id}/processes/7331/kill"
-            ))
-            .body(Body::empty())
-            .unwrap(),
+            Request::post(format!("/api/callbacks/{session_id}/processes/7331/kill"))
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -460,7 +814,7 @@ async fn process_control_mutations_require_scope_and_csrf_and_audit_exact_pid() 
 }
 
 #[tokio::test]
-async fn generic_task_endpoints_reject_reserved_process_commands_and_retries() {
+async fn generic_task_endpoints_reject_reserved_structured_commands_and_retries() {
     let repo = test_repository().await;
     let operator = create_user(&repo, "reserved-process", Role::Operator).await;
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -477,7 +831,15 @@ async fn generic_task_endpoints_reject_reserved_process_commands_and_retries() {
         .unwrap();
     let csrf = csrf_token(&response_text(page).await);
 
-    for command in ["nw/process-list", "nw/process-kill"] {
+    for command in [
+        "nw/process-list",
+        "nw/process-kill",
+        "nw/fs-list",
+        "nw/fs-stat",
+        "nw/fs-mkdir",
+        "nw/fs-move",
+        "nw/fs-delete",
+    ] {
         let response = app
             .clone()
             .oneshot(
@@ -831,4 +1193,48 @@ async fn tasking_tab_exposes_persistent_controls_and_local_assets() {
     ] {
         assert!(page.contains(label), "missing tasking label {label}");
     }
+}
+
+#[tokio::test]
+async fn filesystem_workspace_renders_url_navigation_controls_and_disabled_transfers() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-page", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let app = authenticated_app(repo, operator).await;
+
+    let response = app
+        .oneshot(
+            Request::get(format!(
+                "/callbacks/{session_id}?tab=files&path=%2Fsrv%2Flab"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    for marker in [
+        "data-file-panel",
+        "data-file-path-form",
+        "data-file-breadcrumbs",
+        "data-file-parent",
+        "data-file-refresh",
+        "data-file-mkdir-form",
+        "data-file-table-body",
+        "data-file-confirm",
+        "data-file-task-link",
+        "data-file-snapshot-age",
+    ] {
+        assert!(page.contains(marker), "missing {marker}");
+    }
+    assert!(page.contains("?tab=files&amp;path=%2F"));
+    assert_eq!(
+        page.matches("Transfer support is being initialized")
+            .count(),
+        2
+    );
+    assert!(page.contains("data-file-upload disabled"));
+    assert!(page.contains("data-file-download disabled"));
 }

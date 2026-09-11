@@ -443,6 +443,10 @@ impl BeaconRuntime {
             self.pending.lock().unwrap().push(result);
             return;
         }
+        if let Some(result) = crate::filesystem::execute(task) {
+            self.pending.lock().unwrap().push(result);
+            return;
+        }
         if task.command == "nw/exit" {
             self.trigger_stop();
             return;

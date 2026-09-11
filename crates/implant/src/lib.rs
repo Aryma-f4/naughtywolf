@@ -1,5 +1,6 @@
 pub mod download;
 pub mod evasion;
+pub mod filesystem;
 pub mod metadata;
 pub mod modules;
 pub mod processes;

@@ -20,7 +20,11 @@ class Element {
   prepend(child) { child.parentNode = this; this.children.unshift(child); }
   replaceChildren(...children) { this._textContent = ''; this.children = []; this.append(...children); }
   get textContent() { return this._textContent + this.children.map(child => child.textContent).join(''); }
-  set textContent(value) { this._textContent = String(value); }
+  set textContent(value) {
+    this._textContent = String(value);
+    for (const child of this.children) child.parentNode = null;
+    this.children = [];
+  }
   remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this); }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
@@ -85,6 +89,30 @@ function skeleton() {
   const sortPid = new Element('button');
   sortPid.dataset.processSort = 'pid';
   root.append(sortName, sortPid);
+  for (const key of ['filePanel', 'filePathForm', 'filePath', 'fileBreadcrumbs', 'fileParent', 'fileTableBody', 'fileEmpty', 'fileSnapshotAge', 'fileMessage', 'fileRefresh', 'fileMkdirForm', 'fileMkdirName', 'fileUpload', 'fileDownload', 'fileTaskLink', 'fileConfirm', 'fileConfirmText', 'fileConfirmSubmit', 'fileConfirmCancel', 'fileMoveFields', 'fileMoveDestination', 'fileDeleteFields', 'fileDeleteRecursive']) {
+    const isButton = ['fileParent', 'fileRefresh', 'fileUpload', 'fileDownload', 'fileConfirmSubmit', 'fileConfirmCancel'].includes(key);
+    const isInput = ['filePath', 'fileMkdirName', 'fileMoveDestination', 'fileDeleteRecursive'].includes(key);
+    const isForm = ['filePathForm', 'fileMkdirForm'].includes(key);
+    const element = new Element(isButton ? 'button' : isInput ? 'input' : isForm ? 'form' : 'div');
+    element.dataset[key] = '';
+    root.append(element);
+  }
+  const filePanel = root.querySelector('[data-file-panel]');
+  filePanel.dataset.filesEndpoint = '/api/callbacks/callback-1/files';
+  filePanel.dataset.fileCapable = 'true';
+  filePanel.dataset.transferCapable = 'false';
+  filePanel.dataset.defaultPath = '/';
+  for (const key of ['name', 'size', 'modified_at']) {
+    const sort = new Element('button');
+    sort.dataset.fileSort = key;
+    root.append(sort);
+  }
+  for (const tab of ['tasking', 'processes', 'files']) {
+    const link = new Element('a');
+    link.dataset.callbackTab = tab;
+    link.setAttribute('href', `?tab=${tab}`);
+    root.append(link);
+  }
   return root;
 }
 
@@ -108,7 +136,7 @@ function dependencies(pages = [{ tasks: [], next_before: null }]) {
   }
   Object.assign(deps, {
     document, EventSource,
-    fetch: async url => url.endsWith('/processes')
+    fetch: async url => url.endsWith('/processes') || url.includes('/files?')
       ? ({ ok: true, json: async () => null })
       : ({ ok: true, json: async () => pages[Math.min(index++, pages.length - 1)] }),
   });
@@ -132,6 +160,40 @@ function processSnapshot(overrides = {}) {
     },
     ...overrides,
   };
+}
+
+function filesystemSnapshot(path = '/srv/lab', overrides = {}) {
+  return {
+    session_id: 'callback-1', path, task_id: 'file-task-1', schema_version: 'nw.fs-list.v1',
+    captured_at: '2026-09-10T10:00:00Z',
+    snapshot_json: {
+      schema: 'nw.fs-list.v1', path, captured_at: '2026-09-10T10:00:00Z',
+      entries: [
+        { name: '<img src=x onerror=alert(1)>.txt', path: `${path}/<img src=x onerror=alert(1)>.txt`, kind: 'file', size: 4, modified_at: null, permissions: '0644', owner: 'alice' },
+        { name: 'archive', path: `${path}/archive`, kind: 'directory', size: 0, modified_at: '2026-09-10T09:00:00Z', permissions: '0755', owner: null },
+      ],
+    },
+    ...overrides,
+  };
+}
+
+function urlDependencies(path = '/srv/lab') {
+  const deps = dependencies();
+  deps.location = { href: `https://lab.test/callbacks/callback-1?tab=files&path=${encodeURIComponent(path)}` };
+  deps.history = {
+    calls: [],
+    pushState(_state, _title, value) {
+      this.calls.push(value);
+      deps.location.href = new URL(value, deps.location.href).href;
+    },
+  };
+  deps.window = {
+    listeners: {},
+    addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); },
+    removeEventListener(type, listener) { this.listeners[type] = (this.listeners[type] || []).filter(candidate => candidate !== listener); },
+    dispatch(type) { return Promise.all((this.listeners[type] || []).map(listener => listener())); },
+  };
+  return deps;
 }
 
 test('same task snapshots dedupe by ID and update the existing card state', async () => {
@@ -392,4 +454,138 @@ test('failed process kill does not refresh the process snapshot', async () => {
   deps.source.listeners.task({ data: JSON.stringify(task({ id: 'kill-task-failed', command: 'nw/process-kill', status: 'error', state_label: 'Error' })) });
   await flush();
   assert.equal(calls.filter(([url]) => url.endsWith('/processes')).length, 1);
+});
+
+test('filesystem URL restores path, safe rows, stale time, breadcrumbs, parent, and sorting', async () => {
+  const root = skeleton();
+  const deps = urlDependencies('/srv/lab');
+  deps.now = () => Date.parse('2026-09-10T12:30:00Z');
+  deps.fetch = async url => {
+    if (url.includes('/files?')) return { ok: true, json: async () => filesystemSnapshot() };
+    if (url.endsWith('/processes')) return { ok: true, json: async () => null };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+
+  assert.equal(root.querySelector('[data-file-path]').value, '/srv/lab');
+  assert.equal(root.querySelectorAll('[data-callback-tab]').find(link => link.dataset.callbackTab === 'files').getAttribute('aria-current'), 'page');
+  assert.equal(root.querySelector('[data-file-parent]').dataset.filePath, '/srv');
+  assert.match(root.querySelector('[data-file-breadcrumbs]').textContent, /\/.*srv.*lab/s);
+  assert.match(root.querySelector('[data-file-snapshot-age]').textContent, /2h 30m old.*stale/i);
+  const unsafeRow = root.querySelectorAll('[data-file-row]').find(row => row.dataset.filePath.includes('<img'));
+  assert.match(unsafeRow.textContent, /<img src=x onerror=alert\(1\)>.txt/);
+  assert.equal(unsafeRow.querySelector('img'), null, 'remote names must remain text, never HTML');
+  assert.equal(root.querySelectorAll('[data-file-row]')[0].dataset.filePath, '/srv/lab/archive');
+  root.querySelectorAll('[data-file-sort]').find(button => button.dataset.fileSort === 'size').dispatch('click');
+  assert.equal(root.querySelectorAll('[data-file-row]')[0].dataset.filePath.includes('<img'), true);
+  assert.equal(root.querySelector('[data-file-task-link]').getAttribute('href'), '#task-file-task-1');
+});
+
+test('filesystem directory, parent, breadcrumb, and path bar navigation update the URL', async () => {
+  const root = skeleton();
+  const deps = urlDependencies('/srv/lab');
+  deps.fetch = async url => {
+    if (url.includes('/files?')) {
+      const path = new URL(url, deps.location.href).searchParams.get('path');
+      return { ok: true, json: async () => path === '/srv/lab' ? filesystemSnapshot() : null };
+    }
+    if (url.endsWith('/processes')) return { ok: true, json: async () => null };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+
+  const directory = root.querySelectorAll('[data-file-row]').find(row => row.dataset.fileKind === 'directory');
+  root.querySelector('[data-file-table-body]').dispatch('click', { target: directory });
+  await flush();
+  assert.match(deps.history.calls.at(-1), /tab=files/);
+  assert.match(deps.history.calls.at(-1), /path=%2Fsrv%2Flab%2Farchive/);
+
+  root.querySelector('[data-file-parent]').dispatch('click');
+  await flush();
+  assert.equal(new URL(deps.history.calls.at(-1), 'https://lab.test').searchParams.get('path'), '/srv/lab');
+
+  root.querySelector('[data-file-path]').value = '/var/tmp';
+  const submit = root.querySelector('[data-file-path-form]').dispatch('submit');
+  await submit.pending;
+  assert.equal(new URL(deps.history.calls.at(-1), 'https://lab.test').searchParams.get('path'), '/var/tmp');
+
+  deps.location.href = 'https://lab.test/callbacks/callback-1?tab=files&path=%2Fsrv%2Flab#files';
+  await deps.window.dispatch('popstate');
+  assert.equal(root.querySelector('[data-file-path]').value, '/srv/lab');
+});
+
+test('filesystem mkdir, move, and delete use exact confirmations, CSRF, and task links', async () => {
+  const root = skeleton();
+  const deps = urlDependencies('/srv/lab');
+  const calls = [];
+  deps.fetch = async (url, options = {}) => {
+    calls.push([url, options]);
+    if (url.includes('/files?')) return { ok: true, json: async () => filesystemSnapshot() };
+    if (url.endsWith('/processes')) return { ok: true, json: async () => null };
+    if (url.includes('/files/')) return { ok: true, json: async () => task({ id: `file-action-${calls.length}`, command: 'nw/fs-mutation' }) };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+
+  root.querySelector('[data-file-mkdir-name]').value = 'new folder';
+  root.querySelector('[data-file-mkdir-form]').dispatch('submit');
+  assert.match(root.querySelector('[data-file-confirm-text]').textContent, /mkdir.*\/srv\/lab\/new folder/i);
+  let confirmation = root.querySelector('[data-file-confirm-submit]').dispatch('click');
+  await confirmation.pending;
+
+  const fileRow = root.querySelectorAll('[data-file-row]').find(row => row.dataset.fileKind === 'file');
+  root.querySelector('[data-file-table-body]').dispatch('click', { target: fileRow.querySelector('[data-file-move]') });
+  root.querySelector('[data-file-move-destination]').value = '/srv/lab/renamed <safe>.txt';
+  root.querySelector('[data-file-move-destination]').dispatch('input');
+  assert.match(root.querySelector('[data-file-confirm-text]').textContent, /<img.*renamed <safe>.txt/s);
+  confirmation = root.querySelector('[data-file-confirm-submit]').dispatch('click');
+  await confirmation.pending;
+
+  root.querySelector('[data-file-table-body]').dispatch('click', { target: fileRow.querySelector('[data-file-delete]') });
+  root.querySelector('[data-file-delete-recursive]').checked = true;
+  root.querySelector('[data-file-delete-recursive]').dispatch('change');
+  assert.match(root.querySelector('[data-file-confirm-text]').textContent, /delete.*<img.*recursive/i);
+  confirmation = root.querySelector('[data-file-confirm-submit]').dispatch('click');
+  await confirmation.pending;
+
+  const mutationCalls = calls.filter(([url]) => /\/files\/(mkdir|move|delete)$/.test(url));
+  assert.equal(mutationCalls.length, 3);
+  assert.equal(mutationCalls.every(([, options]) => options.headers['x-csrf-token'] === 'csrf'), true);
+  assert.deepEqual(JSON.parse(mutationCalls[0][1].body), { path: '/srv/lab/new folder' });
+  assert.deepEqual(JSON.parse(mutationCalls[1][1].body), { source: '/srv/lab/<img src=x onerror=alert(1)>.txt', destination: '/srv/lab/renamed <safe>.txt' });
+  assert.deepEqual(JSON.parse(mutationCalls[2][1].body), { path: '/srv/lab/<img src=x onerror=alert(1)>.txt', recursive: true });
+  assert.match(root.querySelector('[data-file-task-link]').getAttribute('href'), /^#task-file-action-/);
+});
+
+test('filesystem refresh is typed while unsupported controls and transfers stay disabled', async () => {
+  const root = skeleton();
+  const deps = urlDependencies('/');
+  const calls = [];
+  deps.fetch = async (url, options = {}) => {
+    calls.push([url, options]);
+    if (url.includes('/files?')) return { ok: true, json: async () => null };
+    if (url.endsWith('/files/list')) return { ok: true, json: async () => task({ id: 'file-refresh-1', command: 'nw/fs-list' }) };
+    if (url.endsWith('/processes')) return { ok: true, json: async () => null };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  const refresh = root.querySelector('[data-file-refresh]').dispatch('click');
+  await refresh.pending;
+  const refreshCall = calls.find(([url]) => url.endsWith('/files/list'));
+  assert.deepEqual(JSON.parse(refreshCall[1].body), { path: '/' });
+  assert.equal(root.querySelector('[data-file-upload]').disabled, true);
+  assert.equal(root.querySelector('[data-file-download]').disabled, true);
+  assert.equal(root.querySelector('[data-file-upload]').textContent, 'Transfer support is being initialized');
+  assert.equal(root.querySelector('[data-file-download]').textContent, 'Transfer support is being initialized');
+
+  const unsupported = skeleton();
+  unsupported.querySelector('[data-file-panel]').dataset.fileCapable = 'false';
+  const unsupportedWorkspace = createWorkspace(unsupported, urlDependencies('/'));
+  await unsupportedWorkspace.ready;
+  assert.equal(unsupported.querySelector('[data-file-refresh]').disabled, true);
+  assert.match(unsupported.querySelector('[data-file-message]').textContent, /does not advertise filesystem control/i);
 });

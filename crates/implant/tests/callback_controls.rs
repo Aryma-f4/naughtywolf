@@ -4,8 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nw_profile::control::{ControlError, ProcessEntry, ProcessListV1};
+use nw_profile::control::{
+    ControlError, FileControlError, FileEntry, FileListV1, FileMutationV1, ProcessEntry,
+    ProcessListV1,
+};
 use nw_profile::msgs::Task;
+use std::fs;
 use uuid::Uuid;
 
 #[test]
@@ -166,4 +170,173 @@ fn process_kill_dedicated_child_fixture() {
     if std::env::var_os("NW_PROCESS_KILL_CHILD").is_some() {
         thread::sleep(Duration::from_secs(120));
     }
+}
+
+#[test]
+fn filesystem_list_and_stat_report_absolute_utf8_and_size_fields() {
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let directory = tree.path().join("documents");
+    fs::create_dir(&directory).expect("fixture directory");
+    let utf8_file = directory.join("数据.txt");
+    let empty_file = directory.join("empty.bin");
+    fs::write(&utf8_file, b"wolf").expect("nonempty fixture file");
+    fs::write(&empty_file, []).expect("empty fixture file");
+
+    let snapshot =
+        nw_implant::filesystem::list(directory.to_str().unwrap()).expect("list temporary fixture");
+
+    assert_eq!(snapshot.schema, "nw.fs-list.v1");
+    assert!(snapshot.path.starts_with(tree.path().to_str().unwrap()));
+    assert_eq!(snapshot.entries.len(), 2);
+    let utf8 = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.name == "数据.txt")
+        .expect("UTF-8 entry");
+    assert_eq!(utf8.kind, "file");
+    assert_eq!(utf8.size, 4);
+    assert_eq!(utf8.path, utf8_file.to_str().unwrap());
+    #[cfg(unix)]
+    assert!(utf8.owner.is_some(), "Unix owner id should be reported");
+    let empty =
+        nw_implant::filesystem::stat(empty_file.to_str().unwrap()).expect("stat empty fixture");
+    assert_eq!(empty.name, "empty.bin");
+    assert_eq!(empty.kind, "file");
+    assert_eq!(empty.size, 0);
+    assert_eq!(empty.path, empty_file.to_str().unwrap());
+}
+
+#[test]
+fn filesystem_mutations_stay_within_the_exact_temporary_fixture_subtree() {
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let source = tree.path().join("source");
+    let moved = tree.path().join("moved");
+    let sibling = tree.path().join("sibling-marker.txt");
+    let nested = source.join("nested.txt");
+    fs::write(&sibling, b"keep").expect("sibling marker");
+
+    let mkdir =
+        nw_implant::filesystem::mkdir(source.to_str().unwrap()).expect("mkdir temporary fixture");
+    assert_eq!(mkdir.schema, "nw.fs-mutation.v1");
+    assert_eq!(mkdir.action, "mkdir");
+    fs::write(&nested, b"nested").expect("nonempty directory fixture");
+    let moved_result =
+        nw_implant::filesystem::move_path(source.to_str().unwrap(), moved.to_str().unwrap())
+            .expect("move temporary fixture");
+    assert_eq!(moved_result.action, "move");
+    assert_eq!(moved_result.destination.as_deref(), moved.to_str());
+    assert!(!source.exists());
+    assert!(moved.join("nested.txt").exists());
+
+    let refusal = nw_implant::filesystem::delete(moved.to_str().unwrap(), false)
+        .expect_err("nonrecursive delete must refuse a nonempty directory");
+    assert_eq!(refusal, FileControlError::DirectoryNotEmpty);
+    nw_implant::filesystem::delete(moved.to_str().unwrap(), true)
+        .expect("recursive delete exact fixture subtree");
+
+    assert!(!moved.exists());
+    assert!(tree.path().exists(), "temporary fixture root must remain");
+    assert_eq!(fs::read(&sibling).unwrap(), b"keep");
+}
+
+#[test]
+fn filesystem_move_refuses_to_replace_an_existing_temporary_destination() {
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let source = tree.path().join("source.txt");
+    let destination = tree.path().join("destination.txt");
+    fs::write(&source, b"source").unwrap();
+    fs::write(&destination, b"destination").unwrap();
+
+    let error =
+        nw_implant::filesystem::move_path(source.to_str().unwrap(), destination.to_str().unwrap())
+            .expect_err("move must not overwrite an existing destination");
+
+    assert_eq!(error, FileControlError::AlreadyExists);
+    assert_eq!(fs::read(&source).unwrap(), b"source");
+    assert_eq!(fs::read(&destination).unwrap(), b"destination");
+}
+
+#[test]
+fn filesystem_dispatch_is_exact_and_validates_arguments_before_access() {
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let protected = tree.path().join("protected");
+    fs::create_dir(&protected).unwrap();
+    fs::write(protected.join("keep.txt"), b"keep").unwrap();
+    let task = |command: &str, args: Vec<String>| Task {
+        id: Uuid::new_v4(),
+        command: command.to_owned(),
+        args,
+        timeout_ms: 1_000,
+    };
+
+    assert!(nw_implant::filesystem::execute(&task("nw/fs-list-extra", vec![])).is_none());
+    for invalid in [
+        task("nw/fs-list", vec![]),
+        task(
+            "nw/fs-delete",
+            vec![protected.to_string_lossy().into_owned(), "TRUE".to_owned()],
+        ),
+        task(
+            "nw/fs-delete",
+            vec![protected.to_string_lossy().into_owned(), "1".to_owned()],
+        ),
+    ] {
+        let result = nw_implant::filesystem::execute(&invalid).expect("filesystem handler");
+        assert!(!result.ok);
+        let error: serde_json::Value = serde_json::from_slice(&result.stderr).unwrap();
+        assert_eq!(error["code"], "invalid_arguments");
+    }
+    assert!(protected.join("keep.txt").exists());
+}
+
+#[test]
+fn filesystem_rejects_empty_and_nul_paths_with_stable_error_codes() {
+    for path in ["", "bad\0path"] {
+        let error = nw_implant::filesystem::stat(path).expect_err("invalid path");
+        assert_eq!(error, FileControlError::InvalidPath);
+        assert_eq!(error.code(), "invalid_path");
+    }
+    assert_eq!(FileControlError::NotFound.code(), "not_found");
+    assert_eq!(
+        FileControlError::PermissionDenied.code(),
+        "permission_denied"
+    );
+    assert_eq!(FileControlError::AlreadyExists.code(), "already_exists");
+    assert_eq!(
+        FileControlError::DirectoryNotEmpty.code(),
+        "directory_not_empty"
+    );
+    assert_eq!(FileControlError::IoFailure.code(), "io_failure");
+}
+
+#[test]
+fn filesystem_contract_round_trips_portable_optional_fields() {
+    let fixture = r#"{
+        "schema":"nw.fs-list.v1",
+        "captured_at":"2026-09-10T12:34:56Z",
+        "path":"C:\\Temp",
+        "entries":[{
+            "name":"empty.txt","path":"C:\\Temp\\empty.txt","kind":"file","size":0,
+            "modified_at":null,"permissions":null,"owner":null
+        }]
+    }"#;
+    let snapshot: FileListV1 = serde_json::from_str(fixture).expect("portable file fixture");
+    assert_eq!(
+        snapshot.entries,
+        vec![FileEntry {
+            name: "empty.txt".to_owned(),
+            path: r"C:\Temp\empty.txt".to_owned(),
+            kind: "file".to_owned(),
+            size: 0,
+            modified_at: None,
+            permissions: None,
+            owner: None,
+        }]
+    );
+    let mutation: FileMutationV1 = serde_json::from_value(serde_json::json!({
+        "schema":"nw.fs-mutation.v1","action":"move","path":"/tmp/a",
+        "destination":"/tmp/b","recursive":false,"completed_at":"2026-09-10T12:35:00Z"
+    }))
+    .unwrap();
+    assert_eq!(mutation.destination.as_deref(), Some("/tmp/b"));
 }

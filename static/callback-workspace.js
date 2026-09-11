@@ -42,6 +42,115 @@
     let processSortKey = "pid";
     let processSortDirection = 1;
     let selectedProcess = null;
+    const filePanel = root.querySelector("[data-file-panel]");
+    const fileDataset = filePanel?.dataset || root.dataset;
+    const filePathForm = root.querySelector("[data-file-path-form]");
+    const filePathInput = root.querySelector("[data-file-path]");
+    const fileBreadcrumbs = root.querySelector("[data-file-breadcrumbs]");
+    const fileParent = root.querySelector("[data-file-parent]");
+    const fileBody = root.querySelector("[data-file-table-body]");
+    const fileEmpty = root.querySelector("[data-file-empty]");
+    const fileSnapshotAge = root.querySelector("[data-file-snapshot-age]");
+    const fileMessage = root.querySelector("[data-file-message]");
+    const fileRefresh = root.querySelector("[data-file-refresh]");
+    const fileMkdirForm = root.querySelector("[data-file-mkdir-form]");
+    const fileMkdirName = root.querySelector("[data-file-mkdir-name]");
+    const fileUpload = root.querySelector("[data-file-upload]");
+    const fileDownload = root.querySelector("[data-file-download]");
+    const fileTaskLink = root.querySelector("[data-file-task-link]");
+    const fileConfirm = root.querySelector("[data-file-confirm]");
+    const fileConfirmText = root.querySelector("[data-file-confirm-text]");
+    const fileConfirmSubmit = root.querySelector("[data-file-confirm-submit]");
+    const fileConfirmCancel = root.querySelector("[data-file-confirm-cancel]");
+    const fileMoveFields = root.querySelector("[data-file-move-fields]");
+    const fileMoveDestination = root.querySelector("[data-file-move-destination]");
+    const fileDeleteFields = root.querySelector("[data-file-delete-fields]");
+    const fileDeleteRecursive = root.querySelector("[data-file-delete-recursive]");
+    const browserLocation = dependencies.location || (typeof window !== "undefined" ? window.location : null);
+    const browserHistory = dependencies.history || (typeof window !== "undefined" ? window.history : null);
+    const browserEvents = dependencies.window || (typeof window !== "undefined" ? window : null);
+    let fileRows = [];
+    let fileSortKey = "name";
+    let fileSortDirection = 1;
+    let pendingFileAction = null;
+
+    const selectedTab = (() => {
+      if (!browserLocation?.href) return "tasking";
+      try {
+        const value = new URL(browserLocation.href).searchParams.get("tab");
+        return ["tasking", "processes", "files"].includes(value) ? value : "tasking";
+      } catch (_) {
+        return "tasking";
+      }
+    })();
+    root.querySelectorAll?.("[data-callback-tab]").forEach(link => {
+      link.setAttribute("aria-current", link.dataset.callbackTab === selectedTab ? "page" : "false");
+    });
+
+    const parseRemotePath = value => {
+      if (typeof value !== "string" || !value || value.includes("\0")) return null;
+      const drive = value.match(/^([A-Za-z]:)[\\/](.*)$/s);
+      if (drive) {
+        const parts = pathParts(drive[2], /[\\/]+/);
+        return { root: `${drive[1]}\\`, separator: "\\", parts };
+      }
+      if (value.startsWith("\\\\")) {
+        const all = value.slice(2).split(/[\\/]+/).filter(Boolean);
+        if (all.length < 2) return null;
+        const root = `\\\\${all.shift()}\\${all.shift()}`;
+        return { root, separator: "\\", parts: pathParts(all.join("\\"), /[\\/]+/) };
+      }
+      if (value.startsWith("/")) return { root: "/", separator: "/", parts: pathParts(value.slice(1), /\/+/) };
+      return null;
+    };
+
+    const pathParts = (value, separator) => {
+      const parts = [];
+      for (const part of value.split(separator).filter(Boolean)) {
+        if (part === ".") continue;
+        if (part === "..") parts.pop();
+        else parts.push(part);
+      }
+      return parts;
+    };
+
+    const formatRemotePath = parsed => {
+      if (!parsed.parts.length) return parsed.root;
+      const joiner = parsed.root.endsWith(parsed.separator) ? "" : parsed.separator;
+      return `${parsed.root}${joiner}${parsed.parts.join(parsed.separator)}`;
+    };
+
+    const normalizeRemotePath = value => {
+      const parsed = parseRemotePath(value);
+      return parsed ? formatRemotePath(parsed) : null;
+    };
+
+    const parentRemotePath = value => {
+      const parsed = parseRemotePath(value);
+      if (!parsed) return null;
+      parsed.parts.pop();
+      return formatRemotePath(parsed);
+    };
+
+    const joinRemotePath = (parent, name) => {
+      const parsed = parseRemotePath(parent);
+      if (!parsed || !name || name.includes("\0") || name.includes("/") || name.includes("\\")) return null;
+      parsed.parts.push(name);
+      return formatRemotePath(parsed);
+    };
+
+    const initialFilePath = () => {
+      if (browserLocation?.href) {
+        try {
+          const value = new URL(browserLocation.href).searchParams.get("path");
+          const normalized = normalizeRemotePath(value || "");
+          if (normalized) return normalized;
+        } catch (_) { /* use callback platform root */ }
+      }
+      return normalizeRemotePath(fileDataset.defaultPath || "/") || "/";
+    };
+
+    let currentFilePath = initialFilePath();
 
     const element = (tag, className, text) => {
       const node = doc.createElement(tag);
@@ -64,6 +173,172 @@
       const remainderMinutes = minutes % 60;
       let age = days ? `${days}d ${remainderHours}h` : hours ? `${hours}h ${remainderMinutes}m` : `${remainderMinutes}m`;
       return `${age} old${ageMs > 15 * 60000 ? " · stale" : ""}`;
+    };
+
+    const setFileTaskLink = task => {
+      const taskId = task?.id || task?.task_id;
+      if (!fileTaskLink || !taskId) return;
+      fileTaskLink.setAttribute("href", `#task-${taskId}`);
+      fileTaskLink.textContent = `Task ${taskId}`;
+      fileTaskLink.hidden = false;
+    };
+
+    const renderFileNavigation = () => {
+      if (filePathInput) filePathInput.value = currentFilePath;
+      const parsed = parseRemotePath(currentFilePath);
+      if (!parsed) return;
+      const crumbs = [];
+      const root = element("button", "file-crumb", parsed.root);
+      root.type = "button";
+      root.dataset.filePath = parsed.root;
+      crumbs.push(root);
+      const accumulated = [];
+      for (const part of parsed.parts) {
+        accumulated.push(part);
+        const target = formatRemotePath({ ...parsed, parts: [...accumulated] });
+        const separator = element("span", "file-crumb-separator", parsed.separator);
+        const button = element("button", "file-crumb", part);
+        button.type = "button";
+        button.dataset.filePath = target;
+        crumbs.push(separator, button);
+      }
+      fileBreadcrumbs?.replaceChildren(...crumbs);
+      if (fileParent) {
+        const parent = parentRemotePath(currentFilePath);
+        fileParent.dataset.filePath = parent;
+        fileParent.disabled = parent === currentFilePath;
+      }
+    };
+
+    const updateFileUrl = () => {
+      if (!browserLocation?.href || !browserHistory?.pushState) return;
+      try {
+        const url = new URL(browserLocation.href);
+        url.searchParams.set("tab", "files");
+        url.searchParams.set("path", currentFilePath);
+        url.hash = "files";
+        browserHistory.pushState({}, "", `${url.pathname}?${url.searchParams.toString()}${url.hash}`);
+      } catch (_) { /* navigation still works without URL state */ }
+    };
+
+    const fileValue = (entry, key) => {
+      if (key === "size") return entry.size === null || entry.size === undefined ? "Unavailable" : `${entry.size} bytes`;
+      return unavailable(entry[key]);
+    };
+
+    const renderFiles = () => {
+      if (!fileBody) return;
+      const sorted = [...fileRows].sort((left, right) => {
+        if (fileSortKey === "name" && left.kind !== right.kind) {
+          if (left.kind === "directory") return -1;
+          if (right.kind === "directory") return 1;
+        }
+        const leftValue = left[fileSortKey];
+        const rightValue = right[fileSortKey];
+        if (typeof leftValue === "number" && typeof rightValue === "number") return (leftValue - rightValue) * fileSortDirection;
+        return String(leftValue ?? "").localeCompare(String(rightValue ?? "")) * fileSortDirection;
+      });
+      const rows = sorted.map(entry => {
+        const row = element("tr", "file-row");
+        row.dataset.fileRow = "";
+        row.dataset.filePath = String(entry.path);
+        row.dataset.fileKind = String(entry.kind);
+        for (const key of ["name", "kind", "size", "modified_at", "permissions", "owner"]) {
+          const cell = element("td", "", fileValue(entry, key));
+          cell.dataset.fileField = key;
+          row.append(cell);
+        }
+        const actions = element("td", "file-actions");
+        const move = element("button", "btn btn-ghost", "Move / rename");
+        move.type = "button";
+        move.dataset.fileMove = "";
+        const remove = element("button", "btn btn-ghost", "Delete");
+        remove.type = "button";
+        remove.dataset.fileDelete = "";
+        actions.append(move, remove);
+        row.append(actions);
+        return row;
+      });
+      fileBody.replaceChildren(...rows);
+      if (fileEmpty) fileEmpty.hidden = rows.length !== 0;
+    };
+
+    const loadFiles = async () => {
+      if (!filePanel || fileDataset.fileCapable !== "true") return;
+      const response = await request(`${fileDataset.filesEndpoint}?path=${encodeURIComponent(currentFilePath)}`, { credentials: "same-origin" });
+      if (!response.ok) throw new Error(`Filesystem snapshot request failed (${response.status})`);
+      const snapshot = await response.json();
+      const data = snapshot?.snapshot_json || snapshot;
+      fileRows = Array.isArray(data?.entries) ? data.entries : [];
+      if (fileSnapshotAge) fileSnapshotAge.textContent = data?.captured_at ? processAge(data.captured_at) : "No filesystem snapshot yet";
+      setFileTaskLink(snapshot);
+      renderFiles();
+    };
+
+    const navigateFiles = async (path, updateUrl = true) => {
+      const normalized = normalizeRemotePath(path);
+      if (!normalized) {
+        if (fileMessage) fileMessage.textContent = "Enter an absolute Linux, Windows drive, or UNC path.";
+        return;
+      }
+      currentFilePath = normalized;
+      renderFileNavigation();
+      if (updateUrl) updateFileUrl();
+      try {
+        await loadFiles();
+        if (fileMessage) fileMessage.textContent = fileRows.length ? "Filesystem snapshot loaded." : "No snapshot for this path; queue a refresh.";
+      } catch (_) {
+        if (fileMessage) fileMessage.textContent = "Filesystem snapshot unavailable; Tasking remains connected.";
+      }
+    };
+
+    const queueFilesystemTask = async (route, body) => {
+      const response = await request(`${fileDataset.filesEndpoint}/${route}`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json", "x-csrf-token": root.dataset.csrfToken },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(`Filesystem task failed (${response.status})`);
+      const task = await response.json();
+      upsert(task);
+      setFileTaskLink(task);
+      return task;
+    };
+
+    const updateFileConfirmation = () => {
+      if (!pendingFileAction || !fileConfirmText) return;
+      if (pendingFileAction.kind === "mkdir") {
+        fileConfirmText.textContent = `Mkdir exact remote path ${pendingFileAction.path}?`;
+      } else if (pendingFileAction.kind === "move") {
+        const destination = fileMoveDestination?.value || "";
+        fileConfirmText.textContent = `Move exact source ${pendingFileAction.source} to exact destination ${destination}?`;
+      } else {
+        const recursive = Boolean(fileDeleteRecursive?.checked);
+        fileConfirmText.textContent = `Delete exact remote path ${pendingFileAction.path}${recursive ? " recursively" : " non-recursively"}?`;
+      }
+    };
+
+    const openFileConfirmation = action => {
+      pendingFileAction = action;
+      if (fileMoveFields) fileMoveFields.hidden = action.kind !== "move";
+      if (fileDeleteFields) fileDeleteFields.hidden = action.kind !== "delete";
+      if (action.kind === "move" && fileMoveDestination) fileMoveDestination.value = action.source;
+      if (action.kind === "delete" && fileDeleteRecursive) fileDeleteRecursive.checked = false;
+      updateFileConfirmation();
+      if (fileConfirm) fileConfirm.hidden = false;
+    };
+
+    const restoreFileLocation = async () => {
+      if (!browserLocation?.href) return;
+      try {
+        const url = new URL(browserLocation.href);
+        const path = normalizeRemotePath(url.searchParams.get("path") || "");
+        root.querySelectorAll?.("[data-callback-tab]").forEach(link => {
+          link.setAttribute("aria-current", link.dataset.callbackTab === url.searchParams.get("tab") ? "page" : "false");
+        });
+        if (path && path !== currentFilePath) await navigateFiles(path, false);
+      } catch (_) { /* ignore malformed browser history entries */ }
     };
 
     const processValue = (process, key) => {
@@ -268,6 +543,11 @@
           if (processMessage) processMessage.textContent = "Process snapshot could not be refreshed; retry when the callback is available.";
         });
       }
+      if ((options.fromEvent || previous) && previous?.status !== "completed" && task.status === "completed" && task.command === "nw/fs-list") {
+        void loadFiles().catch(() => {
+          if (fileMessage) fileMessage.textContent = "Filesystem snapshot could not be refreshed; retry when the callback is available.";
+        });
+      }
     };
 
     const loadPage = async (before = null) => {
@@ -451,6 +731,101 @@
       }
     });
 
+    filePathForm?.addEventListener("submit", async event => {
+      event.preventDefault();
+      await navigateFiles(filePathInput?.value || "");
+    });
+    fileParent?.addEventListener("click", async () => {
+      if (fileParent.disabled) return;
+      await navigateFiles(fileParent.dataset.filePath);
+    });
+    fileBreadcrumbs?.addEventListener("click", async event => {
+      const button = event.target.closest?.("[data-file-path]");
+      if (button) await navigateFiles(button.dataset.filePath);
+    });
+    root.querySelectorAll?.("[data-file-sort]").forEach(button => {
+      button.addEventListener("click", () => {
+        const key = button.dataset.fileSort;
+        if (fileSortKey === key) fileSortDirection *= -1;
+        else {
+          fileSortKey = key;
+          fileSortDirection = -1;
+        }
+        renderFiles();
+      });
+    });
+    fileBody?.addEventListener("click", async event => {
+      const row = event.target.closest?.("[data-file-row]");
+      if (!row) return;
+      if (event.target.closest?.("[data-file-move]")) {
+        openFileConfirmation({ kind: "move", source: row.dataset.filePath });
+      } else if (event.target.closest?.("[data-file-delete]")) {
+        openFileConfirmation({ kind: "delete", path: row.dataset.filePath });
+      } else if (row.dataset.fileKind === "directory") {
+        await navigateFiles(row.dataset.filePath);
+      }
+    });
+    fileRefresh?.addEventListener("click", async () => {
+      if (fileRefresh.disabled) return;
+      fileRefresh.disabled = true;
+      try {
+        const task = await queueFilesystemTask("list", { path: currentFilePath });
+        if (fileMessage) fileMessage.textContent = `Filesystem refresh task ${task.id} queued.`;
+      } catch (_) {
+        if (fileMessage) fileMessage.textContent = "Unable to queue filesystem refresh; check callback scope and connection.";
+      } finally {
+        fileRefresh.disabled = false;
+      }
+    });
+    fileMkdirForm?.addEventListener("submit", event => {
+      event.preventDefault();
+      const path = joinRemotePath(currentFilePath, fileMkdirName?.value || "");
+      if (!path) {
+        if (fileMessage) fileMessage.textContent = "Directory name must be one path component.";
+        return;
+      }
+      openFileConfirmation({ kind: "mkdir", path });
+    });
+    fileMoveDestination?.addEventListener("input", updateFileConfirmation);
+    fileDeleteRecursive?.addEventListener("change", updateFileConfirmation);
+    fileConfirmCancel?.addEventListener("click", () => {
+      pendingFileAction = null;
+      if (fileConfirm) fileConfirm.hidden = true;
+    });
+    fileConfirmSubmit?.addEventListener("click", async () => {
+      if (!pendingFileAction || fileConfirmSubmit.disabled) return;
+      let route;
+      let body;
+      if (pendingFileAction.kind === "mkdir") {
+        route = "mkdir";
+        body = { path: pendingFileAction.path };
+      } else if (pendingFileAction.kind === "move") {
+        const destination = normalizeRemotePath(fileMoveDestination?.value || "");
+        if (!destination) {
+          if (fileMessage) fileMessage.textContent = "Move destination must be an absolute remote path.";
+          return;
+        }
+        route = "move";
+        body = { source: pendingFileAction.source, destination };
+      } else {
+        route = "delete";
+        body = { path: pendingFileAction.path, recursive: Boolean(fileDeleteRecursive?.checked) };
+      }
+      fileConfirmSubmit.disabled = true;
+      try {
+        const task = await queueFilesystemTask(route, body);
+        if (fileMessage) fileMessage.textContent = `Filesystem ${route} task ${task.id} queued.`;
+        if (fileConfirm) fileConfirm.hidden = true;
+        pendingFileAction = null;
+        if (fileMkdirName) fileMkdirName.value = "";
+      } catch (_) {
+        if (fileMessage) fileMessage.textContent = `Unable to queue filesystem ${route}; check callback scope and connection.`;
+      } finally {
+        fileConfirmSubmit.disabled = false;
+      }
+    });
+    browserEvents?.addEventListener?.("popstate", restoreFileLocation);
+
     if (offlineQueue) {
       offlineQueue.hidden = root.dataset.online !== "false";
       offlineQueue.textContent = "Callback is offline. New tasks stay queued until its next check-in.";
@@ -464,12 +839,36 @@
         processMessage.textContent = "Callback is offline. Process tasks remain queued until its next check-in.";
       }
     }
+    if (filePanel) {
+      const capable = fileDataset.fileCapable === "true";
+      renderFileNavigation();
+      if (fileUpload) {
+        fileUpload.disabled = true;
+        fileUpload.textContent = "Transfer support is being initialized";
+      }
+      if (fileDownload) {
+        fileDownload.disabled = true;
+        fileDownload.textContent = "Transfer support is being initialized";
+      }
+      if (!capable) {
+        if (fileRefresh) fileRefresh.disabled = true;
+        if (fileMessage) fileMessage.textContent = "This callback does not advertise filesystem control capability.";
+      } else if (root.dataset.online === "false" && fileMessage) {
+        fileMessage.textContent = "Callback is offline. Filesystem tasks remain queued until its next check-in.";
+      }
+    }
     setConnection("Connecting");
     const ready = loadPage()
       .then(() => {
         if (closed) return undefined;
         return loadProcesses().catch(() => {
           if (processMessage) processMessage.textContent = "Process snapshot unavailable; Tasking remains connected.";
+        });
+      })
+      .then(() => {
+        if (closed) return undefined;
+        return loadFiles().catch(() => {
+          if (fileMessage) fileMessage.textContent = "Filesystem snapshot unavailable; Tasking remains connected.";
         });
       })
       .then(() => connect())
@@ -481,6 +880,7 @@
       close() {
         if (closed) return;
         closed = true;
+        browserEvents?.removeEventListener?.("popstate", restoreFileLocation);
         eventSource?.close();
       },
     };

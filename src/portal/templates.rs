@@ -927,13 +927,28 @@ pub fn callback_detail_page(
         .as_ref()
         .map(|capabilities| capabilities.process_browser)
         .unwrap_or(false);
+    let file_capable = callback
+        .capabilities_json
+        .as_ref()
+        .map(|capabilities| capabilities.file_browser)
+        .unwrap_or(false);
+    let file_default_path = if callback.os.to_ascii_lowercase().contains("windows") {
+        r"C:\"
+    } else {
+        "/"
+    };
+    let file_default_path_url = if file_default_path == "/" {
+        "%2F"
+    } else {
+        "C%3A%5C"
+    };
     let tasking_panel = format!(
         r##"<section class="callback-tasking panel" data-callback-tasking data-live-output
           data-tasks-endpoint="/api/callbacks/{callback_id}/tasks"
           data-events-endpoint="/api/callbacks/{callback_id}/events"
           data-csrf-token="{csrf}" data-online="{online}">
           <header class="callback-tasking-title"><div><p class="eyebrow">TASKING / PERSISTENT LEDGER</p><h3>Tasking</h3><p>Authoritative callback history, reconciled after every connection.</p></div><div><span class="connection-label">Connection</span><span class="stream-state" data-connection-state role="status">Connecting</span></div></header>
-          <nav class="callback-tabs" aria-label="Callback workspace tabs"><a aria-current="page" href="#tasking">Tasking</a><a href="#processes">Processes</a><span>Files</span><span>Metadata</span></nav>
+          <nav class="callback-tabs" aria-label="Callback workspace tabs"><a data-callback-tab="tasking" aria-current="page" href="?tab=tasking#tasking">Tasking</a><a data-callback-tab="processes" href="?tab=processes#processes">Processes</a><a data-callback-tab="files" href="?tab=files&amp;path={file_default_path_url}#files">Files</a><span>Metadata</span></nav>
           <p class="offline-queue" data-offline-queue hidden></p>
           <div class="task-filters">
             <label>Search task history<input type="search" data-task-search placeholder="Command, operator, or output"></label>
@@ -950,6 +965,17 @@ pub fn callback_detail_page(
             <aside class="process-detail" data-process-detail aria-live="polite"><p>Select a process to inspect its latest values.</p></aside>
             <div class="process-confirm" data-process-confirm hidden role="dialog" aria-modal="true" aria-labelledby="process-confirm-title"><h4 id="process-confirm-title">Confirm process termination</h4><p data-process-confirm-text></p><button type="button" class="btn btn-ghost" data-process-confirm-cancel>Cancel</button><button type="button" class="btn btn-danger" data-process-confirm-submit>Terminate exact PID</button></div>
           </section>
+          <section id="files" class="file-panel panel" data-file-panel data-files-endpoint="/api/callbacks/{callback_id}/files" data-file-capable="{file_capable}" data-transfer-capable="false" data-default-path="{file_default_path}">
+            <header class="file-panel-head"><div><p class="eyebrow">FILESYSTEM CONTROL / AUDITED</p><h3>Files</h3><p>Latest structured directory snapshot from this callback.</p></div><div class="file-controls"><span data-file-snapshot-age>Loading snapshot…</span><button type="button" class="btn btn-ghost" data-file-refresh>Refresh</button></div></header>
+            <p class="file-message" data-file-message role="status" aria-live="polite"></p>
+            <form class="file-path-form" data-file-path-form><button type="button" class="btn btn-ghost" data-file-parent aria-label="Open parent directory">Parent</button><label class="sr-only" for="callback-file-path">Remote path</label><input id="callback-file-path" type="text" data-file-path autocomplete="off" required><button type="submit" class="btn btn-ghost">Open path</button></form>
+            <nav class="file-breadcrumbs" data-file-breadcrumbs aria-label="Remote path breadcrumbs"></nav>
+            <div class="file-toolbar"><form data-file-mkdir-form><label>New directory<input type="text" data-file-mkdir-name autocomplete="off" required></label><button type="submit" class="btn btn-ghost">Mkdir</button></form><a data-file-task-link href="#tasking" hidden>Open filesystem task in Tasking</a></div>
+            <div class="file-transfer-controls" aria-label="File transfers"><button type="button" class="btn btn-ghost" data-file-upload disabled>Transfer support is being initialized</button><button type="button" class="btn btn-ghost" data-file-download disabled>Transfer support is being initialized</button></div>
+            <div class="table-scroll"><table class="data-table file-table"><caption class="sr-only">Callback filesystem</caption><thead><tr><th><button type="button" data-file-sort="name">Name</button></th><th><button type="button" data-file-sort="kind">Kind</button></th><th><button type="button" data-file-sort="size">Size</button></th><th><button type="button" data-file-sort="modified_at">Modified</button></th><th><button type="button" data-file-sort="permissions">Permissions</button></th><th><button type="button" data-file-sort="owner">Owner</button></th><th>Actions</th></tr></thead><tbody data-file-table-body></tbody></table></div>
+            <p class="file-empty" data-file-empty hidden>No entries are available for this directory snapshot.</p>
+            <div class="file-confirm" data-file-confirm hidden role="dialog" aria-modal="true" aria-labelledby="file-confirm-title"><h4 id="file-confirm-title">Confirm exact filesystem target</h4><p data-file-confirm-text></p><div data-file-move-fields hidden><label>Exact destination<input type="text" data-file-move-destination autocomplete="off"></label></div><div data-file-delete-fields hidden><label><input type="checkbox" data-file-delete-recursive> Delete directory contents recursively</label></div><button type="button" class="btn btn-ghost" data-file-confirm-cancel>Cancel</button><button type="button" class="btn btn-danger" data-file-confirm-submit>Queue exact action</button></div>
+          </section>
           <noscript><section class="task-history-panel">{rows}</section><section id="task-results">{persisted_output}</section></noscript>
           <div class="command-dock panel"><div class="command-dock-label"><span aria-hidden="true">&gt;_</span><div><strong>Task this callback</strong><small>Use ↑ and ↓ for persisted command history</small></div></div>
             <form id="task-form" data-task-form><input type="hidden" name="csrf_token" value="{csrf}"><div class="command-input"><label class="sr-only" for="command">Command</label><span aria-hidden="true">$</span><input list="command-suggestions" type="text" id="command" data-command-input autocomplete="off" placeholder="Task an authorized lab agent…" required><datalist id="command-suggestions">{suggestions}</datalist></div><label class="sr-only" for="args">Arguments</label><input class="command-args" type="text" id="args" data-command-arguments placeholder="Arguments (optional)"><button type="submit" class="btn btn-primary">Execute <span aria-hidden="true">↗</span></button></form>
@@ -959,6 +985,9 @@ pub fn callback_detail_page(
         csrf = escape_html(csrf_token),
         online = online,
         process_capable = process_capable,
+        file_capable = file_capable,
+        file_default_path = escape_html(file_default_path),
+        file_default_path_url = file_default_path_url,
         session_context = session_context,
         rows = rows,
         persisted_output = persisted_output,

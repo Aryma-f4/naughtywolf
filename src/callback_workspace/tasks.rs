@@ -154,8 +154,17 @@ pub struct EnqueueTaskRequest {
     timeout_ms: Option<u64>,
 }
 
-fn is_reserved_process_command(command: &str) -> bool {
-    matches!(command, "nw/process-list" | "nw/process-kill")
+fn is_reserved_structured_command(command: &str) -> bool {
+    matches!(
+        command,
+        "nw/process-list"
+            | "nw/process-kill"
+            | "nw/fs-list"
+            | "nw/fs-stat"
+            | "nw/fs-mkdir"
+            | "nw/fs-move"
+            | "nw/fs-delete"
+    )
 }
 
 pub(super) async fn require_csrf(session: &Session, headers: &HeaderMap) -> Result<(), AppError> {
@@ -211,9 +220,9 @@ pub async fn enqueue_task(
     if command.is_empty() || command.chars().count() > 256 {
         return Err(AppError::Validation("invalid command".to_owned()));
     }
-    if is_reserved_process_command(command) {
+    if is_reserved_structured_command(command) {
         return Err(AppError::Validation(
-            "process controls must use their typed endpoints".to_owned(),
+            "structured controls must use their typed endpoints".to_owned(),
         ));
     }
     let timeout_ms = request.timeout_ms.unwrap_or(30_000).clamp(1, 600_000);
@@ -246,9 +255,9 @@ pub async fn retry_task(
         .find_task_record(&session_id, &task_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    if is_reserved_process_command(&original_task.command) {
+    if is_reserved_structured_command(&original_task.command) {
         return Err(AppError::Validation(
-            "process controls must use their typed endpoints".to_owned(),
+            "structured controls must use their typed endpoints".to_owned(),
         ));
     }
     let retry_id = repository

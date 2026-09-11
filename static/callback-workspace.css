@@ -51,6 +51,33 @@
 .process-confirm h4 { margin: 0 0 .5rem; }
 .process-confirm p { margin: 0 0 .8rem; }
 .process-confirm button + button { margin-left: .5rem; }
+.file-panel { display: grid; gap: 1rem; padding: 1.25rem; }
+.file-panel-head, .file-controls, .file-path-form, .file-toolbar, .file-transfer-controls { display: flex; align-items: center; gap: .75rem; }
+.file-panel-head { align-items: flex-end; justify-content: space-between; }
+.file-panel-head h3 { margin: .15rem 0; }
+.file-controls > span, .file-message { color: var(--muted, #6d7178); font-size: .8rem; }
+.file-message { margin: 0; min-height: 1.2rem; }
+.file-path-form input { flex: 1; min-width: 12rem; }
+.file-breadcrumbs { display: flex; align-items: center; gap: .35rem; overflow-x: auto; }
+.file-crumb { border: 0; background: transparent; color: var(--accent, #b5432d); cursor: pointer; padding: .2rem; font: inherit; white-space: nowrap; }
+.file-crumb-separator { color: var(--muted, #6d7178); }
+.file-toolbar { justify-content: space-between; }
+.file-toolbar form, .file-toolbar label { display: flex; align-items: flex-end; gap: .5rem; }
+.file-toolbar label { align-items: stretch; flex-direction: column; font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
+.file-transfer-controls { flex-wrap: wrap; }
+.file-transfer-controls button { max-width: 18rem; }
+.file-table th button { border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; padding: 0; text-align: left; }
+.file-table td { vertical-align: top; }
+.file-table td[data-file-field] { max-width: 22rem; overflow-wrap: anywhere; }
+.file-row[data-file-kind="directory"] td:first-child { font-weight: 700; cursor: pointer; }
+.file-actions { display: flex; gap: .35rem; white-space: nowrap; }
+.file-empty { margin: 0; color: var(--muted, #6d7178); }
+.file-confirm { border: 2px solid var(--accent, #dc5539); padding: 1rem; background: var(--surface, #fff); }
+.file-confirm h4 { margin: 0 0 .5rem; }
+.file-confirm p { margin: 0 0 .8rem; overflow-wrap: anywhere; }
+.file-confirm [data-file-move-fields], .file-confirm [data-file-delete-fields] { margin-bottom: .8rem; }
+.file-confirm [data-file-move-fields] label { display: grid; gap: .35rem; }
+.file-confirm button + button { margin-left: .5rem; }
 @media (max-width: 850px) {
   .task-filters { grid-template-columns: 1fr; }
   .session-context-wrap { position: static; }
@@ -58,4 +85,6 @@
   .process-panel-head, .process-toolbar { align-items: stretch; flex-direction: column; }
   .process-controls, .process-toolbar { align-items: stretch; flex-direction: column; }
   .process-toolbar input { min-width: 0; width: 100%; }
+  .file-panel-head, .file-path-form, .file-toolbar { align-items: stretch; flex-direction: column; }
+  .file-controls, .file-toolbar form { align-items: stretch; flex-direction: column; }
 }

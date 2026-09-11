@@ -8,8 +8,8 @@ use crate::{
     audit::AuditEntry,
     auth::rbac::Role,
     db::models::{
-        Asset, AssetStatus, AuditEvent, Callback, CheckRun, EventRule, Evidence, InstalledService,
-        Operation, OperationStatus, ProcessSnapshot, RunState, TaskRecord,
+        Asset, AssetStatus, AuditEvent, Callback, CheckRun, EventRule, Evidence, FileSnapshot,
+        InstalledService, Operation, OperationStatus, ProcessSnapshot, RunState, TaskRecord,
     },
     error::AppError,
 };
@@ -889,6 +889,49 @@ impl Repository {
         Ok(task_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_filesystem_task_with_audit(
+        &self,
+        session_id: &str,
+        command: &str,
+        arguments: &[String],
+        operator_id: &str,
+        operator_name: &str,
+        audit_action: &str,
+        audit_target: &str,
+    ) -> Result<String, AppError> {
+        let task_id = Uuid::new_v4().to_string();
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_tasks \
+             (id, session_id, command, args_json, timeout_ms, status, operator_id) \
+             VALUES (?, ?, ?, ?, 30000, 'pending', ?)",
+        )
+        .bind(&task_id)
+        .bind(session_id)
+        .bind(command)
+        .bind(serde_json::json!(arguments))
+        .bind(operator_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_audit \
+             (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+             VALUES (?, ?, ?, ?, ?, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(operator_id)
+        .bind(operator_name)
+        .bind(audit_action)
+        .bind(session_id)
+        .bind(format!("task {task_id}: {audit_target}"))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+        Ok(task_id)
+    }
+
     pub async fn retry_task_with_audit(
         &self,
         session_id: &str,
@@ -1061,6 +1104,113 @@ impl Repository {
         } else {
             None
         };
+        let file_snapshot = if ok && command == "nw/fs-list" {
+            let requested_path = arguments
+                .as_array()
+                .and_then(|values| match values.as_slice() {
+                    [path] => path.as_str(),
+                    _ => None,
+                })
+                .ok_or_else(|| AppError::Validation("invalid filesystem list task".to_owned()))?;
+            let requested_path = nw_profile::control::normalize_remote_path(requested_path)
+                .map_err(|_| {
+                    AppError::Validation("invalid filesystem list task path".to_owned())
+                })?;
+            let mut snapshot: nw_profile::control::FileListV1 = serde_json::from_slice(stdout)
+                .map_err(|_| AppError::Validation("invalid filesystem list result".to_owned()))?;
+            let result_path =
+                nw_profile::control::normalize_remote_path(&snapshot.path).map_err(|_| {
+                    AppError::Validation("invalid filesystem list result path".to_owned())
+                })?;
+            if snapshot.schema != nw_profile::control::FILE_LIST_SCHEMA_V1
+                || result_path != requested_path
+                || chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at).is_err()
+                || snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| nw_profile::control::normalize_remote_path(&entry.path).is_err())
+            {
+                return Err(AppError::Validation(
+                    "invalid filesystem list result schema, path, or capture time".to_owned(),
+                ));
+            }
+            snapshot.path = requested_path.clone();
+            Some((requested_path, snapshot))
+        } else {
+            None
+        };
+        if ok
+            && matches!(
+                command.as_str(),
+                "nw/fs-mkdir" | "nw/fs-move" | "nw/fs-delete"
+            )
+        {
+            let result: nw_profile::control::FileMutationV1 = serde_json::from_slice(stdout)
+                .map_err(|_| {
+                    AppError::Validation("invalid filesystem mutation result".to_owned())
+                })?;
+            let values = arguments.as_array().ok_or_else(|| {
+                AppError::Validation("invalid filesystem mutation task".to_owned())
+            })?;
+            let expected = match (command.as_str(), values.as_slice()) {
+                ("nw/fs-mkdir", [path]) => Some(("mkdir", path.as_str(), None, false)),
+                ("nw/fs-move", [source, destination]) => {
+                    Some(("move", source.as_str(), destination.as_str(), false))
+                }
+                ("nw/fs-delete", [path, recursive])
+                    if matches!(recursive.as_str(), Some("false" | "true")) =>
+                {
+                    Some((
+                        "delete",
+                        path.as_str(),
+                        None,
+                        recursive.as_str() == Some("true"),
+                    ))
+                }
+                _ => None,
+            }
+            .ok_or_else(|| AppError::Validation("invalid filesystem mutation task".to_owned()))?;
+            let expected_path = expected
+                .1
+                .ok_or_else(|| AppError::Validation("invalid filesystem mutation task".to_owned()))
+                .and_then(|path| {
+                    nw_profile::control::normalize_remote_path(path).map_err(|_| {
+                        AppError::Validation("invalid filesystem mutation task".to_owned())
+                    })
+                })?;
+            let result_path =
+                nw_profile::control::normalize_remote_path(&result.path).map_err(|_| {
+                    AppError::Validation("invalid filesystem mutation result".to_owned())
+                })?;
+            let expected_destination = expected
+                .2
+                .map(|path| {
+                    nw_profile::control::normalize_remote_path(path).map_err(|_| {
+                        AppError::Validation("invalid filesystem mutation task".to_owned())
+                    })
+                })
+                .transpose()?;
+            let result_destination = result
+                .destination
+                .as_deref()
+                .map(|path| {
+                    nw_profile::control::normalize_remote_path(path).map_err(|_| {
+                        AppError::Validation("invalid filesystem mutation result".to_owned())
+                    })
+                })
+                .transpose()?;
+            if result.schema != nw_profile::control::FILE_MUTATION_SCHEMA_V1
+                || result.action != expected.0
+                || result_path != expected_path
+                || result_destination != expected_destination
+                || result.recursive != expected.3
+                || chrono::DateTime::parse_from_rfc3339(&result.completed_at).is_err()
+            {
+                return Err(AppError::Validation(
+                    "invalid filesystem mutation result".to_owned(),
+                ));
+            }
+        }
         let process_kill = if ok && command == "nw/process-kill" {
             let result: nw_profile::control::ProcessKillV1 = serde_json::from_slice(stdout)
                 .map_err(|_| AppError::Validation("invalid process kill result".to_owned()))?;
@@ -1144,6 +1294,46 @@ impl Repository {
                 .map_err(|_| AppError::Internal)?;
             }
         }
+        if let Some((path, snapshot)) = file_snapshot {
+            let previous: Option<String> = sqlx::query_scalar(
+                "SELECT captured_at FROM c2_file_snapshots WHERE session_id = ? AND path = ?",
+            )
+            .bind(session_id)
+            .bind(&path)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+            let is_newer = previous
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| {
+                    chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at)
+                        .map(|new_value| new_value > value)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            if is_newer {
+                let snapshot_json =
+                    serde_json::to_value(&snapshot).map_err(|_| AppError::Internal)?;
+                sqlx::query(
+                    "INSERT INTO c2_file_snapshots \
+                     (session_id, path, task_id, schema_version, snapshot_json, captured_at) \
+                     VALUES (?, ?, ?, ?, ?, ?) \
+                     ON CONFLICT(session_id, path) DO UPDATE SET task_id = excluded.task_id, \
+                     schema_version = excluded.schema_version, snapshot_json = excluded.snapshot_json, \
+                     captured_at = excluded.captured_at",
+                )
+                .bind(session_id)
+                .bind(&path)
+                .bind(task_id)
+                .bind(&snapshot.schema)
+                .bind(snapshot_json)
+                .bind(&snapshot.captured_at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| AppError::Internal)?;
+            }
+        }
         sqlx::query(
             "UPDATE c2_tasks SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), result_output = ?, \
@@ -1213,6 +1403,24 @@ impl Repository {
              FROM c2_process_snapshots WHERE session_id = ?",
         )
         .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn latest_file_snapshot(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<Option<FileSnapshot>, AppError> {
+        let path = nw_profile::control::normalize_remote_path(path)
+            .map_err(|_| AppError::Validation("invalid filesystem path".to_owned()))?;
+        sqlx::query_as::<_, FileSnapshot>(
+            "SELECT session_id, path, task_id, schema_version, snapshot_json, captured_at \
+             FROM c2_file_snapshots WHERE session_id = ? AND path = ?",
+        )
+        .bind(session_id)
+        .bind(path)
         .fetch_optional(&self.pool)
         .await
         .map_err(|_| AppError::Internal)
