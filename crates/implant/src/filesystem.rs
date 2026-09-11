@@ -8,7 +8,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use nw_profile::{
     control::{
         FILE_LIST_SCHEMA_V1, FILE_MUTATION_SCHEMA_V1, FileControlError, FileEntry, FileListV1,
-        FileMutationV1,
+        FileMutationV1, MAX_FILE_LIST_ENTRIES,
     },
     msgs::{Task, TaskResult},
 };
@@ -23,9 +23,29 @@ fn map_error(error: io::Error) -> FileControlError {
         io::ErrorKind::PermissionDenied => FileControlError::PermissionDenied,
         io::ErrorKind::AlreadyExists => FileControlError::AlreadyExists,
         io::ErrorKind::DirectoryNotEmpty => FileControlError::DirectoryNotEmpty,
-        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => FileControlError::InvalidPath,
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData | io::ErrorKind::NotADirectory => {
+            FileControlError::InvalidPath
+        }
+        _ if platform_invalid_path(&error) => FileControlError::InvalidPath,
         _ => FileControlError::IoFailure,
     }
+}
+
+#[cfg(unix)]
+fn platform_invalid_path(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(code) if matches!(code, libc::ENOTDIR | libc::ENAMETOOLONG | libc::ELOOP))
+}
+
+#[cfg(windows)]
+fn platform_invalid_path(error: &io::Error) -> bool {
+    // ERROR_INVALID_NAME, ERROR_BAD_PATHNAME, ERROR_FILENAME_EXCED_RANGE,
+    // ERROR_DIRECTORY and ERROR_CANT_RESOLVE_FILENAME.
+    matches!(error.raw_os_error(), Some(123 | 161 | 206 | 267 | 1921))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_invalid_path(_error: &io::Error) -> bool {
+    false
 }
 
 fn normalized(path: &str) -> Result<PathBuf, FileControlError> {
@@ -110,13 +130,14 @@ fn entry(path: &Path) -> Result<FileEntry, FileControlError> {
 
 pub fn list(path: &str) -> Result<FileListV1, FileControlError> {
     let path = normalized(path)?;
-    let mut entries = fs::read_dir(&path)
-        .map_err(map_error)?
-        .map(|entry_result| {
-            let entry_path = entry_result.map_err(map_error)?.path();
-            entry(&entry_path)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut entries = Vec::new();
+    for entry_result in fs::read_dir(&path).map_err(map_error)? {
+        if entries.len() == MAX_FILE_LIST_ENTRIES {
+            return Err(FileControlError::ResultTooLarge);
+        }
+        let entry_path = entry_result.map_err(map_error)?.path();
+        entries.push(entry(&entry_path)?);
+    }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(FileListV1 {
         schema: FILE_LIST_SCHEMA_V1.to_owned(),
@@ -140,17 +161,94 @@ pub fn mkdir(path: &str) -> Result<FileMutationV1, FileControlError> {
 pub fn move_path(source: &str, destination: &str) -> Result<FileMutationV1, FileControlError> {
     let source = normalized(source)?;
     let destination = normalized(destination)?;
-    match fs::symlink_metadata(&destination) {
-        Ok(_) => return Err(FileControlError::AlreadyExists),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(map_error(error)),
-    }
-    fs::rename(&source, &destination).map_err(map_error)?;
+    rename_no_replace(&source, &destination).map_err(map_error)?;
     Ok(mutation("move", &source, Some(&destination), false))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: both C strings remain alive for this call and are NUL terminated.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: both C strings remain alive for this call and are NUL terminated.
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // A zero flag set deliberately omits MOVEFILE_REPLACE_EXISTING.
+    let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    windows
+)))]
+fn rename_no_replace(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unsupported on this platform",
+    ))
 }
 
 pub fn delete(path: &str, recursive: bool) -> Result<FileMutationV1, FileControlError> {
     let path = normalized(path)?;
+    reject_link_or_reparse_components(&path, true)?;
     let metadata = fs::symlink_metadata(&path).map_err(map_error)?;
     if metadata.file_type().is_dir() {
         if recursive {
@@ -165,6 +263,42 @@ pub fn delete(path: &str, recursive: bool) -> Result<FileMutationV1, FileControl
         fs::remove_file(&path).map_err(map_error)?;
     }
     Ok(mutation("delete", &path, None, recursive))
+}
+
+fn reject_link_or_reparse_components(
+    path: &Path,
+    reject_target: bool,
+) -> Result<(), FileControlError> {
+    let first = if reject_target {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    for component_path in first.into_iter().flat_map(Path::ancestors) {
+        let metadata = fs::symlink_metadata(component_path).map_err(map_error)?;
+        if metadata_is_link_or_reparse(&metadata) {
+            return Err(FileControlError::InvalidPath);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn mutation(

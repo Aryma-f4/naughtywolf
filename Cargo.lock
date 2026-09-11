@@ -1667,6 +1667,7 @@ dependencies = [
  "base64",
  "chrono",
  "hostname",
+ "libc",
  "local-ip-address",
  "nw-profile",
  "nw-server",
@@ -1682,6 +1683,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "whoami",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

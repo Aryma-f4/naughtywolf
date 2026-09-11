@@ -463,6 +463,174 @@ async fn filesystem_list_result_rejects_path_mismatch_without_any_result_write()
 }
 
 #[tokio::test]
+async fn filesystem_list_result_rejects_nonchild_and_name_mismatch_entries_atomically() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-entry-invalid", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+
+    for entry in [
+        serde_json::json!({"name":"report.txt","path":"/srv/files/nested/report.txt"}),
+        serde_json::json!({"name":"other.txt","path":"/srv/files/report.txt"}),
+        serde_json::json!({"name":"report.txt","path":"/srv/other/report.txt"}),
+    ] {
+        let task_id = repo
+            .enqueue_task(
+                &session_id,
+                "nw/fs-list",
+                &serde_json::json!(["/srv/files"]),
+                30_000,
+            )
+            .await
+            .unwrap();
+        let result = serde_json::to_vec(&serde_json::json!({
+            "schema":"nw.fs-list.v1",
+            "captured_at":"2026-09-10T12:35:00Z",
+            "path":"/srv/files",
+            "entries":[{
+                "name": entry["name"], "path": entry["path"], "kind":"file", "size":4,
+                "modified_at":null, "permissions":null, "owner":null
+            }]
+        }))
+        .unwrap();
+        let error = repo
+            .store_task_result_for_session(&session_id, &task_id, true, &result, &[], 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, naughtywolf::AppError::Validation(_)));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM c2_task_results WHERE task_id = ?")
+                .bind(&task_id)
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
+#[tokio::test]
+async fn unknown_filesystem_schema_is_acked_and_stored_raw_without_projection() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-future", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let baseline_task = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-list",
+            &serde_json::json!(["/srv/files"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    assert!(
+        repo.store_task_result_for_session(
+            &session_id,
+            &baseline_task,
+            true,
+            &filesystem_snapshot_fixture("/srv/files", "2026-09-10T12:35:00Z"),
+            &[],
+            0,
+        )
+        .await
+        .unwrap()
+    );
+    let task_id = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-list",
+            &serde_json::json!(["/srv/files"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    let raw = br#"{"schema":"nw.fs-list.v2","captured_at":"2026-09-10T12:36:00Z","path":"/srv/files","entries":[{"future":true}]}"#;
+
+    assert!(
+        repo.store_task_result_for_session(&session_id, &task_id, true, raw, &[], 0)
+            .await
+            .unwrap(),
+        "successful store makes the poll layer ACK this result"
+    );
+    let stored: (Vec<u8>, String) = sqlx::query_as(
+        "SELECT r.stdout, t.status FROM c2_task_results r JOIN c2_tasks t ON t.id = r.task_id WHERE r.task_id = ?",
+    )
+    .bind(&task_id)
+    .fetch_one(&repo.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.0, raw);
+    assert_eq!(stored.1, "completed");
+    let terminal_audit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM c2_audit WHERE target_session = ? AND action = 'task_completed' AND details = ?",
+    )
+    .bind(&session_id)
+    .bind(format!("task {task_id}"))
+    .fetch_one(&repo.pool)
+    .await
+    .unwrap();
+    assert_eq!(terminal_audit, 1);
+    let snapshot = repo
+        .latest_file_snapshot(&session_id, "/srv/files")
+        .await
+        .unwrap()
+        .expect("existing typed projection remains");
+    assert_eq!(snapshot.task_id, baseline_task);
+    assert_eq!(snapshot.captured_at, "2026-09-10T12:35:00Z");
+}
+
+#[tokio::test]
+async fn filesystem_projection_rejects_more_than_the_contract_entry_limit() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "filesystem-result-limit", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let task_id = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-list",
+            &serde_json::json!(["/srv/files"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    let entries = (0..=nw_profile::control::MAX_FILE_LIST_ENTRIES)
+        .map(|index| {
+            let name = format!("entry-{index}");
+            serde_json::json!({
+                "name": name,
+                "path": format!("/srv/files/entry-{index}"),
+                "kind": "file",
+                "size": 0,
+                "modified_at": null,
+                "permissions": null,
+                "owner": null
+            })
+        })
+        .collect::<Vec<_>>();
+    let oversized = serde_json::to_vec(&serde_json::json!({
+        "schema":"nw.fs-list.v1",
+        "captured_at":"2026-09-10T12:35:00Z",
+        "path":"/srv/files",
+        "entries":entries
+    }))
+    .unwrap();
+
+    let error = repo
+        .store_task_result_for_session(&session_id, &task_id, true, &oversized, &[], 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, naughtywolf::AppError::Validation(_)));
+    let result_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM c2_task_results WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert_eq!(result_count, 0);
+}
+
+#[tokio::test]
 async fn filesystem_mutation_result_must_match_the_exact_task_target_atomically() {
     let repo = test_repository().await;
     let operator = create_user(&repo, "filesystem-result", Role::Operator).await;

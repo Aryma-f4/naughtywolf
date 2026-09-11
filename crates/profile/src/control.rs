@@ -4,6 +4,7 @@ pub const PROCESS_LIST_SCHEMA_V1: &str = "nw.process-list.v1";
 pub const PROCESS_KILL_SCHEMA_V1: &str = "nw.process-kill.v1";
 pub const FILE_LIST_SCHEMA_V1: &str = "nw.fs-list.v1";
 pub const FILE_MUTATION_SCHEMA_V1: &str = "nw.fs-mutation.v1";
+pub const MAX_FILE_LIST_ENTRIES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProcessEntry {
@@ -76,6 +77,8 @@ pub enum FileControlError {
     DirectoryNotEmpty,
     #[error("path is invalid")]
     InvalidPath,
+    #[error("filesystem result exceeds the supported limit")]
+    ResultTooLarge,
     #[error("filesystem operation failed")]
     IoFailure,
 }
@@ -88,6 +91,7 @@ impl FileControlError {
             Self::AlreadyExists => "already_exists",
             Self::DirectoryNotEmpty => "directory_not_empty",
             Self::InvalidPath => "invalid_path",
+            Self::ResultTooLarge => "result_too_large",
             Self::IoFailure => "io_failure",
         }
     }
@@ -126,6 +130,79 @@ pub fn normalize_remote_path(path: &str) -> Result<String, FileControlError> {
         return normalize_components("/", remainder, false);
     }
     Err(FileControlError::InvalidPath)
+}
+
+/// Return whether `entry_path` is exactly one lexical child beneath `directory`
+/// and its final component is exactly `entry_name`. Windows parent components
+/// compare case-insensitively while the callback-reported basename remains exact.
+pub fn remote_path_is_immediate_child(
+    directory: &str,
+    entry_path: &str,
+    entry_name: &str,
+) -> Result<bool, FileControlError> {
+    let directory = normalize_remote_path(directory)?;
+    let entry_path = normalize_remote_path(entry_path)?;
+    let directory_windows = is_windows_remote_path(&directory);
+    if directory_windows != is_windows_remote_path(&entry_path) {
+        return Ok(false);
+    }
+    let Some((parent, basename)) = remote_parent_and_basename(&entry_path, directory_windows)
+    else {
+        return Ok(false);
+    };
+    if basename.is_empty() || entry_name.is_empty() {
+        return Ok(false);
+    }
+    let parent_matches = if directory_windows {
+        parent.eq_ignore_ascii_case(&directory)
+    } else {
+        parent == directory
+    };
+    Ok(parent_matches && basename == entry_name)
+}
+
+fn is_windows_remote_path(path: &str) -> bool {
+    path.starts_with(r"\\")
+        || (path.len() >= 3
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[1] == b':'
+            && path.as_bytes()[2] == b'\\')
+}
+
+fn remote_parent_and_basename(path: &str, windows: bool) -> Option<(&str, &str)> {
+    if !windows {
+        let separator = path.rfind('/')?;
+        let parent = if separator == 0 {
+            "/"
+        } else {
+            &path[..separator]
+        };
+        return Some((parent, &path[separator + 1..]));
+    }
+
+    let root_len = windows_root_len(path)?;
+    let separator = path.rfind('\\')?;
+    if separator < root_len.saturating_sub(1) || separator + 1 >= path.len() {
+        return None;
+    }
+    let parent = if separator < root_len {
+        &path[..root_len]
+    } else {
+        &path[..separator]
+    };
+    Some((parent, &path[separator + 1..]))
+}
+
+fn windows_root_len(path: &str) -> Option<usize> {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        return Some(3);
+    }
+    let tail = path.strip_prefix(r"\\")?;
+    let server_end = tail.find('\\')?;
+    let share = &tail[server_end + 1..];
+    let share_end = share.find('\\').unwrap_or(share.len());
+    Some(2 + server_end + 1 + share_end)
 }
 
 fn normalize_components(
@@ -212,7 +289,7 @@ pub struct CallbackCapabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::{CallbackCapabilities, normalize_remote_path};
+    use super::{CallbackCapabilities, normalize_remote_path, remote_path_is_immediate_child};
 
     #[test]
     fn legacy_capabilities_default_to_disabled() {
@@ -246,6 +323,38 @@ mod tests {
     fn control_remote_path_normalization_rejects_relative_empty_and_nul_paths() {
         for path in ["", "relative/path", "bad\0path", r"C:relative"] {
             assert!(normalize_remote_path(path).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn immediate_remote_children_are_root_and_platform_aware() {
+        for (directory, path, name) in [
+            ("/", "/child", "child"),
+            ("/srv/files", "/srv/files/report.txt", "report.txt"),
+            (r"C:\", r"C:\child", "child"),
+            (r"C:\Temp", r"c:\Temp\report.txt", "report.txt"),
+            (
+                r"\\server\share",
+                r"\\SERVER\SHARE\report.txt",
+                "report.txt",
+            ),
+        ] {
+            assert!(remote_path_is_immediate_child(directory, path, name).unwrap());
+        }
+
+        for (directory, path, name) in [
+            ("/", "/", ""),
+            ("/srv/files", "/srv/files/nested/report.txt", "report.txt"),
+            ("/srv/files", "/srv/other/report.txt", "report.txt"),
+            ("/srv/files", "/srv/files/report.txt", "other.txt"),
+            (r"C:\Temp", r"C:\Temp\nested\report.txt", "report.txt"),
+            (
+                r"\\server\share",
+                r"\\server\other\report.txt",
+                "report.txt",
+            ),
+        ] {
+            assert!(!remote_path_is_immediate_child(directory, path, name).unwrap());
         }
     }
 }

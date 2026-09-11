@@ -5,8 +5,8 @@ use std::{
 };
 
 use nw_profile::control::{
-    ControlError, FileControlError, FileEntry, FileListV1, FileMutationV1, ProcessEntry,
-    ProcessListV1,
+    ControlError, FileControlError, FileEntry, FileListV1, FileMutationV1, MAX_FILE_LIST_ENTRIES,
+    ProcessEntry, ProcessListV1,
 };
 use nw_profile::msgs::Task;
 use std::fs;
@@ -209,9 +209,10 @@ fn filesystem_list_and_stat_report_absolute_utf8_and_size_fields() {
 #[test]
 fn filesystem_mutations_stay_within_the_exact_temporary_fixture_subtree() {
     let tree = tempfile::tempdir().expect("fresh filesystem fixture");
-    let source = tree.path().join("source");
-    let moved = tree.path().join("moved");
-    let sibling = tree.path().join("sibling-marker.txt");
+    let fixture_root = tree.path().canonicalize().unwrap();
+    let source = fixture_root.join("source");
+    let moved = fixture_root.join("moved");
+    let sibling = fixture_root.join("sibling-marker.txt");
     let nested = source.join("nested.txt");
     fs::write(&sibling, b"keep").expect("sibling marker");
 
@@ -235,7 +236,7 @@ fn filesystem_mutations_stay_within_the_exact_temporary_fixture_subtree() {
         .expect("recursive delete exact fixture subtree");
 
     assert!(!moved.exists());
-    assert!(tree.path().exists(), "temporary fixture root must remain");
+    assert!(fixture_root.exists(), "temporary fixture root must remain");
     assert_eq!(fs::read(&sibling).unwrap(), b"keep");
 }
 
@@ -254,6 +255,168 @@ fn filesystem_move_refuses_to_replace_an_existing_temporary_destination() {
     assert_eq!(error, FileControlError::AlreadyExists);
     assert_eq!(fs::read(&source).unwrap(), b"source");
     assert_eq!(fs::read(&destination).unwrap(), b"destination");
+}
+
+#[test]
+fn filesystem_concurrent_moves_never_replace_the_winning_destination() {
+    use std::sync::{Arc, Barrier};
+
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let contender_count = 32;
+    let barrier = Arc::new(Barrier::new(contender_count));
+    let destination = tree.path().join("destination.txt");
+    let mut contenders = Vec::new();
+    for index in 0..contender_count {
+        let source = tree.path().join(format!("source-{index}.txt"));
+        let contents = format!("source-{index}");
+        fs::write(&source, &contents).unwrap();
+        let barrier = Arc::clone(&barrier);
+        let destination = destination.clone();
+        contenders.push(thread::spawn(move || {
+            barrier.wait();
+            (
+                index,
+                source.clone(),
+                nw_implant::filesystem::move_path(
+                    source.to_str().unwrap(),
+                    destination.to_str().unwrap(),
+                ),
+            )
+        }));
+    }
+
+    let outcomes = contenders
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    let winners = outcomes
+        .iter()
+        .filter(|(_, _, result)| result.is_ok())
+        .collect::<Vec<_>>();
+    assert_eq!(winners.len(), 1, "exactly one no-replace move may win");
+    let winning_index = winners[0].0;
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        format!("source-{winning_index}")
+    );
+    for (index, source, result) in outcomes {
+        if index == winning_index {
+            assert!(!source.exists());
+        } else {
+            assert_eq!(result.unwrap_err(), FileControlError::AlreadyExists);
+            assert_eq!(
+                fs::read_to_string(source).unwrap(),
+                format!("source-{index}")
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_delete_rejects_symlink_ancestors_and_preserves_outside_sentinel() {
+    use std::os::unix::fs::symlink;
+
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let fixture_root = tree.path().canonicalize().unwrap();
+    let fixture = fixture_root.join("fixture");
+    let outside = fixture_root.join("outside");
+    fs::create_dir(&fixture).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let sentinel = outside.join("sentinel.txt");
+    let recursive_directory = outside.join("recursive-directory");
+    fs::create_dir(&recursive_directory).unwrap();
+    let recursive_sentinel = recursive_directory.join("sentinel.txt");
+    fs::write(&sentinel, b"keep").unwrap();
+    fs::write(&recursive_sentinel, b"keep-recursive").unwrap();
+    let link = fixture.join("escape");
+    symlink(&outside, &link).unwrap();
+
+    let error = nw_implant::filesystem::delete(link.join("sentinel.txt").to_str().unwrap(), false)
+        .expect_err("symlink ancestor must be rejected for nonrecursive delete");
+    assert_eq!(error, FileControlError::InvalidPath);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+
+    let error =
+        nw_implant::filesystem::delete(link.join("recursive-directory").to_str().unwrap(), true)
+            .expect_err("symlink ancestor must be rejected for recursive delete");
+    assert_eq!(error, FileControlError::InvalidPath);
+    assert_eq!(fs::read(&recursive_sentinel).unwrap(), b"keep-recursive");
+
+    let target_error = nw_implant::filesystem::delete(link.to_str().unwrap(), true)
+        .expect_err("target symlinks have explicit reject semantics");
+    assert_eq!(target_error, FileControlError::InvalidPath);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+}
+
+#[cfg(windows)]
+#[test]
+fn filesystem_delete_rejects_windows_reparse_ancestors() {
+    use std::{io::ErrorKind, os::windows::fs::symlink_dir};
+
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let fixture_root = tree.path().canonicalize().unwrap();
+    let fixture = fixture_root.join("fixture");
+    let outside = fixture_root.join("outside");
+    fs::create_dir(&fixture).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let sentinel = outside.join("sentinel.txt");
+    fs::write(&sentinel, b"keep").unwrap();
+    let link = fixture.join("escape");
+    if let Err(error) = symlink_dir(&outside, &link) {
+        if error.kind() == ErrorKind::PermissionDenied {
+            return;
+        }
+        panic!("failed to construct reparse fixture: {error}");
+    }
+
+    for recursive in [false, true] {
+        let target = link.join("sentinel.txt");
+        assert_eq!(
+            nw_implant::filesystem::delete(target.to_str().unwrap(), recursive).unwrap_err(),
+            FileControlError::InvalidPath
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+    }
+}
+
+#[test]
+fn filesystem_maps_not_a_directory_and_overlong_names_to_invalid_path() {
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let file = tree.path().join("plain-file");
+    fs::write(&file, b"fixture").unwrap();
+    let not_a_directory = file.join("child");
+    assert_eq!(
+        nw_implant::filesystem::stat(not_a_directory.to_str().unwrap()).unwrap_err(),
+        FileControlError::InvalidPath
+    );
+
+    let overlong = tree.path().join("x".repeat(1024));
+    assert_eq!(
+        nw_implant::filesystem::stat(overlong.to_str().unwrap()).unwrap_err(),
+        FileControlError::InvalidPath
+    );
+}
+
+#[test]
+fn filesystem_list_is_bounded_at_the_contract_limit() {
+    let tree = tempfile::tempdir().expect("fresh filesystem fixture");
+    let directory = tree.path().join("bounded");
+    fs::create_dir(&directory).unwrap();
+    for index in 0..MAX_FILE_LIST_ENTRIES {
+        fs::write(directory.join(format!("entry-{index:05}")), []).unwrap();
+    }
+    assert_eq!(
+        nw_implant::filesystem::list(directory.to_str().unwrap())
+            .unwrap()
+            .entries
+            .len(),
+        MAX_FILE_LIST_ENTRIES
+    );
+    fs::write(directory.join("one-too-many"), []).unwrap();
+    let error = nw_implant::filesystem::list(directory.to_str().unwrap()).unwrap_err();
+    assert_eq!(error, FileControlError::ResultTooLarge);
+    assert_eq!(error.code(), "result_too_large");
 }
 
 #[test]

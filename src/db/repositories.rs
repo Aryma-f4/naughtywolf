@@ -1116,26 +1116,54 @@ impl Repository {
                 .map_err(|_| {
                     AppError::Validation("invalid filesystem list task path".to_owned())
                 })?;
-            let mut snapshot: nw_profile::control::FileListV1 = serde_json::from_slice(stdout)
+            let raw: serde_json::Value = serde_json::from_slice(stdout)
                 .map_err(|_| AppError::Validation("invalid filesystem list result".to_owned()))?;
-            let result_path =
-                nw_profile::control::normalize_remote_path(&snapshot.path).map_err(|_| {
-                    AppError::Validation("invalid filesystem list result path".to_owned())
+            let schema = raw
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    AppError::Validation("invalid filesystem list result schema".to_owned())
                 })?;
-            if snapshot.schema != nw_profile::control::FILE_LIST_SCHEMA_V1
-                || result_path != requested_path
-                || chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at).is_err()
-                || snapshot
-                    .entries
-                    .iter()
-                    .any(|entry| nw_profile::control::normalize_remote_path(&entry.path).is_err())
-            {
-                return Err(AppError::Validation(
-                    "invalid filesystem list result schema, path, or capture time".to_owned(),
-                ));
+            if schema != nw_profile::control::FILE_LIST_SCHEMA_V1 {
+                None
+            } else {
+                let mut snapshot: nw_profile::control::FileListV1 = serde_json::from_value(raw)
+                    .map_err(|_| {
+                        AppError::Validation("invalid filesystem list result".to_owned())
+                    })?;
+                let result_path = nw_profile::control::normalize_remote_path(&snapshot.path)
+                    .map_err(|_| {
+                        AppError::Validation("invalid filesystem list result path".to_owned())
+                    })?;
+                if result_path != requested_path
+                    || chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at).is_err()
+                    || snapshot.entries.len() > nw_profile::control::MAX_FILE_LIST_ENTRIES
+                {
+                    return Err(AppError::Validation(
+                        "invalid filesystem list result schema, path, or capture time".to_owned(),
+                    ));
+                }
+                for entry in &mut snapshot.entries {
+                    let entry_path = nw_profile::control::normalize_remote_path(&entry.path)
+                        .map_err(|_| {
+                            AppError::Validation("invalid filesystem list result entry".to_owned())
+                        })?;
+                    if !nw_profile::control::remote_path_is_immediate_child(
+                        &requested_path,
+                        &entry_path,
+                        &entry.name,
+                    )
+                    .unwrap_or(false)
+                    {
+                        return Err(AppError::Validation(
+                            "invalid filesystem list result entry".to_owned(),
+                        ));
+                    }
+                    entry.path = entry_path;
+                }
+                snapshot.path = requested_path.clone();
+                Some((requested_path, snapshot))
             }
-            snapshot.path = requested_path.clone();
-            Some((requested_path, snapshot))
         } else {
             None
         };
@@ -1145,70 +1173,87 @@ impl Repository {
                 "nw/fs-mkdir" | "nw/fs-move" | "nw/fs-delete"
             )
         {
-            let result: nw_profile::control::FileMutationV1 = serde_json::from_slice(stdout)
-                .map_err(|_| {
-                    AppError::Validation("invalid filesystem mutation result".to_owned())
-                })?;
-            let values = arguments.as_array().ok_or_else(|| {
-                AppError::Validation("invalid filesystem mutation task".to_owned())
+            let raw: serde_json::Value = serde_json::from_slice(stdout).map_err(|_| {
+                AppError::Validation("invalid filesystem mutation result".to_owned())
             })?;
-            let expected = match (command.as_str(), values.as_slice()) {
-                ("nw/fs-mkdir", [path]) => Some(("mkdir", path.as_str(), None, false)),
-                ("nw/fs-move", [source, destination]) => {
-                    Some(("move", source.as_str(), destination.as_str(), false))
-                }
-                ("nw/fs-delete", [path, recursive])
-                    if matches!(recursive.as_str(), Some("false" | "true")) =>
-                {
-                    Some((
-                        "delete",
-                        path.as_str(),
-                        None,
-                        recursive.as_str() == Some("true"),
-                    ))
-                }
-                _ => None,
-            }
-            .ok_or_else(|| AppError::Validation("invalid filesystem mutation task".to_owned()))?;
-            let expected_path = expected
-                .1
-                .ok_or_else(|| AppError::Validation("invalid filesystem mutation task".to_owned()))
-                .and_then(|path| {
-                    nw_profile::control::normalize_remote_path(path).map_err(|_| {
-                        AppError::Validation("invalid filesystem mutation task".to_owned())
-                    })
-                })?;
-            let result_path =
-                nw_profile::control::normalize_remote_path(&result.path).map_err(|_| {
+            let schema = raw
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
                     AppError::Validation("invalid filesystem mutation result".to_owned())
                 })?;
-            let expected_destination = expected
-                .2
-                .map(|path| {
-                    nw_profile::control::normalize_remote_path(path).map_err(|_| {
+            if schema != nw_profile::control::FILE_MUTATION_SCHEMA_V1 {
+                // Future filesystem schemas remain available as immutable raw
+                // task results, but are not trusted for typed projection.
+            } else {
+                let result: nw_profile::control::FileMutationV1 = serde_json::from_value(raw)
+                    .map_err(|_| {
+                        AppError::Validation("invalid filesystem mutation result".to_owned())
+                    })?;
+                let values = arguments.as_array().ok_or_else(|| {
+                    AppError::Validation("invalid filesystem mutation task".to_owned())
+                })?;
+                let expected = match (command.as_str(), values.as_slice()) {
+                    ("nw/fs-mkdir", [path]) => Some(("mkdir", path.as_str(), None, false)),
+                    ("nw/fs-move", [source, destination]) => {
+                        Some(("move", source.as_str(), destination.as_str(), false))
+                    }
+                    ("nw/fs-delete", [path, recursive])
+                        if matches!(recursive.as_str(), Some("false" | "true")) =>
+                    {
+                        Some((
+                            "delete",
+                            path.as_str(),
+                            None,
+                            recursive.as_str() == Some("true"),
+                        ))
+                    }
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    AppError::Validation("invalid filesystem mutation task".to_owned())
+                })?;
+                let expected_path = expected
+                    .1
+                    .ok_or_else(|| {
                         AppError::Validation("invalid filesystem mutation task".to_owned())
                     })
-                })
-                .transpose()?;
-            let result_destination = result
-                .destination
-                .as_deref()
-                .map(|path| {
-                    nw_profile::control::normalize_remote_path(path).map_err(|_| {
+                    .and_then(|path| {
+                        nw_profile::control::normalize_remote_path(path).map_err(|_| {
+                            AppError::Validation("invalid filesystem mutation task".to_owned())
+                        })
+                    })?;
+                let result_path = nw_profile::control::normalize_remote_path(&result.path)
+                    .map_err(|_| {
                         AppError::Validation("invalid filesystem mutation result".to_owned())
+                    })?;
+                let expected_destination = expected
+                    .2
+                    .map(|path| {
+                        nw_profile::control::normalize_remote_path(path).map_err(|_| {
+                            AppError::Validation("invalid filesystem mutation task".to_owned())
+                        })
                     })
-                })
-                .transpose()?;
-            if result.schema != nw_profile::control::FILE_MUTATION_SCHEMA_V1
-                || result.action != expected.0
-                || result_path != expected_path
-                || result_destination != expected_destination
-                || result.recursive != expected.3
-                || chrono::DateTime::parse_from_rfc3339(&result.completed_at).is_err()
-            {
-                return Err(AppError::Validation(
-                    "invalid filesystem mutation result".to_owned(),
-                ));
+                    .transpose()?;
+                let result_destination = result
+                    .destination
+                    .as_deref()
+                    .map(|path| {
+                        nw_profile::control::normalize_remote_path(path).map_err(|_| {
+                            AppError::Validation("invalid filesystem mutation result".to_owned())
+                        })
+                    })
+                    .transpose()?;
+                if result.action != expected.0
+                    || result_path != expected_path
+                    || result_destination != expected_destination
+                    || result.recursive != expected.3
+                    || chrono::DateTime::parse_from_rfc3339(&result.completed_at).is_err()
+                {
+                    return Err(AppError::Validation(
+                        "invalid filesystem mutation result".to_owned(),
+                    ));
+                }
             }
         }
         let process_kill = if ok && command == "nw/process-kill" {
