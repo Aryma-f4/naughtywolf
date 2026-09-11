@@ -2,7 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use nw_profile::msgs::{FileAck, FileChunk};
@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub const DEFAULT_MAX_TRANSFER_BYTES: u64 = 268_435_456;
+pub const DEFAULT_TRANSFER_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const CHUNK_BYTES: u64 = 1024;
 
 /// Public transfer status; `storage_key` remains an internal implementation detail.
@@ -96,17 +97,25 @@ impl From<AppError> for TransferError {
 pub struct TransferStore {
     repository: Repository,
     root: PathBuf,
+    root_dir: Arc<RootHandle>,
     max_bytes: u64,
-    locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    retention_secs: u64,
+    locks: Arc<std::sync::Mutex<std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 pub struct UploadStage {
     file: Option<File>,
-    part_path: PathBuf,
+    root_dir: Arc<RootHandle>,
     storage_key: String,
     bytes: u64,
     max_bytes: u64,
     hasher: Sha256,
+}
+
+struct RootHandle {
+    file: File,
+    #[cfg(not(unix))]
+    path: PathBuf,
 }
 
 impl UploadStage {
@@ -136,7 +145,7 @@ impl UploadStage {
 impl Drop for UploadStage {
     fn drop(&mut self) {
         if self.file.is_some() {
-            let _ = std::fs::remove_file(&self.part_path);
+            let _ = unlink_relative(&self.root_dir, &format!("{}.part", self.storage_key));
         }
     }
 }
@@ -146,7 +155,12 @@ impl TransferStore {
         repository: Repository,
         config: &crate::config::Config,
     ) -> Result<Self, TransferError> {
-        Self::new(repository, &config.evidence_dir, config.max_transfer_bytes)
+        Self::new_with_retention(
+            repository,
+            &config.evidence_dir,
+            config.max_transfer_bytes,
+            config.transfer_retention_secs,
+        )
     }
 
     pub fn max_bytes(&self) -> u64 {
@@ -156,6 +170,20 @@ impl TransferStore {
         repository: Repository,
         evidence_root: impl AsRef<Path>,
         max_bytes: u64,
+    ) -> Result<Self, TransferError> {
+        Self::new_with_retention(
+            repository,
+            evidence_root,
+            max_bytes,
+            DEFAULT_TRANSFER_RETENTION_SECS,
+        )
+    }
+
+    pub fn new_with_retention(
+        repository: Repository,
+        evidence_root: impl AsRef<Path>,
+        max_bytes: u64,
+        retention_secs: u64,
     ) -> Result<Self, TransferError> {
         let evidence_root = evidence_root.as_ref();
         if evidence_root.exists()
@@ -182,10 +210,13 @@ impl TransferStore {
         if !root.is_dir() || max_bytes == 0 || max_bytes > i64::MAX as u64 {
             return Err(TransferError::UnsafeStorage);
         }
+        let root_dir = Arc::new(open_directory(&root)?);
         Ok(Self {
             repository,
             root,
+            root_dir,
             max_bytes,
+            retention_secs,
             locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
@@ -198,7 +229,11 @@ impl TransferStore {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_MAX_TRANSFER_BYTES);
-        Self::new(repository, evidence_root, max_bytes)
+        let retention_secs = std::env::var("NAUGHTYWOLF_TRANSFER_RETENTION_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TRANSFER_RETENTION_SECS);
+        Self::new_with_retention(repository, evidence_root, max_bytes, retention_secs)
     }
 
     pub async fn queue_download(
@@ -238,17 +273,12 @@ impl TransferStore {
 
     pub fn begin_upload_stage(&self) -> Result<UploadStage, TransferError> {
         let storage_key = Uuid::new_v4().simple().to_string();
-        let part_path = self.safe_path(&format!("{storage_key}.part"))?;
-        let file = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create_new(true)
-            .open(&part_path)
-            .map_err(|_| TransferError::Storage)?;
-        sync_directory(&self.root)?;
+        self.safe_path(&format!("{storage_key}.part"))?;
+        let file = create_new_relative(&self.root_dir, &format!("{storage_key}.part"))?;
+        sync_directory_handle(&self.root_dir)?;
         Ok(UploadStage {
             file: Some(file),
-            part_path,
+            root_dir: self.root_dir.clone(),
             storage_key,
             bytes: 0,
             max_bytes: self.max_bytes,
@@ -267,9 +297,12 @@ impl TransferStore {
         let file = stage.file.take().ok_or(TransferError::Storage)?;
         file.sync_all().map_err(|_| TransferError::Storage)?;
         drop(file);
-        let completed = self.safe_path(&stage.storage_key)?;
-        publish_no_replace(&stage.part_path, &completed)?;
-        sync_directory(&self.root)?;
+        publish_no_replace_at(
+            &stage.root_dir,
+            &format!("{}.part", stage.storage_key),
+            &stage.storage_key,
+        )?;
+        sync_directory_handle(&stage.root_dir)?;
         let sha256 = hex::encode(stage.hasher.clone().finalize());
         let transfer_id = Uuid::new_v4().to_string();
         self.repository
@@ -299,6 +332,8 @@ impl TransferStore {
     /// queued or active transfer. This is safe to run at every server start.
     pub async fn cleanup_orphans(&self) -> Result<(), TransferError> {
         let transfers = self.repository.list_all_file_transfers().await?;
+        self.cleanup_expired(&transfers).await?;
+        let transfers = self.repository.list_all_file_transfers().await?;
         let active_ids: std::collections::HashSet<_> = transfers
             .iter()
             .filter(|transfer| matches!(transfer.status.as_str(), "queued" | "active"))
@@ -307,7 +342,7 @@ impl TransferStore {
         self.locks
             .lock()
             .expect("transfer lock map poisoned")
-            .retain(|id, _| active_ids.contains(id));
+            .retain(|id, lock| active_ids.contains(id) && lock.upgrade().is_some());
         let live: std::collections::HashSet<_> = transfers
             .iter()
             .filter(|transfer| matches!(transfer.status.as_str(), "queued" | "active"))
@@ -318,25 +353,71 @@ impl TransferStore {
                 ]
             })
             .collect();
-        let retained_downloads: std::collections::HashSet<_> = transfers
+        let retained_completed: std::collections::HashSet<_> = transfers
             .iter()
-            .filter(|transfer| transfer.direction == "download" && transfer.status == "completed")
+            .filter(|transfer| transfer.status == "completed")
             .map(|transfer| transfer.storage_key.clone())
             .collect();
         let entries = std::fs::read_dir(&self.root).map_err(|_| TransferError::Storage)?;
         for entry in entries {
             let entry = entry.map_err(|_| TransferError::Storage)?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !live.contains(&name) && !retained_downloads.contains(&name) {
-                let path = self.safe_path(&name)?;
-                let metadata =
-                    std::fs::symlink_metadata(&path).map_err(|_| TransferError::Storage)?;
-                if metadata.file_type().is_file() {
-                    std::fs::remove_file(path).map_err(|_| TransferError::Storage)?;
+            if !live.contains(&name) && !retained_completed.contains(&name) {
+                if let Ok(file) = open_existing_regular_at(&self.root_dir, &name, false) {
+                    drop(file);
+                    unlink_relative(&self.root_dir, &name)?;
                 }
             }
         }
-        sync_directory(&self.root)
+        sync_directory_handle(&self.root_dir)
+    }
+
+    async fn cleanup_expired(&self, transfers: &[FileTransfer]) -> Result<(), TransferError> {
+        let now = chrono::Utc::now();
+        for transfer in transfers {
+            if !matches!(
+                transfer.status.as_str(),
+                "completed" | "error" | "cancelled"
+            ) {
+                continue;
+            }
+            let stamp = transfer
+                .completed_at
+                .as_deref()
+                .unwrap_or(&transfer.updated_at);
+            let expired = chrono::DateTime::parse_from_rfc3339(stamp)
+                .ok()
+                .map(|value| {
+                    let age = now
+                        .signed_duration_since(value.with_timezone(&chrono::Utc))
+                        .num_seconds();
+                    age >= 0 && (age as u64) >= self.retention_secs
+                })
+                .unwrap_or(false);
+            if !expired {
+                continue;
+            }
+            let lease = self.acquire_lease(&transfer.id).await?;
+            for name in [
+                transfer.storage_key.clone(),
+                format!("{}.part", transfer.storage_key),
+            ] {
+                let path = self.safe_path(&name)?;
+                if std::fs::symlink_metadata(&path)
+                    .map(|metadata| metadata.file_type().is_file())
+                    .unwrap_or(false)
+                {
+                    std::fs::remove_file(path).map_err(|_| TransferError::Storage)?;
+                }
+            }
+            sqlx::query("DELETE FROM c2_file_transfers WHERE id = ? AND status IN ('completed','error','cancelled')")
+                .bind(&transfer.id)
+                .execute(&self.repository.pool)
+                .await
+                .map_err(|_| TransferError::Repository)?;
+            self.release_lease(&transfer.id, &lease).await?;
+        }
+        Ok(())
     }
 
     pub async fn receive_chunk(
@@ -347,6 +428,20 @@ impl TransferStore {
         let transfer_id = chunk.transfer_id.ok_or(TransferError::MissingProtocolId)?;
         let lock = self.lock_for(&transfer_id.to_string());
         let _guard = lock.lock().await;
+        let lease = self.acquire_lease(&transfer_id.to_string()).await?;
+        let result = self
+            .receive_chunk_inner(session_id, chunk, transfer_id)
+            .await;
+        self.release_lease(&transfer_id.to_string(), &lease).await?;
+        result
+    }
+
+    async fn receive_chunk_inner(
+        &self,
+        session_id: &str,
+        chunk: &FileChunk,
+        transfer_id: Uuid,
+    ) -> Result<FileAck, TransferError> {
         let task_id = chunk.task_id.ok_or(TransferError::MissingProtocolId)?;
         let Some(mut transfer) = self
             .repository
@@ -372,8 +467,7 @@ impl TransferStore {
             if chunk.total != total || end > total {
                 return Err(TransferError::TotalMismatch);
             }
-            let completed = self.safe_path(&transfer.storage_key)?;
-            let mut file = open_existing_regular(&completed)?;
+            let mut file = open_existing_regular_at(&self.root_dir, &transfer.storage_key, false)?;
             file.seek(SeekFrom::Start(chunk.offset))
                 .map_err(|_| TransferError::Storage)?;
             let mut persisted = vec![0; chunk.data.len()];
@@ -431,12 +525,13 @@ impl TransferStore {
         }
         let received =
             u64::try_from(transfer.received_bytes).map_err(|_| TransferError::Repository)?;
-        let part = self.safe_path(&format!("{}.part", transfer.storage_key))?;
-        let completed = self.safe_path(&transfer.storage_key)?;
+        let part_name = format!("{}.part", transfer.storage_key);
+        let completed_name = transfer.storage_key.clone();
         if reconcile_completed_download(
             &self.repository,
             &mut transfer,
-            &completed,
+            &self.root_dir,
+            &completed_name,
             chunk.total,
             self.max_bytes,
         )
@@ -463,7 +558,7 @@ impl TransferStore {
             if end > received {
                 return Err(TransferError::DuplicateMismatch);
             }
-            let mut file = open_existing_regular(&part)?;
+            let mut file = open_existing_regular_at(&self.root_dir, &part_name, true)?;
             file.seek(SeekFrom::Start(chunk.offset))
                 .map_err(|_| TransferError::Storage)?;
             let mut persisted = vec![0; chunk.data.len()];
@@ -480,19 +575,25 @@ impl TransferStore {
             });
         }
 
-        let mut file = if received == 0 && !part.exists() {
-            OpenOptions::new()
-                .write(true)
-                .read(true)
-                .create_new(true)
-                .open(&part)
-                .map_err(|_| TransferError::Storage)?
+        let mut file = if received == 0 {
+            match create_new_relative(&self.root_dir, &part_name) {
+                Ok(file) => file,
+                Err(TransferError::Storage) => {
+                    open_existing_regular_at(&self.root_dir, &part_name, true)?
+                }
+                Err(error) => return Err(error),
+            }
         } else {
-            open_existing_regular(&part)?
+            open_existing_regular_at(&self.root_dir, &part_name, true)?
         };
         let metadata = file.metadata().map_err(|_| TransferError::Storage)?;
         if !metadata.file_type().is_file() {
             return Err(TransferError::UnsafeStorage);
+        }
+        if metadata.len() != received {
+            self.fail(&transfer.id, "transfer staging prefix is inconsistent")
+                .await?;
+            return Err(TransferError::Storage);
         }
         file.set_len(received).map_err(|_| TransferError::Storage)?;
         file.seek(SeekFrom::Start(received))
@@ -500,7 +601,7 @@ impl TransferStore {
         file.write_all(&chunk.data)
             .map_err(|_| TransferError::Storage)?;
         file.sync_all().map_err(|_| TransferError::Storage)?;
-        sync_directory(&self.root)?;
+        sync_directory_handle(&self.root_dir)?;
         let next = received
             .checked_add(chunk.data.len() as u64)
             .ok_or(TransferError::TotalMismatch)?;
@@ -516,7 +617,8 @@ impl TransferStore {
         }
 
         if next == chunk.total {
-            let digest = sha256_file(&part)?;
+            let mut verify = open_existing_regular_at(&self.root_dir, &part_name, false)?;
+            let digest = sha256_open_file(&mut verify)?;
             if transfer
                 .sha256
                 .as_deref()
@@ -525,15 +627,20 @@ impl TransferStore {
                 self.fail(&transfer.id, "SHA-256 mismatch").await?;
                 return Err(TransferError::ChecksumMismatch);
             }
-            publish_no_replace(&part, &completed)?;
-            sync_directory(&self.root)?;
-            sqlx::query("UPDATE c2_file_transfers SET received_bytes = ?, sha256 = ?, status = 'completed', error = NULL, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+            publish_no_replace_at(&self.root_dir, &part_name, &transfer.storage_key)?;
+            sync_directory_handle(&self.root_dir)?;
+            let verified = sqlx::query("UPDATE c2_file_transfers SET received_bytes = ?, sha256 = ?, error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status = 'active'")
                 .bind(next as i64)
                 .bind(&digest)
                 .bind(&transfer.id)
                 .execute(&self.repository.pool)
                 .await
                 .map_err(|_| TransferError::Repository)?;
+            if verified.rows_affected() != 1 {
+                return Err(TransferError::Repository);
+            }
+            transfer.received_bytes = next as i64;
+            transfer.sha256 = Some(digest.clone());
             return Ok(FileAck {
                 transfer_id: Some(transfer_id),
                 received: next,
@@ -556,8 +663,7 @@ impl TransferStore {
         {
             return Err(TransferError::NotDownloadable);
         }
-        let path = self.safe_path(&transfer.storage_key)?;
-        let mut file = open_existing_regular(&path)?;
+        let mut file = open_existing_regular_at(&self.root_dir, &transfer.storage_key, false)?;
         let metadata = file.metadata().map_err(|_| TransferError::Storage)?;
         let expected_size = transfer
             .expected_size
@@ -587,8 +693,7 @@ impl TransferStore {
         {
             return Err(TransferError::NotDownloadable);
         }
-        let path = self.safe_path(&transfer.storage_key)?;
-        let mut file = open_existing_regular(&path)?;
+        let mut file = open_existing_regular_at(&self.root_dir, &transfer.storage_key, false)?;
         let metadata = file.metadata().map_err(|_| TransferError::Storage)?;
         let expected_size = transfer
             .expected_size
@@ -613,7 +718,7 @@ impl TransferStore {
         session_id: &str,
         budget: usize,
     ) -> Result<Vec<FileChunk>, TransferError> {
-        let Some(mut transfer) = self
+        let Some(transfer) = self
             .repository
             .next_file_transfer(session_id, "upload")
             .await?
@@ -622,6 +727,21 @@ impl TransferStore {
         };
         let lock = self.lock_for(&transfer.id);
         let _guard = lock.lock().await;
+        let lease = self.acquire_lease(&transfer.id).await?;
+        let transfer_id = transfer.id.clone();
+        let result = self
+            .next_upload_chunks_inner(session_id, budget, transfer)
+            .await;
+        self.release_lease(&transfer_id, &lease).await?;
+        result
+    }
+
+    async fn next_upload_chunks_inner(
+        &self,
+        _session_id: &str,
+        budget: usize,
+        mut transfer: FileTransfer,
+    ) -> Result<Vec<FileChunk>, TransferError> {
         self.activate_if_next(&mut transfer, "upload").await?;
         if transfer.status != "active" || budget == 0 {
             return Ok(Vec::new());
@@ -649,8 +769,7 @@ impl TransferStore {
         }
         let offset =
             u64::try_from(transfer.received_bytes).map_err(|_| TransferError::Repository)?;
-        let path = self.safe_path(&transfer.storage_key)?;
-        let mut file = open_existing_regular(&path)?;
+        let mut file = open_existing_regular_at(&self.root_dir, &transfer.storage_key, false)?;
         let mut chunks = Vec::new();
         let mut cursor = offset;
         let mut remaining = budget as u64;
@@ -683,6 +802,18 @@ impl TransferStore {
         let id = ack.transfer_id.ok_or(TransferError::MissingProtocolId)?;
         let lock = self.lock_for(&id.to_string());
         let _guard = lock.lock().await;
+        let lease = self.acquire_lease(&id.to_string()).await?;
+        let result = self.ack_upload_inner(session_id, ack, id).await;
+        self.release_lease(&id.to_string(), &lease).await?;
+        result
+    }
+
+    async fn ack_upload_inner(
+        &self,
+        session_id: &str,
+        ack: &FileAck,
+        id: Uuid,
+    ) -> Result<FileAck, TransferError> {
         let Some(transfer) = self
             .repository
             .file_transfer_for_session(session_id, &id.to_string())
@@ -718,7 +849,10 @@ impl TransferStore {
         if ack.received < current {
             return Ok(*ack);
         }
-        let status = if ack.done { "completed" } else { "active" };
+        // A terminal receiver ACK only proves that the bytes reached its
+        // transfer-specific staging file. The implant publishes and confirms
+        // the destination via its task result, so keep this provisional.
+        let status = "active";
         let update = sqlx::query("UPDATE c2_file_transfers SET received_bytes = ?, status = ?, completed_at = CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE completed_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND received_bytes = ? AND status = 'active'")
             .bind(ack.received as i64).bind(status).bind(ack.done).bind(&transfer.id)
             .bind(current as i64)
@@ -747,50 +881,82 @@ impl TransferStore {
     }
 
     async fn fail(&self, transfer_id: &str, error: &str) -> Result<(), TransferError> {
-        sqlx::query("UPDATE c2_file_transfers SET status = 'error', error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+        let update = sqlx::query("UPDATE c2_file_transfers SET status = 'error', error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status IN ('queued', 'active')")
             .bind(error).bind(transfer_id).execute(&self.repository.pool).await.map_err(|_| TransferError::Repository)?;
+        if update.rows_affected() != 1 {
+            return Err(TransferError::Repository);
+        }
         Ok(())
     }
 
     fn safe_path(&self, file_name: &str) -> Result<PathBuf, TransferError> {
-        if file_name.is_empty()
-            || file_name.contains(['/', '\\'])
-            || file_name == "."
-            || file_name == ".."
-        {
-            return Err(TransferError::UnsafeStorage);
-        }
-        let path = self.root.join(file_name);
-        let parent = path
-            .parent()
-            .ok_or(TransferError::UnsafeStorage)?
-            .canonicalize()
-            .map_err(|_| TransferError::UnsafeStorage)?;
-        if parent != self.root {
-            return Err(TransferError::UnsafeStorage);
-        }
-        if path.exists() {
-            let metadata =
-                std::fs::symlink_metadata(&path).map_err(|_| TransferError::UnsafeStorage)?;
-            if !metadata.file_type().is_file()
-                || path
-                    .canonicalize()
-                    .ok()
-                    .and_then(|resolved| resolved.parent().map(Path::to_path_buf))
-                    != Some(self.root.clone())
-            {
-                return Err(TransferError::UnsafeStorage);
-            }
-        }
-        Ok(path)
+        validate_component(file_name)?;
+        // This path is retained for UI/tests only. Actual file operations use
+        // the directory handle held at construction, so replacing an ancestor
+        // cannot redirect reads, writes, or publication.
+        Ok(self.root.join(file_name))
     }
 
     fn lock_for(&self, transfer_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.locks.lock().expect("transfer lock map poisoned");
-        locks
-            .entry(transfer_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        if let Some(lock) = locks.get(transfer_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(transfer_id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn acquire_lease(&self, transfer_id: &str) -> Result<String, TransferError> {
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM c2_file_transfers WHERE id = ?")
+                .bind(transfer_id)
+                .fetch_optional(&self.repository.pool)
+                .await
+                .map_err(|_| TransferError::Repository)?;
+        if exists.is_none() {
+            return Err(TransferError::ProtocolMismatch);
+        }
+        let owner = Uuid::new_v4().to_string();
+        for _ in 0..200 {
+            let mut transaction = self
+                .repository
+                .pool
+                .begin()
+                .await
+                .map_err(|_| TransferError::Repository)?;
+            sqlx::query("DELETE FROM c2_transfer_leases WHERE expires_at <= unixepoch()")
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| TransferError::Repository)?;
+            let inserted = sqlx::query(
+                "INSERT OR IGNORE INTO c2_transfer_leases (transfer_id, owner, expires_at) VALUES (?, ?, unixepoch() + 30)",
+            )
+            .bind(transfer_id)
+            .bind(&owner)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| TransferError::Repository)?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| TransferError::Repository)?;
+            if inserted.rows_affected() == 1 {
+                return Ok(owner);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        Err(TransferError::Repository)
+    }
+
+    async fn release_lease(&self, transfer_id: &str, owner: &str) -> Result<(), TransferError> {
+        sqlx::query("DELETE FROM c2_transfer_leases WHERE transfer_id = ? AND owner = ?")
+            .bind(transfer_id)
+            .bind(owner)
+            .execute(&self.repository.pool)
+            .await
+            .map_err(|_| TransferError::Repository)?;
+        Ok(())
     }
 }
 
@@ -801,18 +967,21 @@ fn valid_sha256(value: &str) -> bool {
 async fn reconcile_completed_download(
     repository: &Repository,
     transfer: &mut FileTransfer,
-    completed: &Path,
+    root_dir: &RootHandle,
+    completed_name: &str,
     total: u64,
     max_bytes: u64,
 ) -> Result<bool, TransferError> {
-    if !completed.exists() {
-        return Ok(false);
-    }
-    let metadata = std::fs::symlink_metadata(completed).map_err(|_| TransferError::Storage)?;
+    let mut completed = match open_existing_regular_at(root_dir, completed_name, false) {
+        Ok(file) => file,
+        Err(TransferError::Storage) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let metadata = completed.metadata().map_err(|_| TransferError::Storage)?;
     if !metadata.file_type().is_file() || metadata.len() != total || total > max_bytes {
         return Err(TransferError::UnsafeStorage);
     }
-    let digest = sha256_file(completed)?;
+    let digest = sha256_open_file(&mut completed)?;
     if transfer
         .sha256
         .as_deref()
@@ -820,7 +989,7 @@ async fn reconcile_completed_download(
     {
         return Err(TransferError::ChecksumMismatch);
     }
-    let update = sqlx::query("UPDATE c2_file_transfers SET received_bytes = ?, sha256 = ?, status = 'completed', error = NULL, completed_at = COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status IN ('queued', 'active')")
+    let update = sqlx::query("UPDATE c2_file_transfers SET received_bytes = ?, sha256 = ?, error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status = 'active'")
         .bind(total as i64)
         .bind(&digest)
         .bind(&transfer.id)
@@ -832,50 +1001,205 @@ async fn reconcile_completed_download(
     }
     transfer.received_bytes = total as i64;
     transfer.sha256 = Some(digest);
-    transfer.status = "completed".to_owned();
+    // Artifact publication is provisional until the receiver reports that it
+    // successfully published the destination path.
+    transfer.status = "active".to_owned();
     Ok(true)
 }
 
-fn publish_no_replace(part: &Path, completed: &Path) -> Result<(), TransferError> {
-    // hard_link is an atomic create-without-replace on the local filesystems
-    // supported by the server. Remove the staged name only after publication.
-    let metadata = std::fs::symlink_metadata(part).map_err(|_| TransferError::Storage)?;
-    if !metadata.file_type().is_file() {
-        return Err(TransferError::UnsafeStorage);
-    }
-    std::fs::hard_link(part, completed).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            TransferError::UnsafeStorage
-        } else {
-            TransferError::Storage
+fn publish_no_replace_at(
+    root: &RootHandle,
+    part: &str,
+    completed: &str,
+) -> Result<(), TransferError> {
+    validate_component(part)?;
+    validate_component(completed)?;
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        let part = CString::new(part).map_err(|_| TransferError::UnsafeStorage)?;
+        let completed = CString::new(completed).map_err(|_| TransferError::UnsafeStorage)?;
+        let result = unsafe {
+            libc::linkat(
+                root.file.as_raw_fd(),
+                part.as_ptr(),
+                root.file.as_raw_fd(),
+                completed.as_ptr(),
+                0,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                TransferError::UnsafeStorage
+            } else {
+                TransferError::Storage
+            });
         }
-    })?;
-    std::fs::remove_file(part).map_err(|_| TransferError::Storage)
+        let result = unsafe { libc::unlinkat(root.file.as_raw_fd(), part.as_ptr(), 0) };
+        if result != 0 {
+            return Err(TransferError::Storage);
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let part_path = root_path(root, part)?;
+        let completed_path = root_path(root, completed)?;
+        std::fs::hard_link(part_path, completed_path).map_err(|_| TransferError::Storage)?;
+        std::fs::remove_file(part_path).map_err(|_| TransferError::Storage)
+    }
 }
 
-fn open_existing_regular(path: &Path) -> Result<File, TransferError> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
+fn open_directory(path: &Path) -> Result<RootHandle, TransferError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| TransferError::UnsafeStorage)?;
+        if !file
+            .metadata()
+            .map_err(|_| TransferError::UnsafeStorage)?
+            .file_type()
+            .is_dir()
+        {
+            return Err(TransferError::UnsafeStorage);
+        }
+        Ok(RootHandle {
+            file,
+            #[cfg(not(unix))]
+            path: path.to_path_buf(),
+        })
     }
-    let file = options.open(path).map_err(|_| TransferError::Storage)?;
-    if !file
-        .metadata()
-        .map_err(|_| TransferError::Storage)?
-        .file_type()
-        .is_file()
+    #[cfg(not(unix))]
+    {
+        Ok(RootHandle {
+            file: File::open(path).map_err(|_| TransferError::UnsafeStorage)?,
+            #[cfg(not(unix))]
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+fn create_new_relative(root: &RootHandle, name: &str) -> Result<File, TransferError> {
+    validate_component(name)?;
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let name = CString::new(name).map_err(|_| TransferError::UnsafeStorage)?;
+        let fd = unsafe {
+            libc::openat(
+                root.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(TransferError::Storage);
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata().map_err(|_| TransferError::Storage)?;
+        if !metadata.file_type().is_file() {
+            return Err(TransferError::UnsafeStorage);
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root_path(root, name)?)
+            .map_err(|_| TransferError::Storage)
+    }
+}
+
+fn unlink_relative(root: &RootHandle, name: &str) -> Result<(), TransferError> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        let name = CString::new(name).map_err(|_| TransferError::UnsafeStorage)?;
+        let result = unsafe { libc::unlinkat(root.file.as_raw_fd(), name.as_ptr(), 0) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(TransferError::Storage);
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::remove_file(root_path(root, name)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(TransferError::Storage),
+        }
+    }
+}
+
+fn open_existing_regular_at(
+    root: &RootHandle,
+    name: &str,
+    write: bool,
+) -> Result<File, TransferError> {
+    validate_component(name)?;
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let name = CString::new(name).map_err(|_| TransferError::UnsafeStorage)?;
+        let flags = if write { libc::O_RDWR } else { libc::O_RDONLY } | libc::O_NOFOLLOW;
+        let fd = unsafe { libc::openat(root.file.as_raw_fd(), name.as_ptr(), flags, 0) };
+        if fd < 0 {
+            return Err(TransferError::Storage);
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file
+            .metadata()
+            .map_err(|_| TransferError::Storage)?
+            .file_type()
+            .is_file()
+        {
+            return Err(TransferError::UnsafeStorage);
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut options = OpenOptions::new();
+        options.read(true).write(write);
+        options
+            .open(root_path(root, name)?)
+            .map_err(|_| TransferError::Storage)
+    }
+}
+
+fn validate_component(name: &str) -> Result<(), TransferError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\'])
+        || name.as_bytes().contains(&0)
     {
         return Err(TransferError::UnsafeStorage);
     }
-    Ok(file)
+    Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String, TransferError> {
-    let mut file = open_existing_regular(path)?;
-    sha256_open_file(&mut file)
+#[cfg(not(unix))]
+fn root_path(root: &RootHandle, name: &str) -> Result<PathBuf, TransferError> {
+    validate_component(name)?;
+    Ok(root.path.join(name))
 }
 
 fn sha256_open_file(file: &mut File) -> Result<String, TransferError> {
@@ -895,8 +1219,9 @@ fn sha256_open_file(file: &mut File) -> Result<String, TransferError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn sync_directory(path: &Path) -> Result<(), TransferError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
+fn sync_directory_handle(directory: &RootHandle) -> Result<(), TransferError> {
+    directory
+        .file
+        .sync_all()
         .map_err(|_| TransferError::Storage)
 }

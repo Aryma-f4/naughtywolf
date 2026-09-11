@@ -1106,10 +1106,31 @@ impl Repository {
         &self,
         session_id: &str,
     ) -> Result<Vec<crate::db::models::C2Task>, AppError> {
+        // SQLite can reject a deferred read->write transaction when another
+        // repository instance claims the same pending rows concurrently.
+        // Retry the complete atomic claim so callers observe a normal empty
+        // result instead of a spurious database error.
+        for attempt in 0..8 {
+            match self.tasks_for_delivery_once(session_id).await {
+                Ok(rows) => return Ok(rows),
+                Err(error) if attempt < 7 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    let _ = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!()
+    }
+
+    async fn tasks_for_delivery_once(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::db::models::C2Task>, AppError> {
         let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
         let mut rows: Vec<crate::db::models::C2Task> = sqlx::query_as(
             "UPDATE c2_tasks AS t SET status = 'delivered', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ') \
-             WHERE t.rowid IN (SELECT candidate.rowid FROM c2_tasks candidate \
+                 WHERE t.rowid IN (SELECT candidate.rowid FROM c2_tasks candidate \
                WHERE candidate.session_id = ? AND candidate.status = 'pending' \
                  AND NOT EXISTS (SELECT 1 FROM c2_file_transfers current_transfer \
                    JOIN c2_file_transfers predecessor \
@@ -1171,7 +1192,7 @@ impl Repository {
             }
         }
         for id in ids {
-            sqlx::query(
+            let update = sqlx::query(
                 "UPDATE c2_tasks SET status = 'processing', \
                  processing_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
@@ -1182,6 +1203,11 @@ impl Repository {
             .execute(&mut *transaction)
             .await
             .map_err(|_| AppError::Internal)?;
+            if update.rows_affected() != 1 {
+                return Err(AppError::Conflict(
+                    "task delivery state changed before acknowledgement".to_owned(),
+                ));
+            }
         }
         transaction.commit().await.map_err(|_| AppError::Internal)
     }
@@ -1562,22 +1588,51 @@ impl Repository {
         .execute(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
-        if matches!(command.as_str(), "nw/download" | "nw/upload") && !ok {
-            let transfer_status = if status == "cancelled" {
-                "cancelled"
-            } else {
-                "error"
-            };
-            sqlx::query(
-                "UPDATE c2_file_transfers SET status = ?, error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-                 WHERE task_id = ? AND status IN ('queued', 'active')",
+        if matches!(command.as_str(), "nw/download" | "nw/upload") {
+            let transfer: Option<(String, i64, i64, String, Option<String>)> = sqlx::query_as(
+                "SELECT direction, expected_size, received_bytes, status, sha256 \
+                 FROM c2_file_transfers WHERE task_id = ?",
             )
-            .bind(transfer_status)
-            .bind(String::from_utf8_lossy(stderr).to_string())
             .bind(task_id)
-            .execute(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(|_| AppError::Internal)?;
+            if let Some((direction, expected_size, received_bytes, transfer_status, sha256)) =
+                transfer
+            {
+                let complete = ok
+                    && transfer_status == "active"
+                    && expected_size >= 0
+                    && received_bytes == expected_size
+                    && (direction == "upload" || sha256.is_some());
+                let transfer_status = if status == "cancelled" {
+                    "cancelled"
+                } else if complete {
+                    "completed"
+                } else {
+                    "error"
+                };
+                let error = if complete {
+                    None
+                } else if status == "cancelled" {
+                    Some("cancelled by receiver".to_owned())
+                } else if ok {
+                    Some("receiver confirmed task before transfer publication".to_owned())
+                } else {
+                    Some(String::from_utf8_lossy(stderr).to_string())
+                };
+                sqlx::query(
+                    "UPDATE c2_file_transfers SET status = ?, error = ?, completed_at = CASE WHEN ? IN ('completed','error','cancelled') THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE completed_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                     WHERE task_id = ? AND status IN ('queued', 'active')",
+                )
+                .bind(transfer_status)
+                .bind(error)
+                .bind(transfer_status)
+                .bind(task_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| AppError::Internal)?;
+            }
         }
         let action = match status {
             "completed" => "task_completed",

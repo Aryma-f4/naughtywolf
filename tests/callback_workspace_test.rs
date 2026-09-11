@@ -137,7 +137,7 @@ async fn transfer_store_persists_contiguous_progress_and_resumes_after_reopen() 
     assert_eq!(first.received, 3);
     assert!(!first.done);
 
-    let reopened = TransferStore::new(repo, directory.path(), 4096).unwrap();
+    let reopened = TransferStore::new(repo.clone(), directory.path(), 4096).unwrap();
     let second = reopened
         .receive_chunk(&session_id, &transfer_chunk(&transfer, 3, 6, b"def"))
         .await
@@ -152,6 +152,18 @@ async fn transfer_store_persists_contiguous_progress_and_resumes_after_reopen() 
         repeated_final_ack.done,
         "a lost completion ACK must be repeatable"
     );
+    let provisional = reopened.transfer(&transfer.id).await.unwrap().unwrap();
+    assert_eq!(provisional.status, "active");
+    repo.store_task_result_for_session(
+        &session_id,
+        transfer.task_id.as_deref().unwrap(),
+        true,
+        b"download confirmed",
+        b"",
+        0,
+    )
+    .await
+    .unwrap();
     let finished = reopened.transfer(&transfer.id).await.unwrap().unwrap();
     assert_eq!(finished.status, "completed");
     assert_eq!(reopened.read_completed(&finished).await.unwrap(), b"abcdef");
@@ -455,6 +467,22 @@ async fn transfer_tasks_are_delivered_one_head_per_direction_until_terminal() {
         .await
         .unwrap();
 
+    // Make the FIFO contract explicit instead of depending on UUID ordering
+    // when several rows share SQLite's millisecond timestamp.
+    for (transfer, minute) in [
+        (&first_download, "01"),
+        (&second_download, "02"),
+        (&first_upload, "03"),
+        (&second_upload, "04"),
+    ] {
+        sqlx::query("UPDATE c2_file_transfers SET created_at = ? WHERE id = ?")
+            .bind(format!("2026-09-11T00:{minute}:00.000Z"))
+            .bind(&transfer.id)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+    }
+
     let delivered = repo.tasks_for_delivery(&session_id).await.unwrap();
     assert_eq!(
         delivered
@@ -547,6 +575,175 @@ async fn cancelling_a_pending_transfer_task_cancels_its_transfer_atomically() {
 }
 
 #[tokio::test]
+async fn final_download_chunk_stays_provisional_until_task_result() {
+    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let expected = hex::encode(Sha256::digest(b"abcdef"));
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/provisional.bin",
+            Some(6),
+            Some(&expected),
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let ack = store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 6, b"abcdef"))
+        .await
+        .unwrap();
+    assert!(ack.done);
+    assert_eq!(
+        repo.file_transfer(&transfer.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "active",
+        "receiver completion must remain provisional until task confirmation"
+    );
+    repo.store_task_result_for_session(
+        &session_id,
+        transfer.task_id.as_deref().unwrap(),
+        true,
+        b"download confirmed",
+        b"",
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.file_transfer(&transfer.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+    assert!(
+        directory
+            .path()
+            .join("callback-transfers")
+            .join(&transfer.storage_key)
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn concurrent_store_instances_serialize_same_transfer() {
+    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/concurrent.bin",
+            Some(6),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let second = TransferStore::new(repo, directory.path(), 4096).unwrap();
+    let first_chunk = transfer_chunk(&transfer, 0, 6, b"abc");
+    let (left, right) = tokio::join!(
+        store.receive_chunk(&session_id, &first_chunk),
+        second.receive_chunk(&session_id, &first_chunk),
+    );
+    assert!(left.is_ok() && right.is_ok());
+    let received = left.unwrap().received.max(right.unwrap().received);
+    assert_eq!(received, 3);
+}
+
+#[tokio::test]
+async fn cleanup_expires_terminal_artifacts_by_configured_timestamp() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = test_repository().await;
+    let operator = create_user(
+        &repo,
+        &format!("retention-{}", uuid::Uuid::new_v4()),
+        Role::Operator,
+    )
+    .await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let store = TransferStore::new_with_retention(repo.clone(), directory.path(), 4096, 0).unwrap();
+    let mut stage = store.begin_upload_stage().unwrap();
+    stage.write(b"expired").unwrap();
+    let transfer = store
+        .finish_upload_stage(
+            stage,
+            &session_id,
+            "/srv/expired.bin",
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE c2_file_transfers SET status = 'completed', completed_at = '2020-01-01T00:00:00.000Z' WHERE id = ?",
+    )
+    .bind(&transfer.id)
+    .execute(&repo.pool)
+    .await
+    .unwrap();
+    store.cleanup_orphans().await.unwrap();
+    assert!(repo.file_transfer(&transfer.id).await.unwrap().is_none());
+    assert!(
+        !directory
+            .path()
+            .join("callback-transfers")
+            .join(&transfer.storage_key)
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn storage_writes_follow_held_directory_after_ancestor_swap() {
+    let evidence = tempfile::tempdir().unwrap();
+    let repo = test_repository().await;
+    let operator = create_user(
+        &repo,
+        &format!("ancestor-{}", uuid::Uuid::new_v4()),
+        Role::Operator,
+    )
+    .await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let store = TransferStore::new(repo.clone(), evidence.path(), 4096).unwrap();
+    let original = evidence.path().join("callback-transfers");
+    let moved = evidence.path().join("callback-transfers-old");
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir(&original).unwrap();
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/ancestor.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 3, b"a"))
+        .await
+        .unwrap();
+    assert!(
+        moved
+            .join(format!("{}.part", transfer.storage_key))
+            .is_file()
+    );
+    assert!(
+        !original
+            .join(format!("{}.part", transfer.storage_key))
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn transfer_endpoints_require_role_scope_and_csrf_and_audit_exact_destination() {
     let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
     let app = authenticated_transfer_app(repo.clone(), operator, store.clone()).await;
@@ -612,7 +809,7 @@ async fn transfer_endpoints_require_role_scope_and_csrf_and_audit_exact_destinat
 #[tokio::test]
 async fn multipart_upload_streams_bounded_fixture_and_completed_download_has_safe_headers() {
     let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
-    let app = authenticated_transfer_app(repo, operator.clone(), store.clone()).await;
+    let app = authenticated_transfer_app(repo.clone(), operator.clone(), store.clone()).await;
     let page = app
         .clone()
         .oneshot(
@@ -664,6 +861,16 @@ async fn multipart_upload_streams_bounded_fixture_and_completed_download_has_saf
         .receive_chunk(&session_id, &transfer_chunk(&download, 0, 3072, &fixture))
         .await
         .unwrap();
+    repo.store_task_result_for_session(
+        &session_id,
+        download.task_id.as_deref().unwrap(),
+        true,
+        b"download confirmed",
+        b"",
+        0,
+    )
+    .await
+    .unwrap();
     let response = app
         .oneshot(
             Request::get(format!(

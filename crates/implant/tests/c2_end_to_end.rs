@@ -58,9 +58,32 @@ async fn drop_partial_transfer_response(
             .max()
             .unwrap_or(0)
     } else {
-        std::fs::metadata(&state.watched)
+        let direct = std::fs::metadata(&state.watched)
             .map(|metadata| metadata.len())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        // Upload receivers keep the final destination untouched until
+        // publication; observe the transfer-specific sidecar instead.
+        let prefix = state
+            .watched
+            .file_name()
+            .map(|name| format!("{}{}.nwpart-", name.to_string_lossy(), ""));
+        let staged = prefix
+            .and_then(|prefix| {
+                state.watched.parent().and_then(|parent| {
+                    std::fs::read_dir(parent).ok().map(|entries| {
+                        entries
+                            .flatten()
+                            .filter(|entry| {
+                                entry.file_name().to_string_lossy().starts_with(&prefix)
+                            })
+                            .filter_map(|entry| entry.metadata().ok().map(|m| m.len()))
+                            .max()
+                            .unwrap_or(0)
+                    })
+                })
+            })
+            .unwrap_or(0);
+        direct.max(staged)
     };
     if bytes > 0 && bytes < state.expected && !state.dropped.swap(true, Ordering::SeqCst) {
         return StatusCode::BAD_GATEWAY.into_response();

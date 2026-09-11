@@ -10,6 +10,7 @@ pub struct Config {
     pub tcp_protocol: String,
     pub evidence_dir: PathBuf,
     pub max_transfer_bytes: u64,
+    pub transfer_retention_secs: u64,
     pub session_secret: String,
     pub cookie_secure: bool,
     pub c2_psk: Vec<u8>,
@@ -56,6 +57,17 @@ impl Config {
                     return Err(ConfigError::InvalidMaxTransferBytes);
                 }
             },
+            transfer_retention_secs: match env::var("NAUGHTYWOLF_TRANSFER_RETENTION_SECS") {
+                Ok(value) => value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidTransferRetentionSecs)?,
+                Err(env::VarError::NotPresent) => {
+                    crate::callback_workspace::transfers::DEFAULT_TRANSFER_RETENTION_SECS
+                }
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err(ConfigError::InvalidTransferRetentionSecs);
+                }
+            },
             session_secret: env::var("NAUGHTYWOLF_SESSION_SECRET")
                 .map_err(|_| ConfigError::Missing("NAUGHTYWOLF_SESSION_SECRET"))?,
             cookie_secure: match env::var("NAUGHTYWOLF_COOKIE_SECURE") {
@@ -80,6 +92,8 @@ impl Config {
             tcp_protocol: "tcp".into(),
             evidence_dir: PathBuf::from("evidence"),
             max_transfer_bytes: 268_435_456,
+            transfer_retention_secs:
+                crate::callback_workspace::transfers::DEFAULT_TRANSFER_RETENTION_SECS,
             session_secret: "test-session-secret-not-for-production".to_string(),
             cookie_secure: false,
             c2_psk: b"dev-psk-change-me".to_vec(),
@@ -111,6 +125,8 @@ pub enum ConfigError {
     InvalidTcpProtocol,
     #[error("NAUGHTYWOLF_MAX_TRANSFER_BYTES must be a positive integer")]
     InvalidMaxTransferBytes,
+    #[error("NAUGHTYWOLF_TRANSFER_RETENTION_SECS must be a non-negative integer")]
+    InvalidTransferRetentionSecs,
     #[error("{0} must be true, false, 1, or 0")]
     InvalidBoolean(&'static str),
 }

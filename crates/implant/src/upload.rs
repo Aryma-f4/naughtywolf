@@ -11,7 +11,6 @@ use uuid::Uuid;
 /// streams data across consecutive server pushes.
 pub struct Upload {
     file: std::fs::File,
-    mirror: Option<std::fs::File>,
     partial_path: PathBuf,
     pub dest: String,
     size: u64,
@@ -53,18 +52,6 @@ impl Upload {
         let file = partial_options
             .open(&partial_path)
             .map_err(|e| format!("open {partial_path:?}: {e}"))?;
-        let mirror = if std::path::Path::new(dest).exists() {
-            None
-        } else {
-            Some(
-                OpenOptions::new()
-                    .create_new(true)
-                    .read(true)
-                    .write(true)
-                    .open(dest)
-                    .map_err(|e| format!("open {dest:?}: {e}"))?,
-            )
-        };
         let received = file
             .metadata()
             .map_err(|e| format!("stat {dest:?}: {e}"))?
@@ -74,7 +61,6 @@ impl Upload {
         }
         Ok(Upload {
             file,
-            mirror,
             partial_path,
             dest: dest.to_string(),
             size: expected_total.unwrap_or(received),
@@ -152,24 +138,9 @@ impl Upload {
         self.file
             .write_all(&chunk.data)
             .map_err(|_| "write upload destination")?;
-        // Keep the requested destination visibly progressive for operators;
-        // only the transfer-specific sidecar controls resume offsets.
-        if let Some(mirror) = self.mirror.as_mut() {
-            mirror
-                .seek(SeekFrom::Start(chunk.offset))
-                .map_err(|_| "seek upload destination mirror")?;
-            mirror
-                .write_all(&chunk.data)
-                .map_err(|_| "write upload destination mirror")?;
-        }
         self.file
             .sync_all()
             .map_err(|_| "sync upload destination")?;
-        if let Some(mirror) = self.mirror.as_ref() {
-            mirror
-                .sync_all()
-                .map_err(|_| "sync upload destination mirror")?;
-        }
         if end > self.received {
             self.received = end;
         }
@@ -188,9 +159,23 @@ impl Upload {
     /// Publish the transfer-specific sidecar after the server confirms the
     /// terminal ACK. Keeping it staged until then makes reconnects idempotent.
     pub fn finalize(&self) -> Result<(), String> {
+        if !self.total_known
+            || self
+                .file
+                .metadata()
+                .map_err(|e| format!("stat upload sidecar: {e}"))?
+                .len()
+                != self.size
+        {
+            return Err("upload sidecar size mismatch".into());
+        }
         if let Some(expected) = &self.expected_sha256 {
-            let mut file = std::fs::File::open(&self.partial_path)
+            let mut file = self
+                .file
+                .try_clone()
                 .map_err(|e| format!("open upload sidecar: {e}"))?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| format!("seek upload sidecar: {e}"))?;
             let mut digest = Sha256::new();
             let mut buffer = [0_u8; 8192];
             loop {
@@ -205,8 +190,18 @@ impl Upload {
                 return Err("upload SHA-256 mismatch".into());
             }
         }
-        std::fs::rename(&self.partial_path, &self.dest)
-            .map_err(|e| format!("publish upload destination: {e}"))
+        // hard_link is an atomic create-without-replace on local filesystems:
+        // an existing destination is never truncated or overwritten.
+        std::fs::hard_link(&self.partial_path, &self.dest)
+            .map_err(|e| format!("publish upload destination: {e}"))?;
+        std::fs::remove_file(&self.partial_path)
+            .map_err(|e| format!("remove upload sidecar: {e}"))?;
+        if let Some(parent) = std::path::Path::new(&self.dest).parent() {
+            if let Ok(directory) = std::fs::File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -236,6 +231,10 @@ mod tests {
             .unwrap();
         assert_eq!(ack.received, 100);
         assert!(ack.done);
+        assert!(
+            !dest.exists(),
+            "receiver must not expose a progressively written final path"
+        );
 
         // A chunk starting before the acked offset must not shrink it.
         let duplicate_mismatch = up
@@ -275,5 +274,30 @@ mod tests {
         assert_eq!(mismatch, "upload transfer id mismatch");
 
         std::fs::remove_file(&dest).ok();
+    }
+
+    #[test]
+    fn no_replace_publication_preserves_preexisting_destination() {
+        let dir = std::env::temp_dir();
+        let dest = dir.join(format!("nw-up-existing-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        std::fs::write(&dest, b"old").unwrap();
+        let transfer_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let mut up = Upload::open(dest.to_str().unwrap(), transfer_id, task_id).unwrap();
+        up.write_chunk(&FileChunk {
+            transfer_id: Some(transfer_id),
+            task_id: Some(task_id),
+            name: dest.to_string_lossy().into_owned(),
+            offset: 0,
+            total: 3,
+            data: b"new".to_vec(),
+        })
+        .unwrap();
+        let error = up.finalize().unwrap_err();
+        assert!(error.contains("publish upload destination"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(format!("{}.nwpart-{}", dest.display(), transfer_id));
     }
 }
