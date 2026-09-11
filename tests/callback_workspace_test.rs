@@ -753,6 +753,180 @@ async fn concurrent_store_instances_serialize_same_transfer() {
     assert_eq!(received, 3);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cross_store_lock_precedes_part_write() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/locked.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let second = TransferStore::new(repo.clone(), directory.path(), 4096).unwrap();
+    let lock_path = directory
+        .path()
+        .join("callback-transfers")
+        .join(format!("{}.lock", transfer.storage_key));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(lock_path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+
+    let blocked = second
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 3, b"new"))
+        .await;
+
+    assert!(matches!(blocked, Err(TransferError::Storage)));
+    assert!(
+        !directory
+            .path()
+            .join("callback-transfers")
+            .join(format!("{}.part", transfer.storage_key))
+            .exists(),
+        "a blocked writer must not create or alter the staging artifact"
+    );
+    assert_eq!(
+        repo.file_transfer(&transfer.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .received_bytes,
+        0,
+        "a blocked writer must not advance the durable offset"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cleanup_does_not_delete_locked_upload_stage() {
+    let (directory, repo, store, _operator, _session_id) = transfer_fixture(4096).await;
+    let mut stage = store.begin_upload_stage().unwrap();
+    stage.write(b"pending").unwrap();
+    let second = TransferStore::new(repo, directory.path(), 4096).unwrap();
+
+    assert!(matches!(
+        second.cleanup_orphans().await,
+        Err(TransferError::Storage)
+    ));
+    assert!(
+        std::fs::read_dir(directory.path().join("callback-transfers"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| std::fs::read(entry.path()).ok().as_deref() == Some(b"pending"))
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cross_store_lock_precedes_part_write() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/locked.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let second = TransferStore::new(repo.clone(), directory.path(), 4096).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(
+            directory
+                .path()
+                .join("callback-transfers")
+                .join(format!("{}.lock", transfer.storage_key)),
+        )
+        .unwrap();
+    let mut overlapped = OVERLAPPED::default();
+    assert_ne!(
+        unsafe {
+            LockFileEx(
+                lock.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        },
+        0
+    );
+
+    assert!(matches!(
+        second
+            .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 3, b"new"))
+            .await,
+        Err(TransferError::Storage)
+    ));
+    assert!(
+        !directory
+            .path()
+            .join("callback-transfers")
+            .join(format!("{}.part", transfer.storage_key))
+            .exists()
+    );
+    assert_eq!(
+        repo.file_transfer(&transfer.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .received_bytes,
+        0
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unix_cleanup_closes_directory_on_invalid_name() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let (directory, _repo, store, _operator, _session_id) = transfer_fixture(4096).await;
+    let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+    std::fs::write(
+        directory.path().join("callback-transfers").join(invalid),
+        b"orphan",
+    )
+    .unwrap();
+
+    let descriptors_before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    for _ in 0..8 {
+        assert!(matches!(
+            store.cleanup_orphans().await,
+            Err(TransferError::UnsafeStorage)
+        ));
+    }
+    let descriptors_after = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    assert_eq!(descriptors_after, descriptors_before);
+}
+
 #[tokio::test]
 async fn active_file_lease_blocks_takeover_until_safe_expiry() {
     let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
@@ -878,6 +1052,45 @@ async fn storage_writes_follow_held_directory_after_ancestor_swap() {
             .join(format!("{}.part", transfer.storage_key))
             .exists()
     );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_guards_reparse_ancestors_until_publication() {
+    let evidence = tempfile::tempdir().unwrap();
+    let repo = test_repository().await;
+    let operator = create_user(
+        &repo,
+        &format!("windows-ancestor-{}", uuid::Uuid::new_v4()),
+        Role::Operator,
+    )
+    .await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let store = TransferStore::new(repo.clone(), evidence.path(), 4096).unwrap();
+    let original = evidence.path().join("callback-transfers");
+    let moved = evidence.path().join("callback-transfers-old");
+
+    assert!(
+        std::fs::rename(&original, &moved).is_err(),
+        "the retained root/ancestor handles must deny an attacker the delete share needed to replace the publication parent with a reparse point"
+    );
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/ancestor.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 3, b"a"))
+        .await
+        .unwrap();
+    assert!(original.join(&transfer.storage_key).is_file());
 }
 
 #[tokio::test]

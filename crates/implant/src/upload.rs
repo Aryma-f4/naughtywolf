@@ -229,7 +229,7 @@ fn open_sidecar(path: &std::path::Path) -> Result<std::fs::File, String> {
         OPEN_ALWAYS,
     };
 
-    validate_windows_ancestors(path)?;
+    let _guard = WindowsPathGuard::open(path)?;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let handle = unsafe {
         CreateFileW(
@@ -264,13 +264,13 @@ fn publish_no_replace(
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, CreateHardLinkW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        CreateFileW, CreateHardLinkW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         GENERIC_READ, OPEN_EXISTING,
     };
 
-    validate_windows_ancestors(partial)?;
-    validate_windows_ancestors(destination)?;
+    let _partial_guard = WindowsPathGuard::open(partial)?;
+    let destination_guard = WindowsPathGuard::open(destination)?;
     let partial_w: Vec<u16> = partial.as_os_str().encode_wide().chain(Some(0)).collect();
     let destination_w: Vec<u16> = destination
         .as_os_str()
@@ -283,7 +283,7 @@ fn publish_no_replace(
     let source = unsafe {
         CreateFileW(
             partial_w.as_ptr(),
-            GENERIC_READ,
+            GENERIC_READ | DELETE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -297,80 +297,117 @@ fn publish_no_replace(
             std::io::Error::last_os_error()
         ));
     }
-    let source_reparse = windows_handle_is_reparse(source);
-    unsafe { CloseHandle(source) };
-    if source_reparse {
+    if windows_handle_is_reparse(source) {
+        unsafe { CloseHandle(source) };
         return Err("upload sidecar is a reparse point".into());
     }
     let result =
         unsafe { CreateHardLinkW(destination_w.as_ptr(), partial_w.as_ptr(), std::ptr::null()) };
     if result == 0 {
+        unsafe { CloseHandle(source) };
         return Err(format!(
             "publish upload destination: {}",
             std::io::Error::last_os_error()
         ));
     }
-    // DeleteFileW removes only the sidecar name; the hard link remains the
-    // published artifact. A preexisting/reparse destination made the link
-    // call fail before this point and is left untouched.
-    let removed =
-        unsafe { windows_sys::Win32::Storage::FileSystem::DeleteFileW(partial_w.as_ptr()) };
+    // Mark the already-opened source for deletion. Reopening the pathname
+    // here would turn cleanup into a reparse/ancestor race.
+    let info = windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO { DeleteFile: true };
+    let removed = unsafe {
+        windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
+            source,
+            windows_sys::Win32::Storage::FileSystem::FileDispositionInfo,
+            &info as *const _ as _,
+            std::mem::size_of::<windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO>()
+                as u32,
+        )
+    };
+    unsafe { CloseHandle(source) };
     if removed == 0 {
         return Err(format!(
             "remove upload sidecar: {}",
             std::io::Error::last_os_error()
         ));
     }
+    let _ = destination_guard.parent.sync_all();
     Ok(())
 }
 
 #[cfg(windows)]
-fn validate_windows_ancestors(path: &std::path::Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    let mut ancestors = Vec::new();
-    let mut current = path;
-    while let Some(parent) = current.parent() {
-        if parent == current {
-            break;
-        }
-        ancestors.push(parent.to_owned());
-        current = parent;
-    }
-    ancestors.reverse();
-    for ancestor in ancestors {
-        let wide: Vec<u16> = ancestor.as_os_str().encode_wide().chain(Some(0)).collect();
+#[allow(dead_code)]
+struct WindowsPathGuard {
+    handles: Vec<std::fs::File>,
+    parent: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl WindowsPathGuard {
+    fn open(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            GENERIC_READ, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
+            OPEN_EXISTING,
         };
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                0,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(format!(
-                "open upload ancestor {ancestor:?}: {}",
-                std::io::Error::last_os_error()
-            ));
+
+        let mut ancestors = Vec::new();
+        let mut current = path
+            .parent()
+            .ok_or_else(|| format!("missing upload parent for {path:?}"))?;
+        loop {
+            ancestors.push(current.to_owned());
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            if parent == current {
+                break;
+            }
+            current = parent;
         }
-        let reparse = windows_handle_is_reparse(handle);
-        unsafe { CloseHandle(handle) };
-        if reparse {
-            return Err(format!(
-                "reparse point in upload path ancestor {ancestor:?}"
-            ));
+        ancestors.reverse();
+        let mut handles = Vec::new();
+        for ancestor in ancestors {
+            let wide: Vec<u16> = ancestor.as_os_str().encode_wide().chain(Some(0)).collect();
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL
+                        | FILE_FLAG_BACKUP_SEMANTICS
+                        | FILE_FLAG_OPEN_REPARSE_POINT,
+                    0,
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(format!(
+                    "open upload ancestor {ancestor:?}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if windows_handle_is_reparse(handle) {
+                unsafe { CloseHandle(handle) };
+                return Err(format!(
+                    "reparse point in upload path ancestor {ancestor:?}"
+                ));
+            }
+            // SAFETY: CreateFileW returned an owned directory handle.
+            handles.push(unsafe { std::fs::File::from_raw_handle(handle as _) });
         }
+        let parent = handles
+            .pop()
+            .ok_or_else(|| format!("missing upload parent for {path:?}"))?;
+        Ok(Self {
+            handles,
+            parent,
+            path: path.to_path_buf(),
+        })
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -455,10 +492,9 @@ mod tests {
     }
 
     #[test]
-    fn no_replace_publication_preserves_preexisting_destination() {
-        let dir = std::env::temp_dir();
-        let dest = dir.join(format!("nw-up-existing-{}.bin", std::process::id()));
-        let _ = std::fs::remove_file(&dest);
+    fn preexisting_or_reparse_destination_is_never_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("destination.bin");
         std::fs::write(&dest, b"old").unwrap();
         let transfer_id = Uuid::new_v4();
         let task_id = Uuid::new_v4();
@@ -475,7 +511,50 @@ mod tests {
         let error = up.finalize().unwrap_err();
         assert!(error.contains("publish upload destination"));
         assert_eq!(std::fs::read(&dest).unwrap(), b"old");
-        let _ = std::fs::remove_file(&dest);
-        let _ = std::fs::remove_file(format!("{}.nwpart-{}", dest.display(), transfer_id));
+        let partial = dir
+            .path()
+            .join(format!("destination.bin.nwpart-{transfer_id}"));
+        assert_eq!(std::fs::read(&partial).unwrap(), b"new");
+        let entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| std::fs::read(path).ok().as_deref() == Some(b"new"))
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![partial]);
+
+        #[cfg(unix)]
+        {
+            let victim = dir.path().join("victim.bin");
+            let reparse_destination = dir.path().join("reparse-destination.bin");
+            std::fs::write(&victim, b"victim").unwrap();
+            std::os::unix::fs::symlink(&victim, &reparse_destination).unwrap();
+            let reparse_transfer = Uuid::new_v4();
+            let mut reparse_upload = Upload::open(
+                reparse_destination.to_str().unwrap(),
+                reparse_transfer,
+                task_id,
+            )
+            .unwrap();
+            reparse_upload
+                .write_chunk(&FileChunk {
+                    transfer_id: Some(reparse_transfer),
+                    task_id: Some(task_id),
+                    name: reparse_destination.to_string_lossy().into_owned(),
+                    offset: 0,
+                    total: 3,
+                    data: b"new".to_vec(),
+                })
+                .unwrap();
+            assert!(reparse_upload.finalize().is_err());
+            assert_eq!(std::fs::read(victim).unwrap(), b"victim");
+            assert_eq!(
+                std::fs::read(
+                    dir.path()
+                        .join(format!("reparse-destination.bin.nwpart-{reparse_transfer}")),
+                )
+                .unwrap(),
+                b"new"
+            );
+        }
     }
 }
