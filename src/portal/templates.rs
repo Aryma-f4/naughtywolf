@@ -922,13 +922,18 @@ pub fn callback_detail_page(
     );
 
     let online = callback.is_online(time::OffsetDateTime::now_utc());
+    let process_capable = callback
+        .capabilities_json
+        .as_ref()
+        .map(|capabilities| capabilities.process_browser)
+        .unwrap_or(false);
     let tasking_panel = format!(
         r##"<section class="callback-tasking panel" data-callback-tasking data-live-output
           data-tasks-endpoint="/api/callbacks/{callback_id}/tasks"
           data-events-endpoint="/api/callbacks/{callback_id}/events"
           data-csrf-token="{csrf}" data-online="{online}">
           <header class="callback-tasking-title"><div><p class="eyebrow">TASKING / PERSISTENT LEDGER</p><h3>Tasking</h3><p>Authoritative callback history, reconciled after every connection.</p></div><div><span class="connection-label">Connection</span><span class="stream-state" data-connection-state role="status">Connecting</span></div></header>
-          <nav class="callback-tabs" aria-label="Callback workspace tabs"><a aria-current="page" href="#tasking">Tasking</a><span>Processes</span><span>Files</span><span>Metadata</span></nav>
+          <nav class="callback-tabs" aria-label="Callback workspace tabs"><a aria-current="page" href="#tasking">Tasking</a><a href="#processes">Processes</a><span>Files</span><span>Metadata</span></nav>
           <p class="offline-queue" data-offline-queue hidden></p>
           <div class="task-filters">
             <label>Search task history<input type="search" data-task-search placeholder="Command, operator, or output"></label>
@@ -936,6 +941,15 @@ pub fn callback_detail_page(
             <label>Errors<select data-task-error-filter><option value="">All output</option><option value="errors">Errors only</option></select></label>
           </div>
           <div class="callback-console-grid"><aside class="session-context-wrap">{session_context}</aside><div class="task-timeline"><div class="task-empty" data-task-empty><strong>No task history yet</strong><p>Submit a command from the dock below.</p></div><div class="task-card-list" data-task-list></div><button class="btn btn-ghost load-older" type="button" data-load-older hidden>Load older</button></div></div>
+          <section id="processes" class="process-panel panel" data-process-panel data-processes-endpoint="/api/callbacks/{callback_id}/processes" data-process-capable="{process_capable}" data-process-online="{online}">
+            <header class="process-panel-head"><div><p class="eyebrow">PROCESS CONTROL / AUDITED</p><h3>Processes</h3><p>Latest structured snapshot from this callback.</p></div><div class="process-controls"><span data-process-snapshot-age>Loading snapshot…</span><button type="button" class="btn btn-ghost" data-process-refresh>Refresh</button></div></header>
+            <p class="process-message" data-process-message role="status" aria-live="polite"></p>
+            <div class="process-toolbar"><label>Search processes<input type="search" data-process-search placeholder="PID, name, executable, or user"></label><a data-process-task-link href="#tasking" hidden>Open control task in Tasking</a></div>
+            <div class="table-scroll"><table class="data-table process-table"><caption class="sr-only">Callback processes</caption><thead><tr><th><button type="button" data-process-sort="pid">PID</button></th><th><button type="button" data-process-sort="parent_pid">Parent PID</button></th><th><button type="button" data-process-sort="name">Name</button></th><th><button type="button" data-process-sort="executable">Executable</button></th><th><button type="button" data-process-sort="user">User</button></th><th><button type="button" data-process-sort="architecture">Architecture</button></th><th><button type="button" data-process-sort="cpu_percent">CPU</button></th><th><button type="button" data-process-sort="memory_bytes">Memory</button></th><th><button type="button" data-process-sort="started_at">Started</button></th><th>Action</th></tr></thead><tbody data-process-table-body></tbody></table></div>
+            <p class="process-empty" data-process-empty hidden>No processes match this search or snapshot.</p>
+            <aside class="process-detail" data-process-detail aria-live="polite"><p>Select a process to inspect its latest values.</p></aside>
+            <div class="process-confirm" data-process-confirm hidden role="dialog" aria-modal="true" aria-labelledby="process-confirm-title"><h4 id="process-confirm-title">Confirm process termination</h4><p data-process-confirm-text></p><button type="button" class="btn btn-ghost" data-process-confirm-cancel>Cancel</button><button type="button" class="btn btn-danger" data-process-confirm-submit>Terminate exact PID</button></div>
+          </section>
           <noscript><section class="task-history-panel">{rows}</section><section id="task-results">{persisted_output}</section></noscript>
           <div class="command-dock panel"><div class="command-dock-label"><span aria-hidden="true">&gt;_</span><div><strong>Task this callback</strong><small>Use ↑ and ↓ for persisted command history</small></div></div>
             <form id="task-form" data-task-form><input type="hidden" name="csrf_token" value="{csrf}"><div class="command-input"><label class="sr-only" for="command">Command</label><span aria-hidden="true">$</span><input list="command-suggestions" type="text" id="command" data-command-input autocomplete="off" placeholder="Task an authorized lab agent…" required><datalist id="command-suggestions">{suggestions}</datalist></div><label class="sr-only" for="args">Arguments</label><input class="command-args" type="text" id="args" data-command-arguments placeholder="Arguments (optional)"><button type="submit" class="btn btn-primary">Execute <span aria-hidden="true">↗</span></button></form>
@@ -944,6 +958,7 @@ pub fn callback_detail_page(
         callback_id = escape_html(&callback.id),
         csrf = escape_html(csrf_token),
         online = online,
+        process_capable = process_capable,
         session_context = session_context,
         rows = rows,
         persisted_output = persisted_output,

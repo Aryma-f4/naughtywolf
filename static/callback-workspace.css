@@ -30,8 +30,32 @@
 .task-empty { padding: 2rem; text-align: center; color: var(--muted, #6d7178); }
 .load-older { width: 100%; margin-top: .75rem; }
 .callback-tasking .command-dock { position: sticky; bottom: .75rem; z-index: 4; box-shadow: 0 .6rem 2rem rgba(20, 22, 26, .14); }
+.process-panel { display: grid; gap: 1rem; padding: 1.25rem; }
+.process-panel-head, .process-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; }
+.process-panel-head h3 { margin: .15rem 0; }
+.process-controls, .process-toolbar { display: flex; align-items: center; gap: .75rem; }
+.process-controls > span { color: var(--muted, #6d7178); font-size: .8rem; }
+.process-message { margin: 0; min-height: 1.2rem; color: var(--muted, #6d7178); }
+.process-toolbar label { display: grid; gap: .3rem; font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
+.process-toolbar input { min-height: 2.5rem; min-width: min(28rem, 60vw); }
+.process-toolbar a { white-space: nowrap; }
+.process-table th button { border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; padding: 0; text-align: left; }
+.process-table td { vertical-align: top; }
+.process-table td[data-process-field] { max-width: 18rem; overflow-wrap: anywhere; }
+.process-actions { white-space: nowrap; }
+.process-empty { margin: 0; color: var(--muted, #6d7178); }
+.process-detail { border: 1px solid var(--border, #d8d7d2); padding: 1rem; background: var(--surface, #fff); }
+.process-detail p { margin: .3rem 0 0; }
+.process-detail-name { font-size: 1rem; }
+.process-confirm { border: 2px solid var(--accent, #dc5539); padding: 1rem; background: var(--surface, #fff); }
+.process-confirm h4 { margin: 0 0 .5rem; }
+.process-confirm p { margin: 0 0 .8rem; }
+.process-confirm button + button { margin-left: .5rem; }
 @media (max-width: 850px) {
   .task-filters { grid-template-columns: 1fr; }
   .session-context-wrap { position: static; }
   .callback-task-meta { grid-template-columns: 1fr; }
+  .process-panel-head, .process-toolbar { align-items: stretch; flex-direction: column; }
+  .process-controls, .process-toolbar { align-items: stretch; flex-direction: column; }
+  .process-toolbar input { min-width: 0; width: 100%; }
 }

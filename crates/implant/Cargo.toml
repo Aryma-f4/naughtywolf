@@ -20,6 +20,8 @@ sha2.workspace = true
 hostname = "0.4"
 whoami = "1.6"
 local-ip-address = "0.6"
+chrono.workspace = true
+sysinfo = "0.38.4"
 
 [dev-dependencies]
 nw-server = { path = "../server" }

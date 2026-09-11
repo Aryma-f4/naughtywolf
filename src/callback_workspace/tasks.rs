@@ -154,7 +154,7 @@ pub struct EnqueueTaskRequest {
     timeout_ms: Option<u64>,
 }
 
-async fn require_csrf(session: &Session, headers: &HeaderMap) -> Result<(), AppError> {
+pub(super) async fn require_csrf(session: &Session, headers: &HeaderMap) -> Result<(), AppError> {
     let expected: Option<String> = session
         .get(CSRF_TOKEN_KEY)
         .await
@@ -168,7 +168,7 @@ async fn require_csrf(session: &Session, headers: &HeaderMap) -> Result<(), AppE
     Ok(())
 }
 
-async fn require_visible_callback(
+pub(super) async fn require_visible_callback(
     repository: &Repository,
     user: &crate::auth::AuthenticatedUser,
     session_id: &str,
@@ -180,7 +180,7 @@ async fn require_visible_callback(
         .ok_or(AppError::NotFound)
 }
 
-async fn task_view(
+pub(super) async fn task_view(
     repository: &Repository,
     session_id: &str,
     task_id: &str,

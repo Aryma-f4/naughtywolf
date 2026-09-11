@@ -69,6 +69,25 @@ async fn create_scoped_callback(repo: &Repository, user_id: &str, session_id: &s
         .unwrap();
 }
 
+fn process_snapshot_fixture(captured_at: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema": "nw.process-list.v1",
+        "captured_at": captured_at,
+        "processes": [{
+            "pid": 7331,
+            "parent_pid": 1,
+            "name": "safe-worker",
+            "executable": "/opt/lab/safe-worker",
+            "user": "operator",
+            "architecture": "x86_64",
+            "cpu_percent": 2.5,
+            "memory_bytes": 8192,
+            "started_at": "2026-09-10T11:00:00Z"
+        }]
+    }))
+    .unwrap()
+}
+
 async fn login(session: Session, Extension(user): Extension<AuthenticatedUser>) -> StatusCode {
     AuthSession { session }.login(&user).await.unwrap();
     StatusCode::NO_CONTENT
@@ -197,6 +216,180 @@ async fn task_api_paginates_on_created_at_and_id_without_overlap() {
             .iter()
             .all(|task| !first_ids.contains(task["id"].as_str().unwrap()))
     );
+}
+
+#[tokio::test]
+async fn process_list_result_validates_and_persists_projection_atomically() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "process-projection", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let task_id = repo
+        .enqueue_task(
+            &session_id,
+            "nw/process-list",
+            &serde_json::json!([]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    let stdout = process_snapshot_fixture("2026-09-10T12:34:56Z");
+
+    assert!(
+        repo.store_task_result_for_session(&session_id, &task_id, true, &stdout, &[], 0)
+            .await
+            .unwrap()
+    );
+    let snapshot = repo
+        .latest_process_snapshot(&session_id)
+        .await
+        .unwrap()
+        .expect("persisted process projection");
+    assert_eq!(snapshot.task_id, task_id);
+    assert_eq!(snapshot.schema_version, "nw.process-list.v1");
+    assert_eq!(snapshot.captured_at, "2026-09-10T12:34:56Z");
+    assert_eq!(snapshot.snapshot_json["processes"][0]["pid"], 7331);
+}
+
+#[tokio::test]
+async fn process_list_result_rejects_unknown_schema_without_storing_any_result() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "process-invalid", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let task_id = repo
+        .enqueue_task(
+            &session_id,
+            "nw/process-list",
+            &serde_json::json!([]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    let invalid =
+        br#"{"schema":"nw.process-list.v2","captured_at":"2026-09-10T12:34:56Z","processes":[]}"#;
+
+    let error = repo
+        .store_task_result_for_session(&session_id, &task_id, true, invalid, &[], 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, naughtywolf::AppError::Validation(_)));
+    let result_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM c2_task_results WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    let snapshot_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM c2_process_snapshots WHERE session_id = ?")
+            .bind(&session_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert_eq!((result_count, snapshot_count), (0, 0));
+}
+
+#[tokio::test]
+async fn process_kill_success_enqueues_a_linked_refresh_after_completion() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "process-refresh", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let kill_id = repo
+        .enqueue_task_with_audit(
+            &session_id,
+            "nw/process-kill",
+            &serde_json::json!([7331]),
+            30_000,
+            &operator.id,
+            &operator.username,
+            None,
+            "process_kill_enqueued",
+        )
+        .await
+        .unwrap();
+    let kill_result = br#"{"schema":"nw.process-kill.v1","pid":7331,"name":"safe-worker","terminated":true,"terminated_at":"2026-09-10T12:35:00Z"}"#;
+
+    repo.store_task_result_for_session(&session_id, &kill_id, true, kill_result, &[], 0)
+        .await
+        .unwrap();
+
+    let refresh: (String, serde_json::Value, String, Option<String>) = sqlx::query_as(
+        "SELECT command, args_json, status, parent_task_id FROM c2_tasks WHERE parent_task_id = ?",
+    )
+    .bind(&kill_id)
+    .fetch_one(&repo.pool)
+    .await
+    .unwrap();
+    assert_eq!(refresh.0, "nw/process-list");
+    assert_eq!(refresh.1, serde_json::json!([]));
+    assert_eq!(refresh.2, "pending");
+    assert_eq!(refresh.3.as_deref(), Some(kill_id.as_str()));
+}
+
+#[tokio::test]
+async fn process_control_mutations_require_scope_and_csrf_and_audit_exact_pid() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "process-owner", Role::Operator).await;
+    let outsider = create_user(&repo, "process-outsider", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let owner_app = authenticated_app(repo.clone(), operator).await;
+
+    let missing_csrf = owner_app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/processes/refresh"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::BAD_REQUEST);
+
+    let outsider_app = authenticated_app(repo.clone(), outsider).await;
+    let hidden = outsider_app
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/processes/7331/kill"))
+                .header("x-csrf-token", "not-disclosed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    let page = owner_app
+        .clone()
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csrf = csrf_token(&response_text(page).await);
+    let kill = owner_app
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/processes/7331/kill"))
+                .header("x-csrf-token", csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(kill.status(), StatusCode::OK);
+    let kill = json(kill).await;
+    assert_eq!(kill["command"], "nw/process-kill");
+    assert_eq!(kill["arguments"], serde_json::json!(["7331"]));
+    let details: String = sqlx::query_scalar(
+        "SELECT details FROM c2_audit WHERE target_session = ? AND action = 'process_kill_enqueued'",
+    )
+    .bind(&session_id)
+    .fetch_one(&repo.pool)
+    .await
+    .unwrap();
+    assert!(details.contains("PID 7331"), "audit details: {details}");
 }
 
 #[tokio::test]

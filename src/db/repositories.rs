@@ -9,7 +9,7 @@ use crate::{
     auth::rbac::Role,
     db::models::{
         Asset, AssetStatus, AuditEvent, Callback, CheckRun, EventRule, Evidence, InstalledService,
-        Operation, OperationStatus, RunState, TaskRecord,
+        Operation, OperationStatus, ProcessSnapshot, RunState, TaskRecord,
     },
     error::AppError,
 };
@@ -852,6 +852,43 @@ impl Repository {
         Ok(task_id)
     }
 
+    pub async fn enqueue_process_kill_with_audit(
+        &self,
+        session_id: &str,
+        pid: u32,
+        operator_id: &str,
+        operator_name: &str,
+    ) -> Result<String, AppError> {
+        let task_id = Uuid::new_v4().to_string();
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_tasks \
+             (id, session_id, command, args_json, timeout_ms, status, operator_id) \
+             VALUES (?, ?, 'nw/process-kill', ?, 30000, 'pending', ?)",
+        )
+        .bind(&task_id)
+        .bind(session_id)
+        .bind(serde_json::json!([pid.to_string()]))
+        .bind(operator_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_audit \
+             (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+             VALUES (?, ?, 'process_kill_enqueued', ?, ?, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(operator_id)
+        .bind(operator_name)
+        .bind(session_id)
+        .bind(format!("task {task_id}: exact PID {pid}"))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+        Ok(task_id)
+    }
+
     pub async fn retry_task_with_audit(
         &self,
         session_id: &str,
@@ -990,21 +1027,62 @@ impl Repository {
         use base64::Engine;
 
         let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT status, cancellation_requested_at FROM c2_tasks WHERE id = ? AND session_id = ?",
+        let row: Option<(String, Option<String>, String, serde_json::Value, Option<String>)> = sqlx::query_as(
+            "SELECT status, cancellation_requested_at, command, args_json, operator_id FROM c2_tasks WHERE id = ? AND session_id = ?",
         )
         .bind(task_id)
         .bind(session_id)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
-        let Some((current, cancellation_requested_at)) = row else {
+        let Some((current, cancellation_requested_at, command, arguments, operator_id)) = row
+        else {
             return Ok(false);
         };
         if matches!(current.as_str(), "completed" | "error" | "cancelled") {
             transaction.commit().await.map_err(|_| AppError::Internal)?;
             return Ok(true);
         }
+
+        let process_snapshot = if ok && command == "nw/process-list" {
+            let snapshot: nw_profile::control::ProcessListV1 = serde_json::from_slice(stdout)
+                .map_err(|_| AppError::Validation("invalid process list result".to_owned()))?;
+            if snapshot.schema != nw_profile::control::PROCESS_LIST_SCHEMA_V1
+                || chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at).is_err()
+            {
+                return Err(AppError::Validation(
+                    "invalid process list result schema or capture time".to_owned(),
+                ));
+            }
+            Some(snapshot)
+        } else {
+            None
+        };
+        let process_kill = if ok && command == "nw/process-kill" {
+            let result: nw_profile::control::ProcessKillV1 = serde_json::from_slice(stdout)
+                .map_err(|_| AppError::Validation("invalid process kill result".to_owned()))?;
+            let expected_pid = arguments
+                .as_array()
+                .and_then(|values| values.as_slice().first())
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|pid| u32::try_from(pid).ok())
+                        .or_else(|| value.as_str().and_then(|pid| pid.parse().ok()))
+                });
+            if result.schema != nw_profile::control::PROCESS_KILL_SCHEMA_V1
+                || expected_pid != Some(result.pid)
+                || !result.terminated
+                || chrono::DateTime::parse_from_rfc3339(&result.terminated_at).is_err()
+            {
+                return Err(AppError::Validation(
+                    "invalid process kill result".to_owned(),
+                ));
+            }
+            Some(result)
+        } else {
+            None
+        };
 
         let status = if ok {
             "completed"
@@ -1025,6 +1103,25 @@ impl Repository {
         .execute(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
+        if let Some(snapshot) = process_snapshot {
+            let snapshot_json = serde_json::to_value(&snapshot).map_err(|_| AppError::Internal)?;
+            sqlx::query(
+                "INSERT INTO c2_process_snapshots \
+                 (session_id, task_id, schema_version, snapshot_json, captured_at) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(session_id) DO UPDATE SET task_id = excluded.task_id, \
+                 schema_version = excluded.schema_version, snapshot_json = excluded.snapshot_json, \
+                 captured_at = excluded.captured_at",
+            )
+            .bind(session_id)
+            .bind(task_id)
+            .bind(&snapshot.schema)
+            .bind(snapshot_json)
+            .bind(&snapshot.captured_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        }
         sqlx::query(
             "UPDATE c2_tasks SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), result_output = ?, \
@@ -1055,8 +1152,48 @@ impl Repository {
         .execute(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
+        if process_kill.is_some() {
+            let refresh_id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO c2_tasks \
+                 (id, session_id, command, args_json, timeout_ms, status, operator_id, parent_task_id) \
+                 VALUES (?, ?, 'nw/process-list', '[]', 30000, 'pending', ?, ?)",
+            )
+            .bind(&refresh_id)
+            .bind(session_id)
+            .bind(operator_id.as_deref())
+            .bind(task_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+            sqlx::query(
+                "INSERT INTO c2_audit \
+                 (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+                 VALUES (?, 'system', 'process_refresh_enqueued', ?, ?, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            )
+            .bind(operator_id.as_deref().unwrap_or(""))
+            .bind(session_id)
+            .bind(format!("task {refresh_id}: refresh after process kill task {task_id}"))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        }
         transaction.commit().await.map_err(|_| AppError::Internal)?;
         Ok(true)
+    }
+
+    pub async fn latest_process_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ProcessSnapshot>, AppError> {
+        sqlx::query_as::<_, ProcessSnapshot>(
+            "SELECT session_id, task_id, schema_version, snapshot_json, captured_at \
+             FROM c2_process_snapshots WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
     }
 
     pub async fn request_task_cancellation(

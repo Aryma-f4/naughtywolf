@@ -24,12 +24,119 @@
     let historyIndex = -1;
     let draft = "";
     let closed = false;
+    const processPanel = root.querySelector("[data-process-panel]");
+    const processSearch = root.querySelector("[data-process-search]");
+    const processBody = root.querySelector("[data-process-table-body]");
+    const processEmpty = root.querySelector("[data-process-empty]");
+    const processSnapshotAge = root.querySelector("[data-process-snapshot-age]");
+    const processMessage = root.querySelector("[data-process-message]");
+    const processRefresh = root.querySelector("[data-process-refresh]");
+    const processDetail = root.querySelector("[data-process-detail]");
+    const processConfirm = root.querySelector("[data-process-confirm]");
+    const processConfirmText = root.querySelector("[data-process-confirm-text]");
+    const processConfirmSubmit = root.querySelector("[data-process-confirm-submit]");
+    const processConfirmCancel = root.querySelector("[data-process-confirm-cancel]");
+    const processTaskLink = root.querySelector("[data-process-task-link]");
+    let processRows = [];
+    let processSortKey = "pid";
+    let processSortDirection = 1;
+    let selectedProcess = null;
 
     const element = (tag, className, text) => {
       const node = doc.createElement(tag);
       if (className) node.className = className;
       if (text !== undefined && text !== null) node.textContent = String(text);
       return node;
+    };
+
+    const unavailable = value => value === null || value === undefined || value === "" ? "Unavailable" : value;
+
+    const processAge = capturedAt => {
+      const captured = Date.parse(capturedAt || "");
+      if (!Number.isFinite(captured)) return "Snapshot time unavailable";
+      const current = typeof dependencies.now === "function" ? dependencies.now() : Date.now();
+      const ageMs = Math.max(0, current - captured);
+      const minutes = Math.floor(ageMs / 60000);
+      const hours = Math.floor(minutes / 60);
+      const days = Math.floor(hours / 24);
+      const remainderHours = hours % 24;
+      const remainderMinutes = minutes % 60;
+      let age = days ? `${days}d ${remainderHours}h` : hours ? `${hours}h ${remainderMinutes}m` : `${remainderMinutes}m`;
+      return `${age} old${ageMs > 15 * 60000 ? " · stale" : ""}`;
+    };
+
+    const processValue = (process, key) => {
+      if (key === "pid") return process.pid;
+      if (key === "parent_pid") return unavailable(process.parent_pid);
+      if (key === "cpu_percent") return process.cpu_percent === null || process.cpu_percent === undefined ? "Unavailable" : `${process.cpu_percent}%`;
+      if (key === "memory_bytes") return process.memory_bytes === null || process.memory_bytes === undefined ? "Unavailable" : `${process.memory_bytes} bytes`;
+      return unavailable(process[key]);
+    };
+
+    const renderProcessDetail = process => {
+      if (!processDetail || !process) return;
+      processDetail.replaceChildren(
+        element("strong", "process-detail-name", unavailable(process.name)),
+        element("p", "process-detail-pid", `PID ${process.pid}`),
+        element("p", "", `Parent PID: ${processValue(process, "parent_pid")}`),
+        element("p", "", `Executable: ${unavailable(process.executable)}`),
+        element("p", "", `User: ${unavailable(process.user)}`),
+        element("p", "", `Architecture: ${unavailable(process.architecture)}`),
+        element("p", "", `CPU: ${processValue(process, "cpu_percent")}`),
+        element("p", "", `Memory: ${processValue(process, "memory_bytes")}`),
+        element("p", "", `Started: ${unavailable(process.started_at)}`),
+      );
+      // Keep the aggregate text useful to assistive technology and lightweight DOM clients.
+      processDetail.textContent = `${unavailable(process.name)} PID ${process.pid} Parent PID: ${processValue(process, "parent_pid")} Executable: ${unavailable(process.executable)} User: ${unavailable(process.user)} Architecture: ${unavailable(process.architecture)} CPU: ${processValue(process, "cpu_percent")} Memory: ${processValue(process, "memory_bytes")} Started: ${unavailable(process.started_at)}`;
+    };
+
+    const renderProcesses = () => {
+      if (!processBody) return;
+      const query = (processSearch?.value || "").trim().toLowerCase();
+      const sorted = [...processRows].sort((a, b) => {
+        const left = processValue(a, processSortKey);
+        const right = processValue(b, processSortKey);
+        if (typeof left === "number" && typeof right === "number") return (left - right) * processSortDirection;
+        return String(left).localeCompare(String(right)) * processSortDirection;
+      });
+      const rows = sorted.map(process => {
+        const row = element("tr", "process-row");
+        row.dataset.processRow = "";
+        row.dataset.processPid = String(process.pid);
+        const haystack = [process.pid, process.parent_pid, process.name, process.executable, process.user, process.architecture]
+          .filter(value => value !== null && value !== undefined).join(" ").toLowerCase();
+        row.hidden = Boolean(query && !haystack.includes(query));
+        for (const key of ["pid", "parent_pid", "name", "executable", "user", "architecture", "cpu_percent", "memory_bytes", "started_at"]) {
+          const cell = element("td", "", processValue(process, key));
+          cell.dataset.processField = key;
+          row.append(cell);
+        }
+        const actions = element("td", "process-actions");
+        const kill = element("button", "btn btn-ghost", "Kill");
+        kill.type = "button";
+        kill.dataset.processKill = "";
+        actions.append(kill);
+        row.append(actions);
+        return row;
+      });
+      processBody.replaceChildren(...rows);
+      if (processEmpty) processEmpty.hidden = rows.some(row => !row.hidden);
+    };
+
+    const loadProcesses = async () => {
+      if (!processPanel || root.dataset.processCapable !== "true") return;
+      const response = await request(root.dataset.processesEndpoint, { credentials: "same-origin" });
+      if (!response.ok) throw new Error(`Process snapshot request failed (${response.status})`);
+      const snapshot = await response.json();
+      const data = snapshot?.snapshot_json || snapshot;
+      processRows = Array.isArray(data?.processes) ? data.processes : [];
+      if (processSnapshotAge) processSnapshotAge.textContent = data?.captured_at ? processAge(data.captured_at) : "No process snapshot yet";
+      if (processTaskLink && snapshot?.task_id) {
+        processTaskLink.setAttribute("href", `#task-${snapshot.task_id}`);
+        processTaskLink.textContent = `Task ${snapshot.task_id}`;
+        processTaskLink.hidden = false;
+      }
+      renderProcesses();
     };
 
     const field = (label, value, marker) => {
@@ -45,6 +152,7 @@
       const card = element("article", "callback-task-card");
       card.dataset.taskCard = "";
       card.dataset.taskId = task.id;
+      card.id = `task-${task.id}`;
       const header = element("header", "callback-task-header");
       const identity = element("div", "callback-task-identity");
       identity.append(element("code", "callback-task-command"));
@@ -145,8 +253,9 @@
       applyFilters();
     };
 
-    const upsert = task => {
+    const upsert = (task, options = {}) => {
       if (!task || !task.id) return;
+      const previous = tasks.get(task.id);
       tasks.set(task.id, { ...(tasks.get(task.id) || {}), ...task });
       let card = cards.get(task.id);
       if (!card) {
@@ -155,6 +264,11 @@
       }
       updateCard(card, tasks.get(task.id));
       renderOrder();
+      if ((options.fromEvent || previous) && previous?.status !== "completed" && task.status === "completed" && task.command === "nw/process-list") {
+        void loadProcesses().catch(() => {
+          if (processMessage) processMessage.textContent = "Process snapshot could not be refreshed; retry when the callback is available.";
+        });
+      }
     };
 
     const loadPage = async (before = null) => {
@@ -179,7 +293,7 @@
       if (closed || !root.dataset.eventsEndpoint || !EventStream) return;
       eventSource = new EventStream(root.dataset.eventsEndpoint);
       eventSource.addEventListener("task", event => {
-        try { upsert(JSON.parse(event.data)); } catch (_) { /* ignore malformed snapshots */ }
+        try { upsert(JSON.parse(event.data), { fromEvent: true }); } catch (_) { /* ignore malformed snapshots */ }
       });
       eventSource.onopen = () => {
         setConnection("Connected");
@@ -257,12 +371,97 @@
       }
     });
 
+    processSearch?.addEventListener("input", renderProcesses);
+    root.querySelectorAll?.("[data-process-sort]").forEach(button => {
+      button.addEventListener("click", () => {
+        const key = button.dataset.processSort;
+        if (processSortKey === key) processSortDirection *= -1;
+        else {
+          processSortKey = key;
+          processSortDirection = -1;
+        }
+        renderProcesses();
+      });
+    });
+    processBody?.addEventListener("click", event => {
+      const kill = event.target.closest?.("[data-process-kill]");
+      const row = event.target.closest?.("[data-process-row]");
+      if (!row) return;
+      const process = processRows.find(candidate => String(candidate.pid) === row.dataset.processPid);
+      if (!process) return;
+      selectedProcess = process;
+      renderProcessDetail(process);
+      if (kill && processConfirm && processConfirmText) {
+        processConfirmText.textContent = `Terminate ${unavailable(process.name)} (PID ${process.pid})? This exact process will be targeted.`;
+        processConfirm.hidden = false;
+      }
+    });
+    processRefresh?.addEventListener("click", async () => {
+      if (processRefresh.disabled) return;
+      processRefresh.disabled = true;
+      try {
+        const response = await request(`${root.dataset.processesEndpoint}/refresh`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "x-csrf-token": root.dataset.csrfToken },
+        });
+        if (!response.ok) throw new Error(`Process refresh task failed (${response.status})`);
+        upsert(await response.json());
+        if (processMessage) processMessage.textContent = "Process refresh queued.";
+      } catch (_) {
+        if (processMessage) processMessage.textContent = "Unable to queue process refresh; check callback scope and connection.";
+      } finally {
+        processRefresh.disabled = false;
+      }
+    });
+    processConfirmCancel?.addEventListener("click", () => {
+      if (processConfirm) processConfirm.hidden = true;
+      selectedProcess = null;
+    });
+    processConfirmSubmit?.addEventListener("click", async () => {
+      if (!selectedProcess || processConfirmSubmit.disabled) return;
+      const target = selectedProcess;
+      processConfirmSubmit.disabled = true;
+      try {
+        const response = await request(`${root.dataset.processesEndpoint}/${encodeURIComponent(target.pid)}/kill`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "x-csrf-token": root.dataset.csrfToken },
+        });
+        if (!response.ok) throw new Error(`Process kill task failed (${response.status})`);
+        const task = await response.json();
+        upsert(task);
+        if (processTaskLink) {
+          processTaskLink.setAttribute("href", `#task-${task.id}`);
+          processTaskLink.textContent = `Task ${task.id}`;
+          processTaskLink.hidden = false;
+        }
+        if (processMessage) processMessage.textContent = `Kill task ${task.id} queued; the table refreshes after successful completion.`;
+        if (processConfirm) processConfirm.hidden = true;
+        selectedProcess = null;
+      } catch (_) {
+        if (processMessage) processMessage.textContent = "Unable to queue process kill; check callback scope and connection.";
+      } finally {
+        processConfirmSubmit.disabled = false;
+      }
+    });
+
     if (offlineQueue) {
       offlineQueue.hidden = root.dataset.online !== "false";
       offlineQueue.textContent = "Callback is offline. New tasks stay queued until its next check-in.";
     }
+    if (processPanel) {
+      const capable = root.dataset.processCapable === "true";
+      if (!capable) {
+        if (processRefresh) processRefresh.disabled = true;
+        if (processMessage) processMessage.textContent = "This callback does not advertise process control capability.";
+      } else if (root.dataset.online === "false" && processMessage) {
+        processMessage.textContent = "Callback is offline. Process tasks remain queued until its next check-in.";
+      }
+    }
     setConnection("Connecting");
     const ready = loadPage()
+      .then(() => closed ? undefined : loadProcesses())
       .then(() => connect())
       .catch(() => setConnection("History unavailable — retry"));
 
