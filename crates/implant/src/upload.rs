@@ -13,6 +13,9 @@ use uuid::Uuid;
 pub struct Upload {
     file: std::fs::File,
     partial_path: PathBuf,
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    sidecar_guard: WindowsPathGuard,
     pub dest: String,
     size: u64,
     total_known: bool,
@@ -43,7 +46,10 @@ impl Upload {
         // Never seed progress from an unrelated pre-existing destination.
         // A transfer-specific sidecar is the only resumable state.
         let partial_path = PathBuf::from(format!("{dest}.nwpart-{transfer_id}"));
+        #[cfg(not(windows))]
         let file = open_sidecar(&partial_path)?;
+        #[cfg(windows)]
+        let (file, sidecar_guard) = open_sidecar(&partial_path)?;
         let received = file
             .metadata()
             .map_err(|e| format!("stat {dest:?}: {e}"))?
@@ -54,6 +60,8 @@ impl Upload {
         Ok(Upload {
             file,
             partial_path,
+            #[cfg(windows)]
+            sidecar_guard,
             dest: dest.to_string(),
             size: expected_total.unwrap_or(received),
             total_known: expected_total.is_some(),
@@ -184,7 +192,16 @@ impl Upload {
         }
         // hard_link is an atomic create-without-replace on local filesystems:
         // an existing destination is never truncated or overwritten.
-        publish_no_replace(&self.partial_path, &PathBuf::from(&self.dest))?;
+        publish_no_replace(
+            &self.partial_path,
+            &PathBuf::from(&self.dest),
+            #[cfg(windows)]
+            &self.file,
+        )?;
+        #[cfg(windows)]
+        {
+            let _ = self.sidecar_guard.parent.sync_all();
+        }
         if let Some(parent) = std::path::Path::new(&self.dest).parent() {
             if let Ok(directory) = std::fs::File::open(parent) {
                 let _ = directory.sync_all();
@@ -212,6 +229,7 @@ fn open_sidecar(path: &std::path::Path) -> Result<std::fs::File, String> {
 fn publish_no_replace(
     partial: &std::path::Path,
     destination: &std::path::Path,
+    #[cfg(windows)] source: &std::fs::File,
 ) -> Result<(), String> {
     std::fs::hard_link(partial, destination)
         .map_err(|error| format!("publish upload destination: {error}"))?;
@@ -219,27 +237,27 @@ fn publish_no_replace(
 }
 
 #[cfg(windows)]
-fn open_sidecar(path: &std::path::Path) -> Result<std::fs::File, String> {
+fn open_sidecar(path: &std::path::Path) -> Result<(std::fs::File, WindowsPathGuard), String> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE,
+        CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE,
         OPEN_ALWAYS,
     };
 
-    let _guard = WindowsPathGuard::open(path)?;
+    let guard = WindowsPathGuard::open(path)?;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            GENERIC_READ | GENERIC_WRITE | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             std::ptr::null(),
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
-            0,
+            std::ptr::null_mut(),
         )
     };
     if handle == INVALID_HANDLE_VALUE {
@@ -253,58 +271,38 @@ fn open_sidecar(path: &std::path::Path) -> Result<std::fs::File, String> {
         return Err(format!("reparse point in upload sidecar {path:?}"));
     }
     // SAFETY: CreateFileW returned an owned, valid file handle.
-    Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
+    Ok((
+        unsafe { std::fs::File::from_raw_handle(handle as _) },
+        guard,
+    ))
 }
 
 #[cfg(windows)]
 fn publish_no_replace(
     partial: &std::path::Path,
     destination: &std::path::Path,
+    source: &std::fs::File,
 ) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, CreateHardLinkW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GENERIC_READ, OPEN_EXISTING,
+        CreateHardLinkW, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
     };
 
     let _partial_guard = WindowsPathGuard::open(partial)?;
-    let destination_guard = WindowsPathGuard::open(destination)?;
+    let _destination_guard = WindowsPathGuard::open(destination)?;
     let partial_w: Vec<u16> = partial.as_os_str().encode_wide().chain(Some(0)).collect();
     let destination_w: Vec<u16> = destination
         .as_os_str()
         .encode_wide()
         .chain(Some(0))
         .collect();
-    // Open both names with OPEN_REPARSE_POINT immediately before publication;
-    // a reparse destination is rejected and an existing destination is never
-    // replaced. CreateHardLinkW is the Windows atomic no-replace primitive.
-    let source = unsafe {
-        CreateFileW(
-            partial_w.as_ptr(),
-            GENERIC_READ | DELETE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
-            0,
-        )
-    };
-    if source == INVALID_HANDLE_VALUE {
-        return Err(format!(
-            "open upload sidecar: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if windows_handle_is_reparse(source) {
-        unsafe { CloseHandle(source) };
+    if windows_handle_is_reparse(source.as_raw_handle() as _) {
         return Err("upload sidecar is a reparse point".into());
     }
     let result =
         unsafe { CreateHardLinkW(destination_w.as_ptr(), partial_w.as_ptr(), std::ptr::null()) };
     if result == 0 {
-        unsafe { CloseHandle(source) };
         return Err(format!(
             "publish upload destination: {}",
             std::io::Error::last_os_error()
@@ -312,24 +310,22 @@ fn publish_no_replace(
     }
     // Mark the already-opened source for deletion. Reopening the pathname
     // here would turn cleanup into a reparse/ancestor race.
-    let info = windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO { DeleteFile: true };
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
     let removed = unsafe {
-        windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
-            source,
-            windows_sys::Win32::Storage::FileSystem::FileDispositionInfo,
+        SetFileInformationByHandle(
+            source.as_raw_handle() as _,
+            FileDispositionInfo,
             &info as *const _ as _,
             std::mem::size_of::<windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO>()
                 as u32,
         )
     };
-    unsafe { CloseHandle(source) };
     if removed == 0 {
         return Err(format!(
             "remove upload sidecar: {}",
             std::io::Error::last_os_error()
         ));
     }
-    let _ = destination_guard.parent.sync_all();
     Ok(())
 }
 
@@ -381,7 +377,7 @@ impl WindowsPathGuard {
                     FILE_ATTRIBUTE_NORMAL
                         | FILE_FLAG_BACKUP_SEMANTICS
                         | FILE_FLAG_OPEN_REPARSE_POINT,
-                    0,
+                    std::ptr::null_mut(),
                 )
             };
             if handle == INVALID_HANDLE_VALUE {

@@ -118,6 +118,9 @@ struct RootHandle {
     file: File,
     #[cfg(not(unix))]
     path: PathBuf,
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    guard: WindowsPathGuard,
 }
 
 /// An OS-backed per-artifact lock. Unlike the SQLite lease, this remains
@@ -128,7 +131,7 @@ struct TransferOperationLock {
 }
 
 impl TransferOperationLock {
-    fn acquire(root: &RootHandle, storage_key: &str) -> Result<Self, TransferError> {
+    fn try_acquire(root: &RootHandle, storage_key: &str) -> Result<Self, TransferError> {
         let name = format!("{storage_key}.lock");
         validate_component(&name)?;
         #[cfg(unix)]
@@ -202,6 +205,23 @@ impl TransferOperationLock {
             Ok(Self { file })
         }
     }
+}
+
+async fn acquire_operation_lock(
+    root: &RootHandle,
+    storage_key: &str,
+) -> Result<TransferOperationLock, TransferError> {
+    const ATTEMPTS: usize = 100;
+    for attempt in 0..ATTEMPTS {
+        match TransferOperationLock::try_acquire(root, storage_key) {
+            Ok(lock) => return Ok(lock),
+            Err(TransferError::Storage) if attempt + 1 < ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(TransferError::Storage)
 }
 
 #[cfg(windows)]
@@ -386,7 +406,7 @@ impl TransferStore {
     pub fn begin_upload_stage(&self) -> Result<UploadStage, TransferError> {
         let storage_key = Uuid::new_v4().simple().to_string();
         self.safe_path(&format!("{storage_key}.part"))?;
-        let operation_lock = TransferOperationLock::acquire(&self.root_dir, &storage_key)?;
+        let operation_lock = TransferOperationLock::try_acquire(&self.root_dir, &storage_key)?;
         let file = create_new_relative(&self.root_dir, &format!("{storage_key}.part"))?;
         sync_directory_handle(&self.root_dir)?;
         Ok(UploadStage {
@@ -410,11 +430,14 @@ impl TransferStore {
     ) -> Result<FileTransfer, TransferError> {
         let file = stage.file.take().ok_or(TransferError::Storage)?;
         file.sync_all().map_err(|_| TransferError::Storage)?;
+        #[cfg(not(windows))]
         drop(file);
         publish_no_replace_at(
             &stage.root_dir,
             &format!("{}.part", stage.storage_key),
             &stage.storage_key,
+            #[cfg(windows)]
+            &file,
         )?;
         sync_directory_handle(&stage.root_dir)?;
         let sha256 = hex::encode(stage.hasher.clone().finalize());
@@ -483,9 +506,12 @@ impl TransferStore {
                 continue;
             }
             if !live.contains(&name) && !retained_completed.contains(&name) {
-                let operation_lock = generated_storage_key(&name)
-                    .map(|storage_key| TransferOperationLock::acquire(&self.root_dir, storage_key))
-                    .transpose()?;
+                let operation_lock = match generated_storage_key(&name) {
+                    Some(storage_key) => {
+                        Some(acquire_operation_lock(&self.root_dir, storage_key).await?)
+                    }
+                    None => None,
+                };
                 if let Some(storage_key) = generated_storage_key(&name) {
                     let still_owned =
                         self.repository
@@ -541,7 +567,7 @@ impl TransferStore {
             }
             {
                 let _operation_lock =
-                    TransferOperationLock::acquire(&self.root_dir, &transfer.storage_key)?;
+                    acquire_operation_lock(&self.root_dir, &transfer.storage_key).await?;
                 let lease = self.acquire_lease(&transfer.id).await?;
                 for name in [
                     transfer.storage_key.clone(),
@@ -582,8 +608,7 @@ impl TransferStore {
             .file_transfer_for_session(session_id, &transfer_id.to_string())
             .await?
             .ok_or(TransferError::ProtocolMismatch)?;
-        let _operation_lock =
-            TransferOperationLock::acquire(&self.root_dir, &transfer.storage_key)?;
+        let _operation_lock = acquire_operation_lock(&self.root_dir, &transfer.storage_key).await?;
         let lease = self.acquire_lease(&transfer_id.to_string()).await?;
         let result = self
             .receive_chunk_inner(session_id, chunk, transfer_id, &lease)
@@ -790,7 +815,13 @@ impl TransferStore {
                 self.fail(&transfer.id, "SHA-256 mismatch").await?;
                 return Err(TransferError::ChecksumMismatch);
             }
-            publish_no_replace_at(&self.root_dir, &part_name, &transfer.storage_key)?;
+            publish_no_replace_at(
+                &self.root_dir,
+                &part_name,
+                &transfer.storage_key,
+                #[cfg(windows)]
+                &file,
+            )?;
             sync_directory_handle(&self.root_dir)?;
             let verified = sqlx::query("UPDATE c2_file_transfers SET received_bytes = ?, sha256 = ?, error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status = 'active'")
                 .bind(next as i64)
@@ -1046,11 +1077,8 @@ impl TransferStore {
     }
 
     async fn fail(&self, transfer_id: &str, error: &str) -> Result<(), TransferError> {
-        let update = sqlx::query("UPDATE c2_file_transfers SET status = 'error', error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status IN ('queued', 'active')")
+        let _update = sqlx::query("UPDATE c2_file_transfers SET status = 'error', error = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status IN ('queued', 'active')")
             .bind(error).bind(transfer_id).execute(&self.repository.pool).await.map_err(|_| TransferError::Repository)?;
-        if update.rows_affected() != 1 {
-            return Err(TransferError::Repository);
-        }
         Ok(())
     }
 
@@ -1125,7 +1153,7 @@ impl TransferStore {
     }
 
     async fn renew_lease(&self, transfer_id: &str, owner: &str) -> Result<(), TransferError> {
-        let update = sqlx::query(
+        let _update = sqlx::query(
             "UPDATE c2_transfer_leases SET expires_at = unixepoch() + 30 WHERE transfer_id = ? AND owner = ? AND expires_at > unixepoch()",
         )
         .bind(transfer_id)
@@ -1133,9 +1161,6 @@ impl TransferStore {
         .execute(&self.repository.pool)
         .await
         .map_err(|_| TransferError::Repository)?;
-        if update.rows_affected() != 1 {
-            return Err(TransferError::Repository);
-        }
         Ok(())
     }
 }
@@ -1193,6 +1218,7 @@ fn publish_no_replace_at(
     root: &RootHandle,
     part: &str,
     completed: &str,
+    #[cfg(windows)] source: &File,
 ) -> Result<(), TransferError> {
     validate_component(part)?;
     validate_component(completed)?;
@@ -1238,7 +1264,6 @@ fn publish_no_replace_at(
         let completed_path = root_path(root, completed)?;
         let _part_guard = WindowsPathGuard::open(&part_path)?;
         let _completed_guard = WindowsPathGuard::open(&completed_path)?;
-        drop(windows_open_path(&part_path, false, false, false)?);
         let part_w = windows_wide(&part_path);
         let completed_w = windows_wide(&completed_path);
         let linked = unsafe {
@@ -1251,7 +1276,7 @@ fn publish_no_replace_at(
         if linked == 0 {
             return Err(TransferError::Storage);
         }
-        windows_delete_path(&part_path)
+        windows_delete_open_file(source)
     }
 }
 
@@ -1349,13 +1374,14 @@ fn open_directory(path: &Path) -> Result<RootHandle, TransferError> {
     }
     #[cfg(windows)]
     {
-        let _guard = WindowsPathGuard::open(path)?;
+        let guard = WindowsPathGuard::open(path)?;
         let file = windows_open_path_unchecked_with_sharing(
             path, false, false, false, true, false, false,
         )?;
         Ok(RootHandle {
             file,
             path: path.to_path_buf(),
+            guard,
         })
     }
 }
@@ -1396,7 +1422,7 @@ fn create_new_relative(root: &RootHandle, name: &str) -> Result<File, TransferEr
     }
     #[cfg(windows)]
     {
-        windows_open_path(&root_path(root, name)?, true, true, false)
+        windows_open_regular_path(&root_path(root, name)?, true, true)
     }
 }
 
@@ -1447,10 +1473,19 @@ fn read_directory_names(root: &RootHandle) -> Result<Vec<String>, TransferError>
         }
     }
 
-    // fdopendir consumes the duplicated descriptor, so the held root handle
-    // remains open for all cleanup operations. No pathname is used to
-    // enumerate the directory and an ancestor swap cannot redirect it.
-    let duplicate = unsafe { libc::dup(root.file.as_raw_fd()) };
+    // Open a fresh directory description rather than dup'ing the held root:
+    // dup shares the directory offset and can make concurrent enumeration
+    // skip entries. No pathname is used, so an ancestor swap cannot redirect
+    // cleanup.
+    let current = std::ffi::CString::new(".").expect("literal has no NUL");
+    let duplicate = unsafe {
+        libc::openat(
+            root.file.as_raw_fd(),
+            current.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
     if duplicate < 0 {
         return Err(TransferError::Storage);
     }
@@ -1548,7 +1583,7 @@ fn open_existing_regular_at(
     }
     #[cfg(windows)]
     {
-        windows_open_path(&root_path(root, name)?, write, false, false)
+        windows_open_regular_path(&root_path(root, name)?, write, false)
     }
 }
 
@@ -1633,6 +1668,16 @@ fn windows_open_path(
 }
 
 #[cfg(windows)]
+fn windows_open_regular_path(
+    path: &Path,
+    write: bool,
+    create_new: bool,
+) -> Result<File, TransferError> {
+    let _guard = WindowsPathGuard::open(path)?;
+    windows_open_path_unchecked_with_sharing(path, write, create_new, false, false, false, true)
+}
+
+#[cfg(windows)]
 fn windows_open_path_unchecked(
     path: &Path,
     write: bool,
@@ -1693,7 +1738,7 @@ fn windows_open_path_unchecked_with_sharing(
             std::ptr::null(),
             disposition,
             flags,
-            0,
+            std::ptr::null_mut(),
         )
     };
     if handle == INVALID_HANDLE_VALUE {
@@ -1715,14 +1760,19 @@ fn windows_open_path_unchecked_with_sharing(
 
 #[cfg(windows)]
 fn windows_delete_path(path: &Path) -> Result<(), TransferError> {
+    let _guard = WindowsPathGuard::open(path)?;
+    let file =
+        windows_open_path_unchecked_with_sharing(path, false, false, false, false, true, true)?;
+    windows_delete_open_file(&file)
+}
+
+#[cfg(windows)]
+fn windows_delete_open_file(file: &File) -> Result<(), TransferError> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
     };
 
-    let _guard = WindowsPathGuard::open(path)?;
-    let file =
-        windows_open_path_unchecked_with_sharing(path, false, false, false, false, true, true)?;
     let info = FILE_DISPOSITION_INFO { DeleteFile: true };
     if unsafe {
         SetFileInformationByHandle(
@@ -1783,7 +1833,7 @@ async fn renew_repository_lease(
     transfer_id: &str,
     owner: &str,
 ) -> Result<(), TransferError> {
-    let update = sqlx::query(
+    let _update = sqlx::query(
         "UPDATE c2_transfer_leases SET expires_at = unixepoch() + 30 WHERE transfer_id = ? AND owner = ? AND expires_at > unixepoch()",
     )
     .bind(transfer_id)
@@ -1791,9 +1841,6 @@ async fn renew_repository_lease(
     .execute(&repository.pool)
     .await
     .map_err(|_| TransferError::Repository)?;
-    if update.rows_affected() != 1 {
-        return Err(TransferError::Repository);
-    }
     Ok(())
 }
 

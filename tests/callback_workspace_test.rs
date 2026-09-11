@@ -730,7 +730,17 @@ async fn final_download_chunk_stays_provisional_until_task_result() {
 
 #[tokio::test]
 async fn concurrent_store_instances_serialize_same_transfer() {
-    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("transfers.sqlite");
+    std::fs::File::create(&database).unwrap();
+    let database_url = format!("sqlite://{}", database.display());
+    let pool = db::create_pool(&database_url).await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    let repo = Repository { pool };
+    let operator = create_user(&repo, "concurrent-store", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let store = TransferStore::new(repo.clone(), directory.path(), 4096).unwrap();
     let transfer = store
         .queue_download(
             &session_id,
@@ -742,7 +752,9 @@ async fn concurrent_store_instances_serialize_same_transfer() {
         )
         .await
         .unwrap();
-    let second = TransferStore::new(repo, directory.path(), 4096).unwrap();
+    let second_pool = db::create_pool(&database_url).await.unwrap();
+    let second =
+        TransferStore::new(Repository { pool: second_pool }, directory.path(), 4096).unwrap();
     let first_chunk = transfer_chunk(&transfer, 0, 6, b"abc");
     let (left, right) = tokio::join!(
         store.receive_chunk(&session_id, &first_chunk),
