@@ -325,7 +325,9 @@ impl BeaconRuntime {
         for ack in pr.acks {
             let mut dl = self.download.write().unwrap();
             if let Some(d) = dl.as_mut() {
-                if d.done() && !ack.done {
+                if ack.transfer_id != Some(d.transfer_id()) {
+                    continue;
+                } else if !ack.done {
                     d.resume_to(ack.received);
                 } else if ack.done {
                     self.pending.lock().unwrap().push(TaskResult {
@@ -347,10 +349,23 @@ impl BeaconRuntime {
             let mut done_meta: Option<(Uuid, u64, String)> = None;
             if let Some(u) = up.as_mut() {
                 for chunk in &pr.push_chunks {
-                    let ack = u.write_chunk(chunk);
-                    if ack.done {
-                        done_meta = Some((u.task_id(), ack.total, u.dest.clone()));
-                        break;
+                    match u.write_chunk(chunk) {
+                        Ok(ack) if ack.done => {
+                            done_meta = Some((u.task_id(), ack.total, u.dest.clone()));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.pending.lock().unwrap().push(TaskResult {
+                                task_id: u.task_id(),
+                                ok: false,
+                                stdout: Vec::new(),
+                                stderr: error.into_bytes(),
+                                exit_code: -1,
+                            });
+                            *up = None;
+                            break;
+                        }
                     }
                 }
             }
@@ -485,7 +500,17 @@ impl BeaconRuntime {
         }
         if task.command == "nw/download" {
             match task.args.as_slice() {
-                [path] => {
+                [path, transfer_id] => {
+                    let Ok(transfer_id) = Uuid::parse_str(transfer_id) else {
+                        self.pending.lock().unwrap().push(TaskResult {
+                            task_id: task.id,
+                            ok: false,
+                            stdout: Vec::new(),
+                            stderr: b"invalid download transfer id".to_vec(),
+                            exit_code: -1,
+                        });
+                        return;
+                    };
                     let mut slot = self.download.write().unwrap();
                     if slot.is_some() {
                         self.pending.lock().unwrap().push(TaskResult {
@@ -496,7 +521,7 @@ impl BeaconRuntime {
                             exit_code: -1,
                         });
                     } else {
-                        match Download::open(path, task.id) {
+                        match Download::open(path, transfer_id, task.id) {
                             Ok(d) => {
                                 // Stream in the background; the completion
                                 // result is reported when the server acks.
@@ -516,7 +541,7 @@ impl BeaconRuntime {
                     task_id: task.id,
                     ok: false,
                     stdout: Vec::new(),
-                    stderr: b"usage: nw/download <path>".to_vec(),
+                    stderr: b"usage: nw/download <path> <transfer-id>".to_vec(),
                     exit_code: -1,
                 }),
             }
@@ -524,7 +549,17 @@ impl BeaconRuntime {
         }
         if task.command == "nw/upload" {
             match task.args.as_slice() {
-                [dest] => {
+                [dest, transfer_id] => {
+                    let Ok(transfer_id) = Uuid::parse_str(transfer_id) else {
+                        self.pending.lock().unwrap().push(TaskResult {
+                            task_id: task.id,
+                            ok: false,
+                            stdout: Vec::new(),
+                            stderr: b"invalid upload transfer id".to_vec(),
+                            exit_code: -1,
+                        });
+                        return;
+                    };
                     let mut slot = self.upload.write().unwrap();
                     if slot.is_some() {
                         self.pending.lock().unwrap().push(TaskResult {
@@ -535,7 +570,7 @@ impl BeaconRuntime {
                             exit_code: -1,
                         });
                     } else {
-                        match crate::upload::Upload::open(dest, task.id) {
+                        match crate::upload::Upload::open(dest, transfer_id, task.id) {
                             Ok(u) => *slot = Some(u),
                             Err(e) => self.pending.lock().unwrap().push(TaskResult {
                                 task_id: task.id,
@@ -551,7 +586,7 @@ impl BeaconRuntime {
                     task_id: task.id,
                     ok: false,
                     stdout: Vec::new(),
-                    stderr: b"usage: nw/upload <dest>".to_vec(),
+                    stderr: b"usage: nw/upload <dest> <transfer-id>".to_vec(),
                     exit_code: -1,
                 }),
             }

@@ -89,16 +89,17 @@ function skeleton() {
   const sortPid = new Element('button');
   sortPid.dataset.processSort = 'pid';
   root.append(sortName, sortPid);
-  for (const key of ['filePanel', 'filePathForm', 'filePath', 'fileBreadcrumbs', 'fileParent', 'fileTableBody', 'fileEmpty', 'fileSnapshotAge', 'fileMessage', 'fileRefresh', 'fileMkdirForm', 'fileMkdirName', 'fileUpload', 'fileDownload', 'fileTaskLink', 'fileConfirm', 'fileConfirmText', 'fileConfirmSubmit', 'fileConfirmCancel', 'fileMoveFields', 'fileMoveDestination', 'fileDeleteFields', 'fileDeleteRecursive']) {
+  for (const key of ['filePanel', 'filePathForm', 'filePath', 'fileBreadcrumbs', 'fileParent', 'fileTableBody', 'fileEmpty', 'fileSnapshotAge', 'fileMessage', 'fileRefresh', 'fileMkdirForm', 'fileMkdirName', 'fileUpload', 'fileDownload', 'fileUploadForm', 'fileUploadInput', 'fileUploadDestination', 'fileTransferList', 'fileTaskLink', 'fileConfirm', 'fileConfirmText', 'fileConfirmSubmit', 'fileConfirmCancel', 'fileMoveFields', 'fileMoveDestination', 'fileDeleteFields', 'fileDeleteRecursive']) {
     const isButton = ['fileParent', 'fileRefresh', 'fileUpload', 'fileDownload', 'fileConfirmSubmit', 'fileConfirmCancel'].includes(key);
-    const isInput = ['filePath', 'fileMkdirName', 'fileMoveDestination', 'fileDeleteRecursive'].includes(key);
-    const isForm = ['filePathForm', 'fileMkdirForm'].includes(key);
+    const isInput = ['filePath', 'fileMkdirName', 'fileMoveDestination', 'fileDeleteRecursive', 'fileUploadInput', 'fileUploadDestination'].includes(key);
+    const isForm = ['filePathForm', 'fileMkdirForm', 'fileUploadForm'].includes(key);
     const element = new Element(isButton ? 'button' : isInput ? 'input' : isForm ? 'form' : 'div');
     element.dataset[key] = '';
     root.append(element);
   }
   const filePanel = root.querySelector('[data-file-panel]');
   filePanel.dataset.filesEndpoint = '/api/callbacks/callback-1/files';
+  filePanel.dataset.transfersEndpoint = '/api/callbacks/callback-1/transfers';
   filePanel.dataset.fileCapable = 'true';
   filePanel.dataset.transferCapable = 'false';
   filePanel.dataset.defaultPath = '/';
@@ -588,4 +589,60 @@ test('filesystem refresh is typed while unsupported controls and transfers stay 
   await unsupportedWorkspace.ready;
   assert.equal(unsupported.querySelector('[data-file-refresh]').disabled, true);
   assert.match(unsupported.querySelector('[data-file-message]').textContent, /does not advertise filesystem control/i);
+});
+
+test('transfer controls queue exact downloads and stream multipart uploads with CSRF', async () => {
+  const root = skeleton();
+  root.querySelector('[data-file-panel]').dataset.transferCapable = 'true';
+  const deps = urlDependencies('/srv/lab');
+  class FormData {
+    constructor() { this.values = []; }
+    append(name, value) { this.values.push([name, value]); }
+  }
+  deps.FormData = FormData;
+  const calls = [];
+  deps.fetch = async (url, options = {}) => {
+    calls.push([url, options]);
+    if (url.includes('/files?')) return { ok: true, json: async () => filesystemSnapshot() };
+    if (url.endsWith('/processes')) return { ok: true, json: async () => null };
+    if (url.endsWith('/files/download')) return { ok: true, json: async () => ({ id: 'download-safe', remote_path: '/srv/lab/<img>.txt', expected_size: 12, received_bytes: 0, status: 'queued', sha256: null }) };
+    if (url.endsWith('/files/upload')) return { ok: true, json: async () => ({ id: 'upload-safe', remote_path: '/srv/lab/upload.bin', expected_size: 3, received_bytes: 0, status: 'queued', sha256: 'abc' }) };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  assert.equal(root.querySelector('[data-file-upload]').disabled, false);
+  assert.equal(root.querySelector('[data-file-download]').disabled, false);
+
+  const fileRow = root.querySelectorAll('[data-file-row]').find(row => row.dataset.fileKind === 'file');
+  const download = fileRow.querySelector('[data-file-download-action]');
+  const event = root.querySelector('[data-file-table-body]').dispatch('click', { target: download });
+  await event.pending;
+  const downloadCall = calls.find(([url]) => url.endsWith('/files/download'));
+  assert.deepEqual(JSON.parse(downloadCall[1].body), { path: '/srv/lab/<img src=x onerror=alert(1)>.txt', expected_size: 4 });
+  assert.equal(downloadCall[1].headers['x-csrf-token'], 'csrf');
+
+  root.querySelector('[data-file-upload-destination]').value = '/srv/lab/upload.bin';
+  root.querySelector('[data-file-upload-input]').files = [{ name: '<img>.bin', size: 3 }];
+  const upload = root.querySelector('[data-file-upload-form]').dispatch('submit');
+  await upload.pending;
+  const uploadCall = calls.find(([url]) => url.endsWith('/files/upload'));
+  assert.equal(uploadCall[1].headers['x-csrf-token'], 'csrf');
+  assert.equal(uploadCall[1].headers['content-type'], undefined);
+  assert.deepEqual(uploadCall[1].body.values.map(([name]) => name), ['destination', 'file']);
+});
+
+test('transfer SSE renders progress checksum and unsafe errors as text only', async () => {
+  const root = skeleton();
+  root.querySelector('[data-file-panel]').dataset.transferCapable = 'true';
+  const deps = urlDependencies('/srv/lab');
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  deps.source.listeners.transfer({ data: JSON.stringify({
+    id: 'transfer-1', direction: 'download', remote_path: '<img src=x onerror=alert(1)>',
+    expected_size: 3072, received_bytes: 1536, status: 'error', sha256: 'deadbeef', error: '<script>alert(1)</script>',
+  }) });
+  const item = root.querySelector('[data-transfer-id]');
+  assert.match(item.textContent, /50%.*deadbeef.*<script>alert\(1\)<\/script>/s);
+  assert.equal(item.querySelector('script'), null);
 });

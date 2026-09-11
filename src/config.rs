@@ -9,6 +9,7 @@ pub struct Config {
     pub tcp_bind: Option<SocketAddr>,
     pub tcp_protocol: String,
     pub evidence_dir: PathBuf,
+    pub max_transfer_bytes: u64,
     pub session_secret: String,
     pub cookie_secure: bool,
     pub c2_psk: Vec<u8>,
@@ -44,6 +45,17 @@ impl Config {
             evidence_dir: env::var("NAUGHTYWOLF_EVIDENCE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("evidence")),
+            max_transfer_bytes: match env::var("NAUGHTYWOLF_MAX_TRANSFER_BYTES") {
+                Ok(value) => value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or(ConfigError::InvalidMaxTransferBytes)?,
+                Err(env::VarError::NotPresent) => 268_435_456,
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err(ConfigError::InvalidMaxTransferBytes);
+                }
+            },
             session_secret: env::var("NAUGHTYWOLF_SESSION_SECRET")
                 .map_err(|_| ConfigError::Missing("NAUGHTYWOLF_SESSION_SECRET"))?,
             cookie_secure: match env::var("NAUGHTYWOLF_COOKIE_SECURE") {
@@ -67,6 +79,7 @@ impl Config {
             tcp_bind: None,
             tcp_protocol: "tcp".into(),
             evidence_dir: PathBuf::from("evidence"),
+            max_transfer_bytes: 268_435_456,
             session_secret: "test-session-secret-not-for-production".to_string(),
             cookie_secure: false,
             c2_psk: b"dev-psk-change-me".to_vec(),
@@ -96,6 +109,8 @@ pub enum ConfigError {
     InvalidTcpBind(#[source] std::net::AddrParseError),
     #[error("NAUGHTYWOLF_TCP_PROTOCOL must be tcp or gs")]
     InvalidTcpProtocol,
+    #[error("NAUGHTYWOLF_MAX_TRANSFER_BYTES must be a positive integer")]
+    InvalidMaxTransferBytes,
     #[error("{0} must be true, false, 1, or 0")]
     InvalidBoolean(&'static str),
 }

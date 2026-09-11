@@ -63,6 +63,10 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
     let repository = Repository { pool };
     let c2_psk = Arc::new(config.c2_psk.clone());
     let evidence_store = EvidenceStore::from_config(repository.clone(), &config);
+    let transfer_store = naughtywolf::callback_workspace::transfers::TransferStore::from_config(
+        repository.clone(),
+        &config,
+    )?;
     let app = Router::<Repository>::new()
         .route("/login", post(login_handler))
         .merge(portal::authenticated_router())
@@ -71,6 +75,7 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
         .merge(public_router())
         .layer(Extension(c2_psk.clone()))
         .layer(axum::Extension(evidence_store))
+        .layer(axum::Extension(transfer_store))
         .layer(session_layer);
 
     if let Some(bind) = config.tcp_bind {

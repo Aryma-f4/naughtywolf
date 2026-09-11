@@ -932,6 +932,11 @@ pub fn callback_detail_page(
         .as_ref()
         .map(|capabilities| capabilities.file_browser)
         .unwrap_or(false);
+    let transfer_capable = callback
+        .capabilities_json
+        .as_ref()
+        .map(|capabilities| capabilities.file_transfer)
+        .unwrap_or(false);
     let file_default_path = if callback.os.to_ascii_lowercase().contains("windows") {
         r"C:\"
     } else {
@@ -965,13 +970,14 @@ pub fn callback_detail_page(
             <aside class="process-detail" data-process-detail aria-live="polite"><p>Select a process to inspect its latest values.</p></aside>
             <div class="process-confirm" data-process-confirm hidden role="dialog" aria-modal="true" aria-labelledby="process-confirm-title"><h4 id="process-confirm-title">Confirm process termination</h4><p data-process-confirm-text></p><button type="button" class="btn btn-ghost" data-process-confirm-cancel>Cancel</button><button type="button" class="btn btn-danger" data-process-confirm-submit>Terminate exact PID</button></div>
           </section>
-          <section id="files" class="file-panel panel" data-file-panel data-files-endpoint="/api/callbacks/{callback_id}/files" data-file-capable="{file_capable}" data-transfer-capable="false" data-default-path="{file_default_path}">
+          <section id="files" class="file-panel panel" data-file-panel data-files-endpoint="/api/callbacks/{callback_id}/files" data-transfers-endpoint="/api/callbacks/{callback_id}/transfers" data-file-capable="{file_capable}" data-transfer-capable="{transfer_capable}" data-default-path="{file_default_path}">
             <header class="file-panel-head"><div><p class="eyebrow">FILESYSTEM CONTROL / AUDITED</p><h3>Files</h3><p>Latest structured directory snapshot from this callback.</p></div><div class="file-controls"><span data-file-snapshot-age>Loading snapshot…</span><button type="button" class="btn btn-ghost" data-file-refresh>Refresh</button></div></header>
             <p class="file-message" data-file-message role="status" aria-live="polite"></p>
             <form class="file-path-form" data-file-path-form><button type="button" class="btn btn-ghost" data-file-parent aria-label="Open parent directory">Parent</button><label class="sr-only" for="callback-file-path">Remote path</label><input id="callback-file-path" type="text" data-file-path autocomplete="off" required><button type="submit" class="btn btn-ghost">Open path</button></form>
             <nav class="file-breadcrumbs" data-file-breadcrumbs aria-label="Remote path breadcrumbs"></nav>
             <div class="file-toolbar"><form data-file-mkdir-form><label>New directory<input type="text" data-file-mkdir-name autocomplete="off" required></label><button type="submit" class="btn btn-ghost">Mkdir</button></form><a data-file-task-link href="#tasking" hidden>Open filesystem task in Tasking</a></div>
-            <div class="file-transfer-controls" aria-label="File transfers"><button type="button" class="btn btn-ghost" data-file-upload disabled>Transfer support is being initialized</button><button type="button" class="btn btn-ghost" data-file-download disabled>Transfer support is being initialized</button></div>
+            <div class="file-transfer-controls" aria-label="File transfers"><form data-file-upload-form><label>Remote destination<input type="text" data-file-upload-destination autocomplete="off" {transfer_disabled}></label><label>Local file<input type="file" data-file-upload-input {transfer_disabled}></label><button type="submit" class="btn btn-ghost" data-file-upload {transfer_disabled}>{transfer_upload_label}</button></form><button type="button" class="btn btn-ghost" data-file-download {transfer_disabled}>{transfer_download_label}</button></div>
+            <section class="file-transfer-list" data-file-transfer-list aria-label="Transfer progress" aria-live="polite"></section>
             <div class="table-scroll"><table class="data-table file-table"><caption class="sr-only">Callback filesystem</caption><thead><tr><th><button type="button" data-file-sort="name">Name</button></th><th><button type="button" data-file-sort="kind">Kind</button></th><th><button type="button" data-file-sort="size">Size</button></th><th><button type="button" data-file-sort="modified_at">Modified</button></th><th><button type="button" data-file-sort="permissions">Permissions</button></th><th><button type="button" data-file-sort="owner">Owner</button></th><th>Actions</th></tr></thead><tbody data-file-table-body></tbody></table></div>
             <p class="file-empty" data-file-empty hidden>No entries are available for this directory snapshot.</p>
             <div class="file-confirm" data-file-confirm hidden role="dialog" aria-modal="true" aria-labelledby="file-confirm-title"><h4 id="file-confirm-title">Confirm exact filesystem target</h4><p data-file-confirm-text></p><div data-file-move-fields hidden><label>Exact destination<input type="text" data-file-move-destination autocomplete="off"></label></div><div data-file-delete-fields hidden><label><input type="checkbox" data-file-delete-recursive> Delete directory contents recursively</label></div><button type="button" class="btn btn-ghost" data-file-confirm-cancel>Cancel</button><button type="button" class="btn btn-danger" data-file-confirm-submit>Queue exact action</button></div>
@@ -986,6 +992,18 @@ pub fn callback_detail_page(
         online = online,
         process_capable = process_capable,
         file_capable = file_capable,
+        transfer_capable = transfer_capable,
+        transfer_disabled = if transfer_capable { "" } else { "disabled" },
+        transfer_upload_label = if transfer_capable {
+            "Upload file"
+        } else {
+            "Transfer support is being initialized"
+        },
+        transfer_download_label = if transfer_capable {
+            "Download a listed file"
+        } else {
+            "Transfer support is being initialized"
+        },
         file_default_path = escape_html(file_default_path),
         file_default_path_url = file_default_path_url,
         session_context = session_context,

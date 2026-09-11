@@ -138,7 +138,7 @@ async fn process_poll(state: &ServerState, env: Envelope) -> Result<Envelope, C2
     // Server->implant upload: apply acks and build push chunks to this beacon's
     // transport budget.
     for ack in &req.upload_acks {
-        state.uploads.apply_ack(&sid, ack.received, ack.done);
+        state.uploads.apply_ack(&sid, ack);
     }
     let push_chunks = state.uploads.push_budget(&sid, req.inner_budget);
     state.registry.touch(&sid).await;

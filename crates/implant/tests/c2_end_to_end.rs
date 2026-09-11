@@ -3,6 +3,7 @@
 //! the result comes back over the real HTTP channel.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +34,38 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+#[derive(Clone)]
+struct DropPartialTransferResponse {
+    watched: PathBuf,
+    expected: u64,
+    dropped: Arc<AtomicBool>,
+}
+
+async fn drop_partial_transfer_response(
+    State(state): State<DropPartialTransferResponse>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    let bytes = if state.watched.is_dir() {
+        std::fs::read_dir(&state.watched)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.metadata().ok().map(|metadata| metadata.len()))
+            .max()
+            .unwrap_or(0)
+    } else {
+        std::fs::metadata(&state.watched)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    };
+    if bytes > 0 && bytes < state.expected && !state.dropped.swap(true, Ordering::SeqCst) {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    response
 }
 
 #[derive(Clone)]
@@ -304,13 +337,13 @@ async fn download_streams_a_remote_file_to_the_server() {
     let endpoint = format!("http://127.0.0.1:{}", port);
 
     // A source file on the "implant" side.
-    let src = std::env::temp_dir().join("nw-dl-src.dat");
-    let payload: Vec<u8> = (0..=255).cycle().take(5000).collect();
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let src = fixture_dir.path().join("nw-dl-src.dat");
+    let payload: Vec<u8> = (0..=255).cycle().take(3072).collect();
     std::fs::write(&src, &payload).unwrap();
 
     // A dedicated downloads dir so we can assert the file landed.
-    let dl_dir = std::env::temp_dir().join(format!("nw-dl-out-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dl_dir);
+    let dl_dir = fixture_dir.path().join("downloads");
 
     let registry = Arc::new(SessionRegistry::new());
     let queue = Arc::new(TaskQueue::new());
@@ -323,8 +356,20 @@ async fn download_streams_a_remote_file_to_the_server() {
         creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
 
-    let bind = format!("127.0.0.1:{}", port);
-    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
+    let dropped = Arc::new(AtomicBool::new(false));
+    let drop_state = DropPartialTransferResponse {
+        watched: dl_dir.clone(),
+        expected: 3072,
+        dropped: dropped.clone(),
+    };
+    let app = nw_server::channels::application(state).layer(axum::middleware::from_fn_with_state(
+        drop_state,
+        drop_partial_transfer_response,
+    ));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let server_handle = tokio::spawn(async move { axum::serve(listener, app).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let profile = Profile {
@@ -348,7 +393,10 @@ async fn download_streams_a_remote_file_to_the_server() {
         .push(
             &sid,
             "nw/download".into(),
-            vec![src.to_str().unwrap().to_string()],
+            vec![
+                src.to_str().unwrap().to_string(),
+                Uuid::new_v4().to_string(),
+            ],
             60_000,
         )
         .await
@@ -366,12 +414,19 @@ async fn download_streams_a_remote_file_to_the_server() {
     let out_path = dl_dir.join(format!("{}-nw-dl-src.dat", sid));
     let written = std::fs::read(&out_path).unwrap_or_default();
     assert_eq!(written, payload, "downloaded bytes must match source");
+    use sha2::Digest as _;
+    assert_eq!(
+        sha2::Sha256::digest(&written),
+        sha2::Sha256::digest(&payload)
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "test must lose a mid-transfer response"
+    );
 
     runtime.trigger_stop();
     let _ = beacon.await;
     server_handle.abort();
-    std::fs::remove_file(&src).ok();
-    let _ = std::fs::remove_dir_all(&dl_dir);
 }
 
 #[tokio::test]
@@ -384,12 +439,12 @@ async fn upload_streams_a_local_file_to_the_implant() {
     let endpoint = format!("http://127.0.0.1:{}", port);
 
     // A source file on the "server/operator" side to push out.
-    let src = std::env::temp_dir().join("nw-up-src.dat");
-    let payload: Vec<u8> = (0..=255).cycle().take(5000).collect();
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let src = fixture_dir.path().join("nw-up-src.dat");
+    let payload: Vec<u8> = (0..=255).cycle().take(3072).collect();
     std::fs::write(&src, &payload).unwrap();
 
-    let dest = std::env::temp_dir().join(format!("nw-up-dest-{}.dat", std::process::id()));
-    let _ = std::fs::remove_file(&dest);
+    let dest = fixture_dir.path().join("nw-up-dest.dat");
 
     let registry = Arc::new(SessionRegistry::new());
     let queue = Arc::new(TaskQueue::new());
@@ -403,8 +458,20 @@ async fn upload_streams_a_local_file_to_the_implant() {
         creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
     };
 
-    let bind = format!("127.0.0.1:{}", port);
-    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
+    let dropped = Arc::new(AtomicBool::new(false));
+    let drop_state = DropPartialTransferResponse {
+        watched: dest.clone(),
+        expected: 3072,
+        dropped: dropped.clone(),
+    };
+    let app = nw_server::channels::application(state).layer(axum::middleware::from_fn_with_state(
+        drop_state,
+        drop_partial_transfer_response,
+    ));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let server_handle = tokio::spawn(async move { axum::serve(listener, app).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // The operator uses a Dispatch over the SAME queue/uploads so the upload job
@@ -465,12 +532,19 @@ async fn upload_streams_a_local_file_to_the_implant() {
         written, payload,
         "implant-side file must match the pushed source"
     );
+    use sha2::Digest as _;
+    assert_eq!(
+        sha2::Sha256::digest(&written),
+        sha2::Sha256::digest(&payload)
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "test must lose a mid-transfer response"
+    );
 
     runtime.trigger_stop();
     let _ = beacon.await;
     server_handle.abort();
-    std::fs::remove_file(&src).ok();
-    std::fs::remove_file(&dest).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

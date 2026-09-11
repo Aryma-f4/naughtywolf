@@ -29,7 +29,7 @@ hkdf = "0.12"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 serde_urlencoded = "0.7"
 futures = "0.3"
 async-trait = "0.1"
@@ -46,7 +46,7 @@ edition = "2024"
 description = "Sliver Web GUI — authorized operator/admin console"
 
 [dependencies]
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }

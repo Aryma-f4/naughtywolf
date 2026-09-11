@@ -83,6 +83,7 @@ impl FileStore {
             if let Err(e) = append_at(&path, &data) {
                 tracing::warn!(file = %path.display(), "append chunk: {e}");
                 return FileAck {
+                    transfer_id: chunk.transfer_id,
                     received: job.received,
                     total: job.total,
                     done: false,
@@ -92,6 +93,7 @@ impl FileStore {
         }
         job.done = job.received >= job.total;
         FileAck {
+            transfer_id: chunk.transfer_id,
             received: job.received,
             total: job.total,
             done: job.done,

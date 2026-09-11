@@ -9,7 +9,8 @@ use crate::{
     auth::rbac::Role,
     db::models::{
         Asset, AssetStatus, AuditEvent, Callback, CheckRun, EventRule, Evidence, FileSnapshot,
-        InstalledService, Operation, OperationStatus, ProcessSnapshot, RunState, TaskRecord,
+        FileTransfer, InstalledService, Operation, OperationStatus, ProcessSnapshot, RunState,
+        TaskRecord,
     },
     error::AppError,
 };
@@ -40,6 +41,130 @@ pub struct Repository {
 }
 
 impl Repository {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_file_transfer_with_audit(
+        &self,
+        transfer_id: &str,
+        session_id: &str,
+        direction: &str,
+        remote_path: &str,
+        storage_key: &str,
+        expected_size: Option<u64>,
+        sha256: Option<&str>,
+        operator_id: &str,
+        operator_name: &str,
+    ) -> Result<FileTransfer, AppError> {
+        let command = match direction {
+            "download" => "nw/download",
+            "upload" => "nw/upload",
+            _ => {
+                return Err(AppError::Validation(
+                    "invalid transfer direction".to_owned(),
+                ));
+            }
+        };
+        let task_id = Uuid::new_v4().to_string();
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_tasks (id, session_id, command, args_json, timeout_ms, status, operator_id) \
+             VALUES (?, ?, ?, ?, 300000, 'pending', ?)",
+        )
+        .bind(&task_id)
+        .bind(session_id)
+        .bind(command)
+        .bind(serde_json::json!([remote_path, transfer_id]))
+        .bind(operator_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_file_transfers \
+             (id, session_id, task_id, direction, remote_path, storage_key, expected_size, received_bytes, sha256, status, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'queued', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(transfer_id)
+        .bind(session_id)
+        .bind(&task_id)
+        .bind(direction)
+        .bind(remote_path)
+        .bind(storage_key)
+        .bind(expected_size.and_then(|size| i64::try_from(size).ok()))
+        .bind(sha256)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_audit \
+             (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+             VALUES (?, ?, ?, ?, ?, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(operator_id)
+        .bind(operator_name)
+        .bind(format!("file_{direction}_enqueued"))
+        .bind(session_id)
+        .bind(format!(
+            "task {task_id}; transfer {transfer_id}; exact destination {remote_path}"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+        self.file_transfer(transfer_id)
+            .await?
+            .ok_or(AppError::Internal)
+    }
+
+    pub async fn file_transfer(&self, transfer_id: &str) -> Result<Option<FileTransfer>, AppError> {
+        sqlx::query_as::<_, FileTransfer>("SELECT * FROM c2_file_transfers WHERE id = ?")
+            .bind(transfer_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn file_transfer_for_session(
+        &self,
+        session_id: &str,
+        transfer_id: &str,
+    ) -> Result<Option<FileTransfer>, AppError> {
+        sqlx::query_as::<_, FileTransfer>(
+            "SELECT * FROM c2_file_transfers WHERE id = ? AND session_id = ?",
+        )
+        .bind(transfer_id)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn next_file_transfer(
+        &self,
+        session_id: &str,
+        direction: &str,
+    ) -> Result<Option<FileTransfer>, AppError> {
+        sqlx::query_as::<_, FileTransfer>(
+            "SELECT * FROM c2_file_transfers WHERE session_id = ? AND direction = ? \
+             AND status IN ('active', 'queued') ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, created_at, id LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(direction)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_file_transfers(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<FileTransfer>, AppError> {
+        sqlx::query_as::<_, FileTransfer>(
+            "SELECT * FROM c2_file_transfers WHERE session_id = ? ORDER BY created_at DESC, id DESC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
     pub async fn list_users(&self) -> Result<Vec<PortalUser>, AppError> {
         let rows = sqlx::query_as::<_, PortalUserRow>(
             "SELECT id, username, role, disabled, created_at FROM users ORDER BY created_at, id",

@@ -234,9 +234,15 @@ impl Dispatcher {
                 if args.len() != 1 {
                     return Outcome::Error("usage: download <remote-path>".into());
                 }
+                let transfer_id = uuid::Uuid::new_v4();
                 match self
                     .queue
-                    .push(&sid, "nw/download".into(), vec![args[0].clone()], 60_000)
+                    .push(
+                        &sid,
+                        "nw/download".into(),
+                        vec![args[0].clone(), transfer_id.to_string()],
+                        60_000,
+                    )
                     .await
                 {
                     Ok(task_id) => Outcome::TaskQueued {
@@ -257,20 +263,30 @@ impl Dispatcher {
                 let [local, dest] = args.as_slice() else {
                     return Outcome::Error("usage: upload <local-path> <remote-dest>".into());
                 };
-                if let Err(e) = self.uploads.start(&sid, local.into(), dest.clone()) {
-                    return Outcome::Error(e);
-                }
-                // Queue the task that opens the destination on the agent; the job
-                // is already registered so the agent's next poll starts receiving.
+                let transfer_id = uuid::Uuid::new_v4();
                 match self
                     .queue
-                    .push(&sid, "nw/upload".into(), vec![dest.clone()], 60_000)
+                    .push(
+                        &sid,
+                        "nw/upload".into(),
+                        vec![dest.clone(), transfer_id.to_string()],
+                        60_000,
+                    )
                     .await
                 {
-                    Ok(task_id) => Outcome::TaskQueued {
-                        session: sid,
+                    Ok(task_id) => match self.uploads.start(
+                        &sid,
+                        local.into(),
+                        dest.clone(),
+                        transfer_id,
                         task_id,
-                        role: self.operator.role,
+                    ) {
+                        Ok(()) => Outcome::TaskQueued {
+                            session: sid,
+                            task_id,
+                            role: self.operator.role,
+                        },
+                        Err(error) => Outcome::Error(error),
                     },
                     Err(e) => Outcome::Error(e.to_string()),
                 }
@@ -613,7 +629,9 @@ mod tests {
         let queued = d.queue.drain(&sid).await;
         assert_eq!(queued[0].id, task_id);
         assert_eq!(queued[0].command, "nw/download");
-        assert_eq!(queued[0].args, ["/etc/hosts"]);
+        assert_eq!(queued[0].args[0], "/etc/hosts");
+        assert_eq!(queued[0].args.len(), 2);
+        assert!(uuid::Uuid::parse_str(&queued[0].args[1]).is_ok());
     }
 
     #[tokio::test]

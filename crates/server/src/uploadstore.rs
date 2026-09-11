@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use nw_profile::msgs::FileChunk;
+use nw_profile::msgs::{FileAck, FileChunk};
 use uuid::Uuid;
 
 /// Chunk size for a server->implant file push (matches the download side).
@@ -17,6 +17,8 @@ pub struct Upload {
     /// Next byte of `src` to send (server-confirmed resume point).
     offset: u64,
     total: u64,
+    transfer_id: Uuid,
+    task_id: Uuid,
 }
 
 /// Per-session registry of active uploads (server pushing a local file out to
@@ -27,7 +29,14 @@ pub struct UploadStore {
 }
 
 impl UploadStore {
-    pub fn start(&self, session: &Uuid, src: PathBuf, dest: String) -> Result<(), String> {
+    pub fn start(
+        &self,
+        session: &Uuid,
+        src: PathBuf,
+        dest: String,
+        transfer_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<(), String> {
         let total = File::open(&src)
             .and_then(|f| f.metadata())
             .map_err(|e| format!("open {src:?}: {e}"))?
@@ -43,6 +52,8 @@ impl UploadStore {
                 dest,
                 offset: 0,
                 total,
+                transfer_id,
+                task_id,
             },
         );
         Ok(())
@@ -50,13 +61,16 @@ impl UploadStore {
 
     /// Apply an agent ack: advance the resume point. Removes the job once the
     /// whole file is confirmed received.
-    pub fn apply_ack(&self, session: &Uuid, received: u64, done: bool) {
+    pub fn apply_ack(&self, session: &Uuid, ack: &FileAck) {
         let mut map = self.inner.lock().unwrap();
         if let Some(u) = map.get_mut(session) {
-            if done {
+            if ack.transfer_id != Some(u.transfer_id) {
+                return;
+            }
+            if ack.done {
                 map.remove(session);
             } else {
-                u.offset = received;
+                u.offset = ack.received.min(u.total);
             }
         }
     }
@@ -82,8 +96,8 @@ impl UploadStore {
             Err(_) => return Vec::new(),
         };
         let mut chunks = Vec::new();
-        let mut remaining = budget as u64;
-        let mut offset = u.offset;
+        let remaining = budget as u64;
+        let offset = u.offset;
         let mut rd = file;
         while remaining > 0 && offset < u.total {
             let take = remaining.min(CHUNK).min(u.total - offset) as usize;
@@ -95,15 +109,15 @@ impl UploadStore {
             }
             buf.truncate(n);
             chunks.push(FileChunk {
+                transfer_id: Some(u.transfer_id),
+                task_id: Some(u.task_id),
                 name: u.dest.clone(),
                 offset,
                 total: u.total,
                 data: buf,
             });
-            offset += n as u64;
-            remaining -= n as u64;
+            break;
         }
-        u.offset = offset;
         chunks
     }
 }
@@ -124,22 +138,45 @@ mod tests {
 
         let store = UploadStore::default();
         let sid = Uuid::new_v4();
+        let transfer_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         store
-            .start(&sid, src.clone(), "/tmp/out.bin".into())
+            .start(
+                &sid,
+                src.clone(),
+                "/tmp/out.bin".into(),
+                transfer_id,
+                task_id,
+            )
             .unwrap();
 
         let c0 = store.push_budget(&sid, 2048);
-        assert_eq!(c0.len(), 2);
+        assert_eq!(c0.len(), 1);
         assert_eq!(c0[0].offset, 0);
-        assert_eq!(c0[1].offset, 1024);
 
         // A resume ack rewinds the server cursor.
-        store.apply_ack(&sid, 1024, false);
+        store.apply_ack(
+            &sid,
+            &FileAck {
+                transfer_id: Some(transfer_id),
+                received: 1024,
+                total: 3000,
+                done: false,
+            },
+        );
         let c1 = store.push_budget(&sid, 4096);
         assert_eq!(c1[0].offset, 1024);
 
         // Confirming done removes the job.
-        store.apply_ack(&sid, 3000, true);
+        store.apply_ack(
+            &sid,
+            &FileAck {
+                transfer_id: Some(transfer_id),
+                received: 3000,
+                total: 3000,
+                done: true,
+            },
+        );
         assert!(store.push_budget(&sid, 4096).is_empty());
 
         std::fs::remove_file(&src).ok();

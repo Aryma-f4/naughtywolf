@@ -298,23 +298,32 @@ pub async fn task_events(
 
     let all_tasks = repository.list_all_task_records(&session_id).await?;
     let mut known = HashMap::new();
+    let mut known_transfers = HashMap::new();
     let mut queued = VecDeque::new();
     for (index, record) in all_tasks.into_iter().enumerate() {
         let view = TaskView::from(record);
         let serialized = serde_json::to_string(&view).map_err(|_| AppError::Internal)?;
         known.insert(view.id.clone(), serialized.clone());
         if index < 20 {
-            queued.push_back(serialized);
+            queued.push_back(("task", serialized));
         }
+    }
+    for transfer in repository.list_file_transfers(&session_id).await? {
+        let serialized = serde_json::to_string(&transfer).map_err(|_| AppError::Internal)?;
+        known_transfers.insert(transfer.id.clone(), serialized.clone());
+        queued.push_back(("transfer", serialized));
     }
 
     let stream = futures::stream::unfold(
-        (repository, session_id, known, queued),
-        |(repository, session_id, mut known, mut queued)| async move {
+        (repository, session_id, known, known_transfers, queued),
+        |(repository, session_id, mut known, mut known_transfers, mut queued)| async move {
             loop {
-                if let Some(snapshot) = queued.pop_front() {
-                    let event = Event::default().event("task").data(snapshot);
-                    return Some((Ok(event), (repository, session_id, known, queued)));
+                if let Some((kind, snapshot)) = queued.pop_front() {
+                    let event = Event::default().event(kind).data(snapshot);
+                    return Some((
+                        Ok(event),
+                        (repository, session_id, known, known_transfers, queued),
+                    ));
                 }
 
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -329,7 +338,20 @@ pub async fn task_events(
                     };
                     if known.get(&view.id) != Some(&serialized) {
                         known.insert(view.id, serialized.clone());
-                        queued.push_back(serialized);
+                        queued.push_back(("task", serialized));
+                    }
+                }
+                let transfers = match repository.list_file_transfers(&session_id).await {
+                    Ok(transfers) => transfers,
+                    Err(_) => return None,
+                };
+                for transfer in transfers.into_iter().rev() {
+                    let Ok(serialized) = serde_json::to_string(&transfer) else {
+                        continue;
+                    };
+                    if known_transfers.get(&transfer.id) != Some(&serialized) {
+                        known_transfers.insert(transfer.id, serialized.clone());
+                        queued.push_back(("transfer", serialized));
                     }
                 }
             }

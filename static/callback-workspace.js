@@ -57,6 +57,10 @@
     const fileMkdirName = root.querySelector("[data-file-mkdir-name]");
     const fileUpload = root.querySelector("[data-file-upload]");
     const fileDownload = root.querySelector("[data-file-download]");
+    const fileUploadForm = root.querySelector("[data-file-upload-form]");
+    const fileUploadInput = root.querySelector("[data-file-upload-input]");
+    const fileUploadDestination = root.querySelector("[data-file-upload-destination]");
+    const fileTransferList = root.querySelector("[data-file-transfer-list]");
     const fileTaskLink = root.querySelector("[data-file-task-link]");
     const fileConfirm = root.querySelector("[data-file-confirm]");
     const fileConfirmText = root.querySelector("[data-file-confirm-text]");
@@ -73,6 +77,7 @@
     let fileSortKey = "name";
     let fileSortDirection = 1;
     let pendingFileAction = null;
+    const transfers = new Map();
 
     const selectedTab = (() => {
       if (!browserLocation?.href) return "tasking";
@@ -256,11 +261,62 @@
         remove.type = "button";
         remove.dataset.fileDelete = "";
         actions.append(move, remove);
+        if (entry.kind === "file" && fileDataset.transferCapable === "true") {
+          const download = element("button", "btn btn-ghost", "Download");
+          download.type = "button";
+          download.dataset.fileDownloadAction = "";
+          actions.prepend(download);
+        }
         row.append(actions);
         return row;
       });
       fileBody.replaceChildren(...rows);
       if (fileEmpty) fileEmpty.hidden = rows.length !== 0;
+    };
+
+    const renderTransfers = () => {
+      if (!fileTransferList) return;
+      const items = [...transfers.values()].map(transfer => {
+        const total = Number(transfer.expected_size) || 0;
+        const received = Math.max(0, Number(transfer.received_bytes) || 0);
+        const percent = total ? Math.min(100, Math.floor((received / total) * 100)) : 0;
+        const item = element("article", "file-transfer");
+        item.dataset.transferId = String(transfer.id);
+        item.append(
+          element("strong", "file-transfer-path", unavailable(transfer.remote_path)),
+          element("span", "file-transfer-direction", unavailable(transfer.direction)),
+          element("span", "file-transfer-progress", `${received} / ${total || "?"} bytes · ${percent}% · ${unavailable(transfer.status)}`),
+          element("code", "file-transfer-checksum", transfer.sha256 ? `SHA-256 ${transfer.sha256}` : "SHA-256 pending"),
+        );
+        if (transfer.error) item.append(element("p", "file-transfer-error", transfer.error));
+        if (transfer.direction === "download" && transfer.status === "completed") {
+          const link = element("a", "btn btn-ghost", "Save verified file");
+          link.setAttribute("href", `${fileDataset.transfersEndpoint}/${encodeURIComponent(transfer.id)}/download`);
+          item.append(link);
+        }
+        return item;
+      });
+      fileTransferList.replaceChildren(...items);
+    };
+
+    const upsertTransfer = transfer => {
+      if (!transfer?.id) return;
+      transfers.set(transfer.id, { ...(transfers.get(transfer.id) || {}), ...transfer });
+      renderTransfers();
+    };
+
+    const queueDownload = async entry => {
+      const response = await request(`${fileDataset.filesEndpoint}/download`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json", "x-csrf-token": root.dataset.csrfToken },
+        body: JSON.stringify({ path: entry.path, expected_size: entry.size }),
+      });
+      if (!response.ok) throw new Error(`Download request failed (${response.status})`);
+      const transfer = await response.json();
+      upsertTransfer(transfer);
+      if (fileMessage) fileMessage.textContent = `Download transfer ${transfer.id} queued.`;
+      return transfer;
     };
 
     const loadFiles = async () => {
@@ -574,6 +630,9 @@
       eventSource.addEventListener("task", event => {
         try { upsert(JSON.parse(event.data), { fromEvent: true }); } catch (_) { /* ignore malformed snapshots */ }
       });
+      eventSource.addEventListener("transfer", event => {
+        try { upsertTransfer(JSON.parse(event.data)); } catch (_) { /* ignore malformed snapshots */ }
+      });
       eventSource.onopen = () => {
         setConnection("Connected");
         if (reconnecting) {
@@ -757,7 +816,14 @@
     fileBody?.addEventListener("click", async event => {
       const row = event.target.closest?.("[data-file-row]");
       if (!row) return;
-      if (event.target.closest?.("[data-file-move]")) {
+      if (event.target.closest?.("[data-file-download-action]")) {
+        try {
+          const entry = fileRows.find(candidate => String(candidate.path) === row.dataset.filePath);
+          if (entry) await queueDownload(entry);
+        } catch (_) {
+          if (fileMessage) fileMessage.textContent = "Unable to queue download; check callback scope and retry.";
+        }
+      } else if (event.target.closest?.("[data-file-move]")) {
         openFileConfirmation({ kind: "move", source: row.dataset.filePath });
       } else if (event.target.closest?.("[data-file-delete]")) {
         openFileConfirmation({ kind: "delete", path: row.dataset.filePath });
@@ -824,6 +890,40 @@
         fileConfirmSubmit.disabled = false;
       }
     });
+    fileUploadForm?.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (fileDataset.transferCapable !== "true" || fileUpload?.disabled) return;
+      const destination = normalizeRemotePath(fileUploadDestination?.value || "");
+      const file = fileUploadInput?.files?.[0];
+      if (!destination || !file) {
+        if (fileMessage) fileMessage.textContent = "Choose one local file and an absolute remote destination.";
+        return;
+      }
+      fileUpload.disabled = true;
+      try {
+        const FormDataType = dependencies.FormData || FormData;
+        const body = new FormDataType();
+        body.append("destination", destination);
+        body.append("file", file);
+        const response = await request(`${fileDataset.filesEndpoint}/upload`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "x-csrf-token": root.dataset.csrfToken },
+          body,
+        });
+        if (!response.ok) throw new Error(`Upload request failed (${response.status})`);
+        const transfer = await response.json();
+        upsertTransfer(transfer);
+        if (fileMessage) fileMessage.textContent = `Upload transfer ${transfer.id} queued.`;
+      } catch (_) {
+        if (fileMessage) fileMessage.textContent = "Unable to stage upload; verify size, scope, and destination.";
+      } finally {
+        fileUpload.disabled = false;
+      }
+    });
+    fileDownload?.addEventListener("click", () => {
+      if (fileMessage) fileMessage.textContent = "Choose Download beside an exact remote file.";
+    });
     browserEvents?.addEventListener?.("popstate", restoreFileLocation);
 
     if (offlineQueue) {
@@ -843,12 +943,12 @@
       const capable = fileDataset.fileCapable === "true";
       renderFileNavigation();
       if (fileUpload) {
-        fileUpload.disabled = true;
-        fileUpload.textContent = "Transfer support is being initialized";
+        fileUpload.disabled = fileDataset.transferCapable !== "true";
+        fileUpload.textContent = fileDataset.transferCapable === "true" ? "Upload file" : "Transfer support is being initialized";
       }
       if (fileDownload) {
-        fileDownload.disabled = true;
-        fileDownload.textContent = "Transfer support is being initialized";
+        fileDownload.disabled = fileDataset.transferCapable !== "true";
+        fileDownload.textContent = fileDataset.transferCapable === "true" ? "Download a listed file" : "Transfer support is being initialized";
       }
       if (!capable) {
         if (fileRefresh) fileRefresh.disabled = true;

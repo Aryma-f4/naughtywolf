@@ -9,10 +9,13 @@ use axum::{
 use futures::StreamExt;
 use naughtywolf::{
     auth::{AuthenticatedUser, middleware::AuthSession, rbac::Role},
+    callback_workspace::transfers::{TransferError, TransferStore},
     db::{self, repositories::Repository},
     portal,
 };
+use nw_profile::msgs::FileChunk;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
 
@@ -67,6 +70,528 @@ async fn create_scoped_callback(repo: &Repository, user_id: &str, session_id: &s
         .execute(&repo.pool)
         .await
         .unwrap();
+}
+
+async fn transfer_fixture(
+    max_bytes: u64,
+) -> (
+    tempfile::TempDir,
+    Repository,
+    TransferStore,
+    AuthenticatedUser,
+    String,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = test_repository().await;
+    let operator = create_user(
+        &repo,
+        &format!("transfer-{}", uuid::Uuid::new_v4()),
+        Role::Operator,
+    )
+    .await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let store = TransferStore::new(repo.clone(), directory.path(), max_bytes).unwrap();
+    (directory, repo, store, operator, session_id)
+}
+
+fn transfer_chunk(
+    transfer: &naughtywolf::db::models::FileTransfer,
+    offset: u64,
+    total: u64,
+    data: &[u8],
+) -> FileChunk {
+    FileChunk {
+        transfer_id: Some(uuid::Uuid::parse_str(&transfer.id).unwrap()),
+        task_id: transfer
+            .task_id
+            .as_deref()
+            .map(|id| uuid::Uuid::parse_str(id).unwrap()),
+        name: "untrusted/../../remote-name.bin".into(),
+        offset,
+        total,
+        data: data.to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn transfer_store_persists_contiguous_progress_and_resumes_after_reopen() {
+    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let expected = hex::encode(Sha256::digest(b"abcdef"));
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/remote.bin",
+            Some(6),
+            Some(&expected),
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+
+    let first = store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 6, b"abc"))
+        .await
+        .unwrap();
+    assert_eq!(first.received, 3);
+    assert!(!first.done);
+
+    let reopened = TransferStore::new(repo, directory.path(), 4096).unwrap();
+    let second = reopened
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 3, 6, b"def"))
+        .await
+        .unwrap();
+    assert_eq!(second.received, 6);
+    assert!(second.done);
+    let repeated_final_ack = reopened
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 3, 6, b"def"))
+        .await
+        .unwrap();
+    assert!(
+        repeated_final_ack.done,
+        "a lost completion ACK must be repeatable"
+    );
+    let finished = reopened.transfer(&transfer.id).await.unwrap().unwrap();
+    assert_eq!(finished.status, "completed");
+    assert_eq!(reopened.read_completed(&finished).await.unwrap(), b"abcdef");
+    assert!(
+        !directory
+            .path()
+            .join("callback-transfers")
+            .join(format!("{}.part", transfer.storage_key))
+            .exists()
+    );
+    assert!(
+        directory
+            .path()
+            .join("callback-transfers")
+            .join(&transfer.storage_key)
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn transfer_store_treats_exact_duplicates_idempotently_and_rejects_gaps() {
+    let (_directory, _repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/remote.bin",
+            Some(6),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 6, b"abc"))
+        .await
+        .unwrap();
+    let duplicate = store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 6, b"abc"))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.received, 3);
+    let gap = store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 4, 6, b"ef"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        gap,
+        TransferError::OffsetGap {
+            expected: 3,
+            actual: 4
+        }
+    ));
+}
+
+#[tokio::test]
+async fn transfer_store_rejects_missing_or_mismatched_protocol_ids_stably() {
+    let (_directory, _repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/remote.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let mut chunk = transfer_chunk(&transfer, 0, 3, b"abc");
+    chunk.transfer_id = None;
+    assert_eq!(
+        store
+            .receive_chunk(&session_id, &chunk)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "transfer protocol id is required"
+    );
+    chunk.transfer_id = Some(uuid::Uuid::new_v4());
+    assert_eq!(
+        store
+            .receive_chunk(&session_id, &chunk)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "transfer protocol id does not match an authorized transfer"
+    );
+}
+
+#[tokio::test]
+async fn transfer_store_enforces_size_limit_and_checksum_before_publication() {
+    let (directory, _repo, store, operator, session_id) = transfer_fixture(5).await;
+    let oversized = store
+        .queue_download(
+            &session_id,
+            "/srv/large.bin",
+            Some(6),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(oversized, TransferError::SizeLimit { .. }));
+
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/bad.bin",
+            Some(3),
+            Some(&"0".repeat(64)),
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let error = store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 3, b"abc"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, TransferError::ChecksumMismatch));
+    assert!(
+        !directory
+            .path()
+            .join("callback-transfers")
+            .join(&transfer.storage_key)
+            .exists()
+    );
+    let failed = store.transfer(&transfer.id).await.unwrap().unwrap();
+    assert_eq!(failed.status, "error");
+}
+
+#[tokio::test]
+async fn transfer_store_refuses_unverified_or_failed_downloads() {
+    let (_directory, _repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let active = store
+        .queue_download(
+            &session_id,
+            "/srv/active.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.read_completed(&active).await.unwrap_err(),
+        TransferError::NotDownloadable
+    ));
+    let failed = store
+        .queue_download(
+            &session_id,
+            "/srv/failed.bin",
+            Some(3),
+            Some(&"0".repeat(64)),
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let _ = store
+        .receive_chunk(&session_id, &transfer_chunk(&failed, 0, 3, b"abc"))
+        .await;
+    let failed = store.transfer(&failed.id).await.unwrap().unwrap();
+    assert!(matches!(
+        store.read_completed(&failed).await.unwrap_err(),
+        TransferError::NotDownloadable
+    ));
+}
+
+#[tokio::test]
+async fn transfer_store_upload_chunks_resume_from_durable_acks_with_fifo_fairness() {
+    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let mut first_stage = store.begin_upload_stage().unwrap();
+    first_stage.write(b"abcdef").unwrap();
+    let first = store
+        .finish_upload_stage(
+            first_stage,
+            &session_id,
+            "/srv/first.bin",
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let mut second_stage = store.begin_upload_stage().unwrap();
+    second_stage.write(b"uvwxyz").unwrap();
+    let second = store
+        .finish_upload_stage(
+            second_stage,
+            &session_id,
+            "/srv/second.bin",
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+
+    let initial = store.next_upload_chunks(&session_id, 4).await.unwrap();
+    assert_eq!(
+        initial.iter().map(|chunk| chunk.data.len()).sum::<usize>(),
+        4
+    );
+    assert!(
+        initial
+            .iter()
+            .all(|chunk| chunk.transfer_id == Some(uuid::Uuid::parse_str(&first.id).unwrap()))
+    );
+    let ack = nw_profile::msgs::FileAck {
+        transfer_id: Some(uuid::Uuid::parse_str(&first.id).unwrap()),
+        received: 4,
+        total: 6,
+        done: false,
+    };
+    store.ack_upload(&session_id, &ack).await.unwrap();
+
+    let reopened = TransferStore::new(repo, directory.path(), 4096).unwrap();
+    let resumed = reopened.next_upload_chunks(&session_id, 4).await.unwrap();
+    assert_eq!(resumed[0].offset, 4);
+    assert_eq!(resumed[0].data, b"ef");
+    reopened
+        .ack_upload(
+            &session_id,
+            &nw_profile::msgs::FileAck {
+                transfer_id: ack.transfer_id,
+                received: 6,
+                total: 6,
+                done: true,
+            },
+        )
+        .await
+        .unwrap();
+    reopened
+        .ack_upload(
+            &session_id,
+            &nw_profile::msgs::FileAck {
+                transfer_id: ack.transfer_id,
+                received: 6,
+                total: 6,
+                done: true,
+            },
+        )
+        .await
+        .unwrap();
+    let next = reopened.next_upload_chunks(&session_id, 2).await.unwrap();
+    assert!(
+        next.iter()
+            .all(|chunk| chunk.transfer_id == Some(uuid::Uuid::parse_str(&second.id).unwrap()))
+    );
+}
+
+#[tokio::test]
+async fn transfer_endpoints_require_role_scope_and_csrf_and_audit_exact_destination() {
+    let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let app = authenticated_transfer_app(repo.clone(), operator, store.clone()).await;
+    let page = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csrf = csrf_token(&response_text(page).await);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/files/download"))
+                .header("content-type", "application/json")
+                .header("x-csrf-token", csrf)
+                .body(Body::from(
+                    r#"{"path":"/srv/exact artifact.bin","expected_size":3072}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let transfer = json(response).await;
+    assert_eq!(transfer["remote_path"], "/srv/exact artifact.bin");
+    let audit: String =
+        sqlx::query_scalar("SELECT details FROM c2_audit WHERE action = 'file_download_enqueued'")
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert!(audit.contains("exact destination /srv/exact artifact.bin"));
+
+    let rejected = app
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/files/download"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"path":"/srv/no-csrf.bin"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let viewer = create_user(&repo, "transfer-viewer", Role::Viewer).await;
+    let viewer_app = authenticated_transfer_app(repo, viewer, store).await;
+    let rejected = viewer_app
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/files/download"))
+                .header("content-type", "application/json")
+                .header("x-csrf-token", "irrelevant")
+                .body(Body::from(r#"{"path":"/srv/forbidden.bin"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn multipart_upload_streams_bounded_fixture_and_completed_download_has_safe_headers() {
+    let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let app = authenticated_transfer_app(repo, operator.clone(), store.clone()).await;
+    let page = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csrf = csrf_token(&response_text(page).await);
+    let boundary = "nw-transfer-boundary";
+    let fixture = vec![0x5a; 3072];
+    let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"destination\"\r\n\r\n/srv/upload target.bin\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"../../ignored.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n").into_bytes();
+    body.extend_from_slice(&fixture);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/files/upload"))
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("x-csrf-token", &csrf)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let uploaded = json(response).await;
+    assert_eq!(uploaded["expected_size"], 3072);
+    assert_eq!(uploaded["remote_path"], "/srv/upload target.bin");
+    assert_eq!(uploaded["sha256"], hex::encode(Sha256::digest(&fixture)));
+
+    let expected = hex::encode(Sha256::digest(&fixture));
+    let download = store
+        .queue_download(
+            &session_id,
+            "/srv/unsafe\"\r\nname.bin",
+            Some(3072),
+            Some(&expected),
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    store
+        .receive_chunk(&session_id, &transfer_chunk(&download, 0, 3072, &fixture))
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(
+            Request::get(format!(
+                "/api/callbacks/{session_id}/transfers/{}/download",
+                download.id
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert!(
+        response.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment; filename=\"download-")
+    );
+    assert_eq!(
+        to_bytes(response.into_body(), 4096).await.unwrap().as_ref(),
+        fixture.as_slice()
+    );
+}
+
+#[tokio::test]
+async fn transfer_sse_emits_durable_progress_snapshots() {
+    let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/progress.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let app = authenticated_transfer_app(repo, operator, store).await;
+    let response = app
+        .oneshot(
+            Request::get(format!("/api/callbacks/{session_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut output = String::new();
+    for _ in 0..4 {
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        output.push_str(std::str::from_utf8(&bytes).unwrap());
+        if output.contains("event: transfer") {
+            break;
+        }
+    }
+    assert!(output.contains("event: transfer"));
+    assert!(output.contains(&transfer.id));
+    assert!(output.contains("/srv/progress.bin"));
 }
 
 fn process_snapshot_fixture(captured_at: &str) -> Vec<u8> {
@@ -129,6 +654,42 @@ async fn authenticated_app(repository: Repository, user: AuthenticatedUser) -> R
         .route("/test/login", post(login))
         .merge(portal::authenticated_router())
         .with_state(repository)
+        .layer(Extension(user))
+        .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false));
+    let response = app
+        .clone()
+        .oneshot(Request::post("/test/login").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let cookie = response.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    Router::new().fallback_service(
+        tower::ServiceBuilder::new()
+            .map_request(move |mut request: Request<Body>| {
+                request
+                    .headers_mut()
+                    .insert("cookie", cookie.parse().unwrap());
+                request
+            })
+            .service(app),
+    )
+}
+
+async fn authenticated_transfer_app(
+    repository: Repository,
+    user: AuthenticatedUser,
+    store: TransferStore,
+) -> Router {
+    let app = Router::<Repository>::new()
+        .route("/test/login", post(login))
+        .merge(portal::authenticated_router())
+        .with_state(repository)
+        .layer(Extension(store))
         .layer(Extension(user))
         .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false));
     let response = app

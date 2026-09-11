@@ -145,6 +145,14 @@ async fn process_sealed_register(
 }
 
 async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelope, C2Error> {
+    process_sealed_poll_with_store(repo, env, None).await
+}
+
+async fn process_sealed_poll_with_store(
+    repo: &Repository,
+    env: Envelope,
+    transfer_store: Option<&crate::callback_workspace::transfers::TransferStore>,
+) -> Result<Envelope, C2Error> {
     let session_id = env.session_id.ok_or(C2Error::BadRequest)?;
     let encoded = repo
         .session_key_for(&session_id.to_string())
@@ -159,6 +167,21 @@ async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelop
     repo.touch_callback(&session_id.to_string())
         .await
         .map_err(|_| C2Error::Internal)?;
+    let has_upload = repo
+        .next_file_transfer(&session_id.to_string(), "upload")
+        .await
+        .map_err(|_| C2Error::Internal)?
+        .is_some();
+    let transfer_store = if let Some(store) = transfer_store {
+        Some(store.clone())
+    } else if !request.file_chunks.is_empty() || !request.upload_acks.is_empty() || has_upload {
+        Some(
+            crate::callback_workspace::transfers::TransferStore::configured(repo.clone())
+                .map_err(|_| C2Error::Internal)?,
+        )
+    } else {
+        None
+    };
     let mut accepted_ids = request.acked_ids;
     accepted_ids.extend(request.accepted_task_ids);
     accepted_ids.sort_unstable();
@@ -183,6 +206,23 @@ async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelop
             result_acks.push(result.task_id);
         }
     }
+    let mut file_acks = Vec::new();
+    if let Some(store) = transfer_store.as_ref() {
+        for chunk in &request.file_chunks {
+            file_acks.push(
+                store
+                    .receive_chunk(&session_id.to_string(), chunk)
+                    .await
+                    .map_err(transfer_c2_error)?,
+            );
+        }
+        for ack in &request.upload_acks {
+            store
+                .ack_upload(&session_id.to_string(), ack)
+                .await
+                .map_err(transfer_c2_error)?;
+        }
+    }
     let tasks = repo
         .tasks_for_delivery(&session_id.to_string())
         .await
@@ -202,16 +242,34 @@ async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelop
     } else {
         Kind::Task
     };
+    let push_chunks = if let Some(store) = transfer_store.as_ref() {
+        store
+            .next_upload_chunks(&session_id.to_string(), request.inner_budget)
+            .await
+            .map_err(transfer_c2_error)?
+    } else {
+        Vec::new()
+    };
     let reply = PollReply {
         tasks,
         result_acks,
-        acks: Vec::new(),
-        push_chunks: Vec::new(),
+        acks: file_acks,
+        push_chunks,
     };
     let reply_id = env.id + 1;
     let plaintext = serde_json::to_vec(&reply).map_err(|_| C2Error::Internal)?;
     let encrypted = crypto::encrypt(&key, reply_id, &plaintext).map_err(|_| C2Error::Internal)?;
     Ok(Envelope::new(kind, reply_id, Some(session_id), encrypted))
+}
+
+fn transfer_c2_error(error: crate::callback_workspace::transfers::TransferError) -> C2Error {
+    use crate::callback_workspace::transfers::TransferError;
+    match error {
+        TransferError::Storage | TransferError::Repository | TransferError::UnsafeStorage => {
+            C2Error::Internal
+        }
+        _ => C2Error::BadRequest,
+    }
 }
 
 async fn checkin(
@@ -555,6 +613,89 @@ mod tests {
         .unwrap();
         let plaintext = crypto::decrypt(key, reply.id, &reply.encrypted).unwrap();
         serde_json::from_slice(&plaintext).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sealed_poll_persists_download_chunks_and_resumes_uploads_within_budget() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let key = crypto::derive_key(b"transfer-poll", b"test");
+        let session_id = seed_poll_session(&repo, &key).await;
+        sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES ('transfer-operator', 'alice', 'x', 'operator')")
+            .execute(&repo.pool).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::callback_workspace::transfers::TransferStore::new(
+            repo.clone(),
+            directory.path(),
+            4096,
+        )
+        .unwrap();
+        let download = store
+            .queue_download(
+                &session_id.to_string(),
+                "/tmp/from-agent.bin",
+                Some(3),
+                None,
+                "transfer-operator",
+                "alice",
+            )
+            .await
+            .unwrap();
+        let mut upload_stage = store.begin_upload_stage().unwrap();
+        upload_stage.write(b"abcdef").unwrap();
+        let upload = store
+            .finish_upload_stage(
+                upload_stage,
+                &session_id.to_string(),
+                "/tmp/to-agent.bin",
+                "transfer-operator",
+                "alice",
+            )
+            .await
+            .unwrap();
+        let request = PollRequest {
+            file_chunks: vec![nw_profile::msgs::FileChunk {
+                transfer_id: Some(Uuid::parse_str(&download.id).unwrap()),
+                task_id: download
+                    .task_id
+                    .as_deref()
+                    .map(|id| Uuid::parse_str(id).unwrap()),
+                name: "../../ignored.bin".into(),
+                offset: 0,
+                total: 3,
+                data: b"xyz".to_vec(),
+            }],
+            inner_budget: 4,
+            ..Default::default()
+        };
+        let id = 41;
+        let encrypted = crypto::encrypt(&key, id, &serde_json::to_vec(&request).unwrap()).unwrap();
+        let reply = process_sealed_poll_with_store(
+            &repo,
+            Envelope::new(Kind::TaskResult, id, Some(session_id), encrypted),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        let plaintext = crypto::decrypt(&key, reply.id, &reply.encrypted).unwrap();
+        let reply: PollReply = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(reply.acks.len(), 1);
+        assert!(reply.acks[0].done);
+        assert_eq!(
+            reply
+                .push_chunks
+                .iter()
+                .map(|chunk| chunk.data.len())
+                .sum::<usize>(),
+            4
+        );
+        assert!(
+            reply
+                .push_chunks
+                .iter()
+                .all(|chunk| chunk.transfer_id == Some(Uuid::parse_str(&upload.id).unwrap()))
+        );
     }
 
     #[tokio::test]

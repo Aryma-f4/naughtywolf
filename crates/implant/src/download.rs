@@ -17,12 +17,13 @@ pub struct Download {
     pub size: u64,
     /// Next byte offset to read (server-confirmed resume point).
     offset: u64,
+    transfer_id: Uuid,
     task_id: Uuid,
 }
 
 impl Download {
     /// Open `path` for streaming as a download task result.
-    pub fn open(path: &str, task_id: Uuid) -> Result<Self, String> {
+    pub fn open(path: &str, transfer_id: Uuid, task_id: Uuid) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| format!("open {path:?}: {e}"))?;
         let size = file
             .metadata()
@@ -34,12 +35,17 @@ impl Download {
             name,
             size,
             offset: 0,
+            transfer_id,
             task_id,
         })
     }
 
     pub fn task_id(&self) -> Uuid {
         self.task_id
+    }
+
+    pub fn transfer_id(&self) -> Uuid {
+        self.transfer_id
     }
 
     pub fn done(&self) -> bool {
@@ -49,9 +55,7 @@ impl Download {
     /// Server says it already has `received` bytes (resume on reconnect or
     /// re-issue). Reprint from there so nothing is retransmitted needlessly.
     pub fn resume_to(&mut self, received: u64) {
-        if received < self.offset {
-            self.offset = received;
-        }
+        self.offset = received.min(self.size);
     }
 
     /// Read up to `budget` raw bytes from the current offset, returning chunks
@@ -61,7 +65,7 @@ impl Download {
             return Vec::new();
         }
         let mut chunks = Vec::new();
-        let mut remaining = budget as u64;
+        let remaining = budget as u64;
         while remaining > 0 && !self.done() {
             self.file.seek(SeekFrom::Start(self.offset)).ok();
             let take = remaining.min(CHUNK).min(self.size - self.offset) as usize;
@@ -72,13 +76,16 @@ impl Download {
             }
             buf.truncate(n);
             chunks.push(FileChunk {
+                transfer_id: Some(self.transfer_id),
+                task_id: Some(self.task_id),
                 name: self.name.clone(),
                 offset: self.offset,
                 total: self.size,
                 data: buf,
             });
-            self.offset += n as u64;
-            remaining -= n as u64;
+            // Preserve room for task/result metadata and rotate fairly across
+            // beacons instead of monopolizing a large transport budget.
+            break;
         }
         chunks
     }
@@ -108,22 +115,40 @@ mod tests {
         f.write_all(&data).unwrap();
         drop(f);
 
-        let mut dl = Download::open(path.to_str().unwrap(), Uuid::new_v4()).unwrap();
+        let transfer_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let mut dl = Download::open(path.to_str().unwrap(), transfer_id, task_id).unwrap();
         assert_eq!(dl.size, 3000);
 
         let c0 = dl.step(2048);
-        assert_eq!(c0.len(), 2);
+        assert_eq!(c0.len(), 1);
         assert_eq!(c0[0].offset, 0);
-        assert_eq!(c0[1].offset, 1024);
-        assert_eq!(dl.step(2048).len(), 1); // 1024 left
+        assert_eq!(c0[0].transfer_id, Some(transfer_id));
+        assert_eq!(c0[0].task_id, Some(task_id));
+        assert_eq!(
+            dl.step(2048)[0].offset,
+            0,
+            "unacknowledged bytes must be retried"
+        );
+        dl.resume_to(1024);
+        assert_eq!(dl.step(2048)[0].offset, 1024);
+        dl.resume_to(2048);
+        assert_eq!(dl.step(2048).len(), 1);
+        dl.resume_to(3000);
         assert!(dl.done());
 
         // Resume after partial (server has 500) restarts before the local ptr.
-        let mut dl2 = Download::open(path.to_str().unwrap(), Uuid::new_v4()).unwrap();
-        dl2.step(2048);
+        let mut dl2 =
+            Download::open(path.to_str().unwrap(), Uuid::new_v4(), Uuid::new_v4()).unwrap();
+        dl2.resume_to(2048);
         dl2.resume_to(512);
         let c = dl2.step(1024);
         assert_eq!(c[0].offset, 512);
+
+        let mut reconnected =
+            Download::open(path.to_str().unwrap(), Uuid::new_v4(), Uuid::new_v4()).unwrap();
+        reconnected.resume_to(2048);
+        assert_eq!(reconnected.step(1024)[0].offset, 2048);
 
         std::fs::remove_file(&path).ok();
     }
