@@ -148,7 +148,7 @@ impl BeaconRuntime {
     /// terminated. The awaiting runner turns the killed child into a result.
     pub async fn kill_task(&self, task_id: &Uuid) -> bool {
         let mut states = self.task_states.lock().unwrap();
-        match states.get(task_id) {
+        let killed = match states.get(task_id) {
             Some(ActiveTask::Running(handle)) => {
                 handle.abort();
                 states.insert(*task_id, ActiveTask::Cancelled);
@@ -159,7 +159,34 @@ impl BeaconRuntime {
                 true
             }
             None => false,
+        };
+        drop(states);
+        if killed {
+            let mut download = self.download.write().unwrap();
+            if download
+                .as_ref()
+                .is_some_and(|candidate| candidate.task_id() == *task_id)
+            {
+                *download = None;
+            }
+            drop(download);
+            let mut upload = self.upload.write().unwrap();
+            if upload
+                .as_ref()
+                .is_some_and(|candidate| candidate.task_id() == *task_id)
+            {
+                *upload = None;
+            }
+            drop(upload);
+            let mut terminal = self.terminal_upload.lock().unwrap();
+            if terminal
+                .as_ref()
+                .is_some_and(|candidate| candidate.task_id == *task_id)
+            {
+                *terminal = None;
+            }
         }
+        killed
     }
 
     fn accept_task(&self, task_id: Uuid) -> bool {
@@ -578,30 +605,38 @@ impl BeaconRuntime {
                         });
                         return;
                     };
-                    let mut slot = self.download.write().unwrap();
-                    if slot.is_some() {
-                        self.pending.lock().unwrap().push(TaskResult {
-                            task_id: task.id,
-                            ok: false,
-                            stdout: Vec::new(),
-                            stderr: b"a download is already in progress".to_vec(),
-                            exit_code: -1,
-                        });
-                    } else {
-                        match Download::open(path, transfer_id, task.id) {
-                            Ok(d) => {
-                                // Stream in the background; the completion
-                                // result is reported when the server acks.
-                                *slot = Some(d);
-                            }
-                            Err(e) => self.pending.lock().unwrap().push(TaskResult {
+                    let transfer_started = {
+                        let mut slot = self.download.write().unwrap();
+                        if slot.is_some() {
+                            self.pending.lock().unwrap().push(TaskResult {
                                 task_id: task.id,
                                 ok: false,
                                 stdout: Vec::new(),
-                                stderr: e.into_bytes(),
+                                stderr: b"a download is already in progress".to_vec(),
                                 exit_code: -1,
-                            }),
+                            });
+                            false
+                        } else {
+                            match Download::open(path, transfer_id, task.id) {
+                                Ok(d) => {
+                                    *slot = Some(d);
+                                    true
+                                }
+                                Err(e) => {
+                                    self.pending.lock().unwrap().push(TaskResult {
+                                        task_id: task.id,
+                                        ok: false,
+                                        stdout: Vec::new(),
+                                        stderr: e.into_bytes(),
+                                        exit_code: -1,
+                                    });
+                                    false
+                                }
+                            }
                         }
+                    };
+                    if transfer_started {
+                        self.wait_for_download(task.id).await;
                     }
                 }
                 _ => self.pending.lock().unwrap().push(TaskResult {
@@ -627,33 +662,46 @@ impl BeaconRuntime {
                         });
                         return;
                     };
-                    let mut slot = self.upload.write().unwrap();
-                    if slot.is_some() {
-                        self.pending.lock().unwrap().push(TaskResult {
-                            task_id: task.id,
-                            ok: false,
-                            stdout: Vec::new(),
-                            stderr: b"an upload is already in progress".to_vec(),
-                            exit_code: -1,
-                        });
-                    } else {
-                        let expected_total = task.args.get(2).and_then(|value| value.parse().ok());
-                        match crate::upload::Upload::open_with_total(
-                            dest,
-                            transfer_id,
-                            task.id,
-                            expected_total,
-                            task.args.get(3).filter(|value| !value.is_empty()).cloned(),
-                        ) {
-                            Ok(u) => *slot = Some(u),
-                            Err(e) => self.pending.lock().unwrap().push(TaskResult {
+                    let transfer_started = {
+                        let mut slot = self.upload.write().unwrap();
+                        if slot.is_some() {
+                            self.pending.lock().unwrap().push(TaskResult {
                                 task_id: task.id,
                                 ok: false,
                                 stdout: Vec::new(),
-                                stderr: e.into_bytes(),
+                                stderr: b"an upload is already in progress".to_vec(),
                                 exit_code: -1,
-                            }),
+                            });
+                            false
+                        } else {
+                            let expected_total =
+                                task.args.get(2).and_then(|value| value.parse().ok());
+                            match crate::upload::Upload::open_with_total(
+                                dest,
+                                transfer_id,
+                                task.id,
+                                expected_total,
+                                task.args.get(3).filter(|value| !value.is_empty()).cloned(),
+                            ) {
+                                Ok(u) => {
+                                    *slot = Some(u);
+                                    true
+                                }
+                                Err(e) => {
+                                    self.pending.lock().unwrap().push(TaskResult {
+                                        task_id: task.id,
+                                        ok: false,
+                                        stdout: Vec::new(),
+                                        stderr: e.into_bytes(),
+                                        exit_code: -1,
+                                    });
+                                    false
+                                }
+                            }
                         }
+                    };
+                    if transfer_started {
+                        self.wait_for_upload(task.id).await;
                     }
                 }
                 _ => self.pending.lock().unwrap().push(TaskResult {
@@ -795,6 +843,36 @@ impl BeaconRuntime {
         }
         let result = runner::run(task.clone()).await;
         self.pending.lock().unwrap().push(result);
+    }
+
+    async fn wait_for_download(&self, task_id: Uuid) {
+        loop {
+            let active = self
+                .download
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|download| download.task_id() == task_id);
+            if !active {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_upload(&self, task_id: Uuid) {
+        loop {
+            let active = self
+                .upload
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|upload| upload.task_id() == task_id);
+            if !active {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     fn session_key(&self) -> [u8; crypto::KEY_LEN] {
@@ -1017,6 +1095,52 @@ mod tests {
         assert!(results.iter().any(|result| {
             result.task_id == victim.id && !result.ok && result.stderr == b"task cancelled"
         }));
+    }
+
+    #[tokio::test]
+    async fn killtask_cancels_a_real_upload_slot_and_emits_terminal_result() {
+        let runtime = Arc::new(runtime());
+        let destination = std::env::temp_dir().join(format!(
+            "nw-runtime-cancel-{}-{}.bin",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let task = Task {
+            id: Uuid::new_v4(),
+            command: "nw/upload".into(),
+            args: vec![
+                destination.to_string_lossy().into_owned(),
+                Uuid::new_v4().to_string(),
+                "3072".into(),
+            ],
+            timeout_ms: 60_000,
+        };
+        assert!(runtime.accept_task(task.id));
+        let runner = tokio::spawn(Arc::clone(&runtime).execute(vec![task.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime.upload.read().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("upload slot must remain registered while transfer is active");
+        assert!(runtime.kill_task(&task.id).await);
+        tokio::time::timeout(Duration::from_secs(2), runner)
+            .await
+            .expect("cancelled transfer task must terminate")
+            .expect("transfer executor join");
+        let results = runtime.pending.lock().unwrap();
+        let result = results
+            .iter()
+            .find(|result| result.task_id == task.id)
+            .expect("cancelled transfer result");
+        assert!(!result.ok);
+        assert_eq!(result.stderr, b"task cancelled");
+        let _ = std::fs::remove_file(&destination);
+        let _ = std::fs::remove_file(format!("{}.nwpart-{}", destination.display(), task.args[1]));
     }
 
     #[test]

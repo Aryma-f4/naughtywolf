@@ -81,7 +81,7 @@ libc.workspace = true
 hex.workspace = true
 base64 = { version = "0.22", features = ["std"] }
 nw-profile = { path = "crates/profile" }
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls-tls", "multipart"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -13,7 +13,7 @@ use naughtywolf::{
     db::{self, repositories::Repository},
     portal,
 };
-use nw_profile::msgs::FileChunk;
+use nw_profile::msgs::{FileAck, FileChunk};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
@@ -363,6 +363,18 @@ async fn transfer_store_upload_chunks_resume_from_durable_acks_with_fifo_fairnes
         )
         .await
         .unwrap();
+    sqlx::query("UPDATE c2_file_transfers SET created_at = ? WHERE id = ?")
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind(&first.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE c2_file_transfers SET created_at = ? WHERE id = ?")
+        .bind("2026-01-01T00:00:01.000Z")
+        .bind(&second.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
 
     let initial = store.next_upload_chunks(&session_id, 4).await.unwrap();
     assert_eq!(
@@ -575,6 +587,92 @@ async fn cancelling_a_pending_transfer_task_cancels_its_transfer_atomically() {
 }
 
 #[tokio::test]
+async fn cancelling_a_processing_transfer_releases_fifo_for_the_next_transfer() {
+    let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let first = store
+        .queue_download(
+            &session_id,
+            "/srv/processing-cancel.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let second = store
+        .queue_download(
+            &session_id,
+            "/srv/after-cancel.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE c2_file_transfers SET created_at = ? WHERE id = ?")
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind(&first.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE c2_file_transfers SET created_at = ? WHERE id = ?")
+        .bind("2026-01-01T00:00:01.000Z")
+        .bind(&second.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    let delivered = repo.tasks_for_delivery(&session_id).await.unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].id, first.task_id.clone().unwrap());
+    let first_id = uuid::Uuid::parse_str(&delivered[0].id).unwrap();
+    repo.acknowledge_tasks(&session_id, &[first_id])
+        .await
+        .unwrap();
+    let cancellation = repo
+        .request_task_cancellation(
+            &session_id,
+            &first_id.to_string(),
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        cancellation,
+        naughtywolf::db::models::TaskCancellation::Requested { .. }
+    ));
+    // This is the terminal result emitted by the real transfer task after
+    // nw/killtask aborts its I/O slot; the repository must atomically cancel
+    // the transfer and make the next FIFO row deliverable.
+    repo.store_task_result_for_session(
+        &session_id,
+        &first_id.to_string(),
+        false,
+        b"",
+        b"task cancelled",
+        -1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.file_transfer(&first.id).await.unwrap().unwrap().status,
+        "cancelled"
+    );
+    let next = repo.tasks_for_delivery(&session_id).await.unwrap();
+    assert!(
+        next.iter()
+            .any(|task| task.id == second.task_id.clone().unwrap())
+    );
+    assert!(
+        !next
+            .iter()
+            .any(|task| task.id == first.task_id.clone().unwrap())
+    );
+}
+
+#[tokio::test]
 async fn final_download_chunk_stays_provisional_until_task_result() {
     let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
     let expected = hex::encode(Sha256::digest(b"abcdef"));
@@ -653,6 +751,45 @@ async fn concurrent_store_instances_serialize_same_transfer() {
     assert!(left.is_ok() && right.is_ok());
     let received = left.unwrap().received.max(right.unwrap().received);
     assert_eq!(received, 3);
+}
+
+#[tokio::test]
+async fn active_file_lease_blocks_takeover_until_safe_expiry() {
+    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/lease.bin",
+            Some(3),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO c2_transfer_leases (transfer_id, owner, expires_at) VALUES (?, ?, unixepoch() + 30)",
+    )
+    .bind(&transfer.id)
+    .bind("other-store")
+    .execute(&repo.pool)
+    .await
+    .unwrap();
+    let blocked = store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 3, b"a"))
+        .await;
+    assert!(matches!(blocked, Err(TransferError::Repository)));
+    sqlx::query("UPDATE c2_transfer_leases SET expires_at = unixepoch() - 1 WHERE transfer_id = ?")
+        .bind(&transfer.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    let resumed = store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 3, b"a"))
+        .await
+        .unwrap();
+    assert_eq!(resumed.received, 1);
+    drop(directory);
 }
 
 #[tokio::test]
@@ -898,6 +1035,241 @@ async fn multipart_upload_streams_bounded_fixture_and_completed_download_has_saf
         to_bytes(response.into_body(), 4096).await.unwrap().as_ref(),
         fixture.as_slice()
     );
+}
+
+#[tokio::test]
+async fn file_backed_application_transfer_survives_http_disconnect_and_db_reopen() {
+    let workspace = tempfile::tempdir().unwrap();
+    let db_path = workspace.path().join("transfers.sqlite");
+    std::fs::File::create(&db_path).unwrap();
+    let database_url = format!("sqlite://{}", db_path.display());
+    let pool = db::create_pool(&database_url).await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    let repo = Repository { pool };
+    let operator = create_user(&repo, "file-backed-operator", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let storage = workspace.path().join("evidence");
+    let store = TransferStore::new(repo.clone(), &storage, 4096).unwrap();
+    let upload_bytes = vec![0x31; 3072];
+    let download_bytes: Vec<u8> = (0..3072).map(|index| (index % 251) as u8).collect();
+    let download_sha = hex::encode(Sha256::digest(&download_bytes));
+
+    // Use an actual TCP listener for the operator API. Aborting this server
+    // after the upload models a dropped HTTP connection before the callback
+    // resumes from its durable transfer state.
+    let app = authenticated_transfer_app(repo.clone(), operator.clone(), store.clone()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(axum::serve(listener, app.into_make_service()).into_future());
+    let client = reqwest::Client::new();
+    let page = client
+        .get(format!("http://{address}/callbacks/{session_id}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = csrf_token(&page);
+    let form = reqwest::multipart::Form::new()
+        .text("destination", "/srv/file-backed-upload.bin")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(upload_bytes.clone())
+                .file_name("payload.bin")
+                .mime_str("application/octet-stream")
+                .unwrap(),
+        );
+    let upload_response = client
+        .post(format!(
+            "http://{address}/api/callbacks/{session_id}/files/upload"
+        ))
+        .header("x-csrf-token", csrf)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload_response.status(), reqwest::StatusCode::OK);
+    let upload_view: Value = upload_response.json().await.unwrap();
+    let upload_id = upload_view["id"].as_str().unwrap().to_owned();
+    let upload_task_id = upload_view["task_id"].as_str().unwrap().to_owned();
+    let upload = repo.file_transfer(&upload_id).await.unwrap().unwrap();
+    assert_eq!(upload.expected_size, Some(3072));
+    assert_eq!(
+        upload.sha256.as_deref(),
+        Some(hex::encode(Sha256::digest(&upload_bytes)).as_str())
+    );
+    let first_upload_chunk = store
+        .next_upload_chunks(&session_id, 1024)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    store
+        .ack_upload(
+            &session_id,
+            &FileAck {
+                transfer_id: first_upload_chunk.transfer_id,
+                received: first_upload_chunk.data.len() as u64,
+                total: first_upload_chunk.total,
+                done: false,
+            },
+        )
+        .await
+        .unwrap();
+    server.abort();
+    let _ = server.await;
+    repo.pool.close().await;
+
+    // Reconstruct both Repository and TransferStore from the same SQLite file
+    // and durable artifact directory; the remaining upload bytes resume at
+    // offset 1024 rather than restarting.
+    let pool = db::create_pool(&database_url).await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    let repo = Repository { pool };
+    let store = TransferStore::new(repo.clone(), &storage, 4096).unwrap();
+    let resumed_upload = store.next_upload_chunks(&session_id, 4096).await.unwrap();
+    assert_eq!(resumed_upload.first().unwrap().offset, 1024);
+    for chunk in &resumed_upload {
+        store
+            .ack_upload(
+                &session_id,
+                &FileAck {
+                    transfer_id: chunk.transfer_id,
+                    received: chunk.offset + chunk.data.len() as u64,
+                    total: chunk.total,
+                    done: chunk.offset + chunk.data.len() as u64 == chunk.total,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    repo.store_task_result_for_session(&session_id, &upload_task_id, true, b"published", b"", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.file_transfer(&upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+
+    let download = store
+        .queue_download(
+            &session_id,
+            "/srv/file-backed-download.bin",
+            Some(download_bytes.len() as u64),
+            Some(&download_sha),
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    store
+        .receive_chunk(
+            &session_id,
+            &transfer_chunk(&download, 0, 3072, &download_bytes[..1024]),
+        )
+        .await
+        .unwrap();
+    repo.pool.close().await;
+
+    let pool = db::create_pool(&database_url).await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    let repo = Repository { pool };
+    let store = TransferStore::new(repo.clone(), &storage, 4096).unwrap();
+    let resumed = repo.file_transfer(&download.id).await.unwrap().unwrap();
+    assert_eq!(resumed.received_bytes, 1024);
+    store
+        .receive_chunk(
+            &session_id,
+            &transfer_chunk(&download, 1024, 3072, &download_bytes[1024..2048]),
+        )
+        .await
+        .unwrap();
+    let final_ack = store
+        .receive_chunk(
+            &session_id,
+            &transfer_chunk(&download, 2048, 3072, &download_bytes[2048..]),
+        )
+        .await
+        .unwrap();
+    assert!(final_ack.done);
+    assert_eq!(
+        repo.file_transfer(&download.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "active"
+    );
+    repo.store_task_result_for_session(
+        &session_id,
+        download.task_id.as_deref().unwrap(),
+        true,
+        b"published",
+        b"",
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.file_transfer(&download.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+    let queued = repo.tasks_for_delivery(&session_id).await.unwrap();
+    assert!(
+        !queued
+            .iter()
+            .any(|task| task.id == download.task_id.clone().unwrap())
+    );
+    let follower = store
+        .queue_download(
+            &session_id,
+            "/srv/file-backed-follower.bin",
+            Some(1),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let ready = repo.tasks_for_delivery(&session_id).await.unwrap();
+    assert!(
+        ready
+            .iter()
+            .any(|task| task.id == follower.task_id.clone().unwrap())
+    );
+
+    // Recreate the application after the second disconnect and verify the
+    // published bytes through the authenticated HTTP download endpoint.
+    let app = authenticated_transfer_app(repo.clone(), operator, store).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(axum::serve(listener, app.into_make_service()).into_future());
+    let response = client
+        .get(format!(
+            "http://{address}/api/callbacks/{session_id}/transfers/{}/download",
+            download.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        download_bytes.as_slice()
+    );
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

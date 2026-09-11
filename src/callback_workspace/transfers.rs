@@ -203,13 +203,19 @@ impl TransferStore {
         {
             return Err(TransferError::UnsafeStorage);
         }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(&root).map_err(|_| TransferError::Storage)?;
+        #[cfg(unix)]
+        let held_root = open_or_create_directory(&root)?;
         let root = root
             .canonicalize()
             .map_err(|_| TransferError::UnsafeStorage)?;
         if !root.is_dir() || max_bytes == 0 || max_bytes > i64::MAX as u64 {
             return Err(TransferError::UnsafeStorage);
         }
+        #[cfg(unix)]
+        let root_dir = Arc::new(held_root);
+        #[cfg(not(unix))]
         let root_dir = Arc::new(open_directory(&root)?);
         Ok(Self {
             repository,
@@ -358,10 +364,7 @@ impl TransferStore {
             .filter(|transfer| transfer.status == "completed")
             .map(|transfer| transfer.storage_key.clone())
             .collect();
-        let entries = std::fs::read_dir(&self.root).map_err(|_| TransferError::Storage)?;
-        for entry in entries {
-            let entry = entry.map_err(|_| TransferError::Storage)?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+        for name in read_directory_names(&self.root_dir)? {
             if !live.contains(&name) && !retained_completed.contains(&name) {
                 if let Ok(file) = open_existing_regular_at(&self.root_dir, &name, false) {
                     drop(file);
@@ -402,19 +405,21 @@ impl TransferStore {
                 transfer.storage_key.clone(),
                 format!("{}.part", transfer.storage_key),
             ] {
-                let path = self.safe_path(&name)?;
-                if std::fs::symlink_metadata(&path)
-                    .map(|metadata| metadata.file_type().is_file())
-                    .unwrap_or(false)
-                {
-                    std::fs::remove_file(path).map_err(|_| TransferError::Storage)?;
+                self.renew_lease(&transfer.id, &lease).await?;
+                if let Ok(file) = open_existing_regular_at(&self.root_dir, &name, false) {
+                    drop(file);
+                    unlink_relative(&self.root_dir, &name)?;
                 }
             }
-            sqlx::query("DELETE FROM c2_file_transfers WHERE id = ? AND status IN ('completed','error','cancelled')")
+            let deleted = sqlx::query("DELETE FROM c2_file_transfers WHERE id = ? AND status IN ('completed','error','cancelled')")
                 .bind(&transfer.id)
                 .execute(&self.repository.pool)
                 .await
                 .map_err(|_| TransferError::Repository)?;
+            if deleted.rows_affected() != 1 {
+                self.release_lease(&transfer.id, &lease).await?;
+                return Err(TransferError::Repository);
+            }
             self.release_lease(&transfer.id, &lease).await?;
         }
         Ok(())
@@ -430,7 +435,7 @@ impl TransferStore {
         let _guard = lock.lock().await;
         let lease = self.acquire_lease(&transfer_id.to_string()).await?;
         let result = self
-            .receive_chunk_inner(session_id, chunk, transfer_id)
+            .receive_chunk_inner(session_id, chunk, transfer_id, &lease)
             .await;
         self.release_lease(&transfer_id.to_string(), &lease).await?;
         result
@@ -441,6 +446,7 @@ impl TransferStore {
         session_id: &str,
         chunk: &FileChunk,
         transfer_id: Uuid,
+        lease: &str,
     ) -> Result<FileAck, TransferError> {
         let task_id = chunk.task_id.ok_or(TransferError::MissingProtocolId)?;
         let Some(mut transfer) = self
@@ -534,6 +540,7 @@ impl TransferStore {
             &completed_name,
             chunk.total,
             self.max_bytes,
+            lease,
         )
         .await?
         {
@@ -595,12 +602,14 @@ impl TransferStore {
                 .await?;
             return Err(TransferError::Storage);
         }
+        self.renew_lease(&transfer.id, lease).await?;
         file.set_len(received).map_err(|_| TransferError::Storage)?;
         file.seek(SeekFrom::Start(received))
             .map_err(|_| TransferError::Storage)?;
         file.write_all(&chunk.data)
             .map_err(|_| TransferError::Storage)?;
         file.sync_all().map_err(|_| TransferError::Storage)?;
+        self.renew_lease(&transfer.id, lease).await?;
         sync_directory_handle(&self.root_dir)?;
         let next = received
             .checked_add(chunk.data.len() as u64)
@@ -617,8 +626,11 @@ impl TransferStore {
         }
 
         if next == chunk.total {
+            self.renew_lease(&transfer.id, lease).await?;
             let mut verify = open_existing_regular_at(&self.root_dir, &part_name, false)?;
-            let digest = sha256_open_file(&mut verify)?;
+            let digest =
+                sha256_open_file_with_lease(&self.repository, &mut verify, &transfer.id, lease)
+                    .await?;
             if transfer
                 .sha256
                 .as_deref()
@@ -730,7 +742,7 @@ impl TransferStore {
         let lease = self.acquire_lease(&transfer.id).await?;
         let transfer_id = transfer.id.clone();
         let result = self
-            .next_upload_chunks_inner(session_id, budget, transfer)
+            .next_upload_chunks_inner(session_id, budget, transfer, &lease)
             .await;
         self.release_lease(&transfer_id, &lease).await?;
         result
@@ -741,6 +753,7 @@ impl TransferStore {
         _session_id: &str,
         budget: usize,
         mut transfer: FileTransfer,
+        lease: &str,
     ) -> Result<Vec<FileChunk>, TransferError> {
         self.activate_if_next(&mut transfer, "upload").await?;
         if transfer.status != "active" || budget == 0 {
@@ -770,6 +783,7 @@ impl TransferStore {
         let offset =
             u64::try_from(transfer.received_bytes).map_err(|_| TransferError::Repository)?;
         let mut file = open_existing_regular_at(&self.root_dir, &transfer.storage_key, false)?;
+        self.renew_lease(&transfer.id, lease).await?;
         let mut chunks = Vec::new();
         let mut cursor = offset;
         let mut remaining = budget as u64;
@@ -958,6 +972,21 @@ impl TransferStore {
             .map_err(|_| TransferError::Repository)?;
         Ok(())
     }
+
+    async fn renew_lease(&self, transfer_id: &str, owner: &str) -> Result<(), TransferError> {
+        let update = sqlx::query(
+            "UPDATE c2_transfer_leases SET expires_at = unixepoch() + 30 WHERE transfer_id = ? AND owner = ? AND expires_at > unixepoch()",
+        )
+        .bind(transfer_id)
+        .bind(owner)
+        .execute(&self.repository.pool)
+        .await
+        .map_err(|_| TransferError::Repository)?;
+        if update.rows_affected() != 1 {
+            return Err(TransferError::Repository);
+        }
+        Ok(())
+    }
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -971,6 +1000,7 @@ async fn reconcile_completed_download(
     completed_name: &str,
     total: u64,
     max_bytes: u64,
+    lease: &str,
 ) -> Result<bool, TransferError> {
     let mut completed = match open_existing_regular_at(root_dir, completed_name, false) {
         Ok(file) => file,
@@ -981,7 +1011,8 @@ async fn reconcile_completed_download(
     if !metadata.file_type().is_file() || metadata.len() != total || total > max_bytes {
         return Err(TransferError::UnsafeStorage);
     }
-    let digest = sha256_open_file(&mut completed)?;
+    let digest =
+        sha256_open_file_with_lease(repository, &mut completed, &transfer.id, lease).await?;
     if transfer
         .sha256
         .as_deref()
@@ -1043,25 +1074,112 @@ fn publish_no_replace_at(
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     {
         let part_path = root_path(root, part)?;
         let completed_path = root_path(root, completed)?;
         std::fs::hard_link(part_path, completed_path).map_err(|_| TransferError::Storage)?;
         std::fs::remove_file(part_path).map_err(|_| TransferError::Storage)
     }
+    #[cfg(windows)]
+    {
+        let part_path = root_path(root, part)?;
+        let completed_path = root_path(root, completed)?;
+        validate_windows_ancestors(&part_path)?;
+        validate_windows_ancestors(&completed_path)?;
+        drop(windows_open_path(&part_path, false, false, false)?);
+        let part_w = windows_wide(&part_path);
+        let completed_w = windows_wide(&completed_path);
+        let linked = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateHardLinkW(
+                completed_w.as_ptr(),
+                part_w.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        if linked == 0 {
+            return Err(TransferError::Storage);
+        }
+        let removed =
+            unsafe { windows_sys::Win32::Storage::FileSystem::DeleteFileW(part_w.as_ptr()) };
+        if removed == 0 {
+            return Err(TransferError::Storage);
+        }
+        Ok(())
+    }
 }
 
-fn open_directory(path: &Path) -> Result<RootHandle, TransferError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(path)
+#[cfg(unix)]
+fn open_or_create_directory(path: &Path) -> Result<RootHandle, TransferError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| TransferError::UnsafeStorage)?
+            .join(path)
+    };
+    // macOS exposes /var as a system symlink to /private/var. Resolve this
+    // fixed system alias before the component-by-component no-follow walk;
+    // user-controlled ancestors are still opened with O_NOFOLLOW below.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if absolute.starts_with("/var") {
+        absolute = PathBuf::from("/private").join(absolute.strip_prefix("/").unwrap());
+    }
+    let mut components = absolute.components();
+    let mut current = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(Path::new("/"))
+        .map_err(|_| TransferError::UnsafeStorage)?;
+    while let Some(component) = components.next() {
+        let name = match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => name,
+            std::path::Component::ParentDir => return Err(TransferError::UnsafeStorage),
+            _ => return Err(TransferError::UnsafeStorage),
+        };
+        let name = CString::new(name.to_string_lossy().as_bytes())
             .map_err(|_| TransferError::UnsafeStorage)?;
-        if !file
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        let next = if fd >= 0 {
+            unsafe { File::from_raw_fd(fd) }
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(TransferError::UnsafeStorage);
+            }
+            let made = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) };
+            if made != 0 {
+                let race = std::io::Error::last_os_error();
+                if race.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(TransferError::UnsafeStorage);
+                }
+            }
+            let fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                )
+            };
+            if fd < 0 {
+                return Err(TransferError::UnsafeStorage);
+            }
+            unsafe { File::from_raw_fd(fd) }
+        };
+        if !next
             .metadata()
             .map_err(|_| TransferError::UnsafeStorage)?
             .file_type()
@@ -1069,17 +1187,25 @@ fn open_directory(path: &Path) -> Result<RootHandle, TransferError> {
         {
             return Err(TransferError::UnsafeStorage);
         }
+        current = next;
+    }
+    Ok(RootHandle { file: current })
+}
+
+#[cfg(not(unix))]
+fn open_directory(path: &Path) -> Result<RootHandle, TransferError> {
+    #[cfg(not(windows))]
+    {
+        return Ok(RootHandle {
+            file: File::open(path).map_err(|_| TransferError::UnsafeStorage)?,
+            path: path.to_path_buf(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let file = windows_open_path(path, false, false, true)?;
         Ok(RootHandle {
             file,
-            #[cfg(not(unix))]
-            path: path.to_path_buf(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(RootHandle {
-            file: File::open(path).map_err(|_| TransferError::UnsafeStorage)?,
-            #[cfg(not(unix))]
             path: path.to_path_buf(),
         })
     }
@@ -1110,7 +1236,7 @@ fn create_new_relative(root: &RootHandle, name: &str) -> Result<File, TransferEr
         }
         Ok(file)
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     {
         OpenOptions::new()
             .read(true)
@@ -1119,9 +1245,14 @@ fn create_new_relative(root: &RootHandle, name: &str) -> Result<File, TransferEr
             .open(root_path(root, name)?)
             .map_err(|_| TransferError::Storage)
     }
+    #[cfg(windows)]
+    {
+        windows_open_path(&root_path(root, name)?, true, true, false)
+    }
 }
 
 fn unlink_relative(root: &RootHandle, name: &str) -> Result<(), TransferError> {
+    validate_component(name)?;
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -1137,7 +1268,7 @@ fn unlink_relative(root: &RootHandle, name: &str) -> Result<(), TransferError> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     {
         match std::fs::remove_file(root_path(root, name)?) {
             Ok(()) => Ok(()),
@@ -1145,6 +1276,66 @@ fn unlink_relative(root: &RootHandle, name: &str) -> Result<(), TransferError> {
             Err(_) => Err(TransferError::Storage),
         }
     }
+    #[cfg(windows)]
+    {
+        let path = root_path(root, name)?;
+        drop(windows_open_path(&path, false, false, false)?);
+        let wide = windows_wide(&path);
+        let removed =
+            unsafe { windows_sys::Win32::Storage::FileSystem::DeleteFileW(wide.as_ptr()) };
+        if removed == 0 {
+            return Err(TransferError::Storage);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn read_directory_names(root: &RootHandle) -> Result<Vec<String>, TransferError> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+
+    // fdopendir consumes the duplicated descriptor, so the held root handle
+    // remains open for all cleanup operations. No pathname is used to
+    // enumerate the directory and an ancestor swap cannot redirect it.
+    let duplicate = unsafe { libc::dup(root.file.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(TransferError::Storage);
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(TransferError::Storage);
+    }
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+            .to_str()
+            .map_err(|_| TransferError::UnsafeStorage)?;
+        if name != "." && name != ".." {
+            names.push(name.to_owned());
+        }
+    }
+    if unsafe { libc::closedir(directory) } != 0 {
+        return Err(TransferError::Storage);
+    }
+    Ok(names)
+}
+
+#[cfg(not(unix))]
+fn read_directory_names(root: &RootHandle) -> Result<Vec<String>, TransferError> {
+    std::fs::read_dir(&root.path)
+        .map_err(|_| TransferError::Storage)?
+        .map(|entry| {
+            entry
+                .map_err(|_| TransferError::Storage)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect()
 }
 
 fn open_existing_regular_at(
@@ -1174,13 +1365,17 @@ fn open_existing_regular_at(
         }
         Ok(file)
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     {
         let mut options = OpenOptions::new();
         options.read(true).write(write);
         options
             .open(root_path(root, name)?)
             .map_err(|_| TransferError::Storage)
+    }
+    #[cfg(windows)]
+    {
+        windows_open_path(&root_path(root, name)?, write, false, false)
     }
 }
 
@@ -1200,6 +1395,158 @@ fn validate_component(name: &str) -> Result<(), TransferError> {
 fn root_path(root: &RootHandle, name: &str) -> Result<PathBuf, TransferError> {
     validate_component(name)?;
     Ok(root.path.join(name))
+}
+
+#[cfg(windows)]
+fn windows_wide(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(windows)]
+fn validate_windows_ancestors(path: &Path) -> Result<(), TransferError> {
+    let mut ancestors = Vec::new();
+    let mut current = path;
+    while let Some(parent) = current.parent() {
+        if parent == current {
+            break;
+        }
+        ancestors.push(parent.to_owned());
+        current = parent;
+    }
+    ancestors.reverse();
+    for ancestor in ancestors {
+        drop(windows_open_path_unchecked(&ancestor, false, false, true)?);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_open_path(
+    path: &Path,
+    write: bool,
+    create_new: bool,
+    directory: bool,
+) -> Result<File, TransferError> {
+    validate_windows_ancestors(path)?;
+    windows_open_path_unchecked(path, write, create_new, directory)
+}
+
+#[cfg(windows)]
+fn windows_open_path_unchecked(
+    path: &Path,
+    write: bool,
+    create_new: bool,
+    directory: bool,
+) -> Result<File, TransferError> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING,
+    };
+
+    let wide = windows_wide(path);
+    let access = if write {
+        GENERIC_READ | GENERIC_WRITE
+    } else {
+        GENERIC_READ
+    };
+    let disposition = if create_new {
+        CREATE_NEW
+    } else {
+        OPEN_EXISTING
+    };
+    let mut flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH;
+    if directory {
+        flags |= FILE_FLAG_BACKUP_SEMANTICS;
+    }
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            disposition,
+            flags,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(TransferError::Storage);
+    }
+    if windows_handle_is_reparse(handle) {
+        unsafe { CloseHandle(handle) };
+        return Err(TransferError::UnsafeStorage);
+    }
+    // SAFETY: CreateFileW returned an owned handle and this File takes it over.
+    let file = unsafe { File::from_raw_handle(handle as _) };
+    let metadata = file.metadata().map_err(|_| TransferError::Storage)?;
+    if directory != metadata.file_type().is_dir() || (!directory && !metadata.file_type().is_file())
+    {
+        return Err(TransferError::UnsafeStorage);
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_handle_is_reparse(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    ok == 0 || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+async fn sha256_open_file_with_lease(
+    repository: &Repository,
+    file: &mut File,
+    transfer_id: &str,
+    owner: &str,
+) -> Result<String, TransferError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| TransferError::Storage)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    let mut since_renewal = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| TransferError::Storage)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        since_renewal = since_renewal.saturating_add(read as u64);
+        if since_renewal >= 1024 * 1024 {
+            renew_repository_lease(repository, transfer_id, owner).await?;
+            since_renewal = 0;
+            tokio::task::yield_now().await;
+        }
+    }
+    renew_repository_lease(repository, transfer_id, owner).await?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| TransferError::Storage)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+async fn renew_repository_lease(
+    repository: &Repository,
+    transfer_id: &str,
+    owner: &str,
+) -> Result<(), TransferError> {
+    let update = sqlx::query(
+        "UPDATE c2_transfer_leases SET expires_at = unixepoch() + 30 WHERE transfer_id = ? AND owner = ? AND expires_at > unixepoch()",
+    )
+    .bind(transfer_id)
+    .bind(owner)
+    .execute(&repository.pool)
+    .await
+    .map_err(|_| TransferError::Repository)?;
+    if update.rows_affected() != 1 {
+        return Err(TransferError::Repository);
+    }
+    Ok(())
 }
 
 fn sha256_open_file(file: &mut File) -> Result<String, TransferError> {
