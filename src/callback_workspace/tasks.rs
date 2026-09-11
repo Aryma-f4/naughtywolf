@@ -154,6 +154,10 @@ pub struct EnqueueTaskRequest {
     timeout_ms: Option<u64>,
 }
 
+fn is_reserved_process_command(command: &str) -> bool {
+    matches!(command, "nw/process-list" | "nw/process-kill")
+}
+
 pub(super) async fn require_csrf(session: &Session, headers: &HeaderMap) -> Result<(), AppError> {
     let expected: Option<String> = session
         .get(CSRF_TOKEN_KEY)
@@ -207,6 +211,11 @@ pub async fn enqueue_task(
     if command.is_empty() || command.chars().count() > 256 {
         return Err(AppError::Validation("invalid command".to_owned()));
     }
+    if is_reserved_process_command(command) {
+        return Err(AppError::Validation(
+            "process controls must use their typed endpoints".to_owned(),
+        ));
+    }
     let timeout_ms = request.timeout_ms.unwrap_or(30_000).clamp(1, 600_000);
     let task_id = repository
         .enqueue_task_with_audit(
@@ -233,6 +242,15 @@ pub async fn retry_task(
     user.require(Role::Operator)?;
     require_visible_callback(&repository, &user, &session_id).await?;
     require_csrf(&session, &headers).await?;
+    let original_task = repository
+        .find_task_record(&session_id, &task_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if is_reserved_process_command(&original_task.command) {
+        return Err(AppError::Validation(
+            "process controls must use their typed endpoints".to_owned(),
+        ));
+    }
     let retry_id = repository
         .retry_task_with_audit(&session_id, &task_id, &user.id, &user.username)
         .await?;

@@ -4,7 +4,15 @@ use nw_profile::control::{
     ProcessListV1,
 };
 use nw_profile::msgs::{Task, TaskResult};
-use sysinfo::{Pid, ProcessesToUpdate, Signal, System, Users};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
+use sysinfo::{
+    MINIMUM_CPU_UPDATE_INTERVAL, Pid, ProcessStatus, ProcessesToUpdate, Signal, System, Users,
+};
+
+const TERMINATION_WAIT: Duration = Duration::from_secs(2);
 
 fn timestamp(seconds: u64) -> Option<String> {
     DateTime::<Utc>::from_timestamp(seconds.try_into().ok()?, 0)
@@ -17,6 +25,8 @@ fn now() -> String {
 
 pub fn list() -> ProcessListV1 {
     let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
     system.refresh_processes(ProcessesToUpdate::All, true);
     let users = Users::new_with_refreshed_list();
     let mut processes = system
@@ -58,10 +68,13 @@ pub fn kill(pid: u32) -> Result<ProcessKillV1, ControlError> {
 
     let terminated = match process.kill_with(Signal::Term) {
         Some(true) => true,
-        Some(false) => return Err(ControlError::PermissionDenied { pid }),
+        Some(false) => return Err(ControlError::TerminateFailed { pid }),
         None if process.kill() => true,
         None => return Err(ControlError::TerminateFailed { pid }),
     };
+    if !wait_for_exit(pid) {
+        return Err(ControlError::TerminateFailed { pid });
+    }
 
     Ok(ProcessKillV1 {
         schema: PROCESS_KILL_SCHEMA_V1.to_owned(),
@@ -70,6 +83,24 @@ pub fn kill(pid: u32) -> Result<ProcessKillV1, ControlError> {
         terminated,
         terminated_at: now(),
     })
+}
+
+fn wait_for_exit(pid: u32) -> bool {
+    let sys_pid = Pid::from_u32(pid);
+    let deadline = Instant::now() + TERMINATION_WAIT;
+    loop {
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        match system.process(sys_pid) {
+            None => return true,
+            Some(process) if matches!(process.status(), ProcessStatus::Zombie) =>
+            {
+                return true;
+            }
+            Some(_) if Instant::now() >= deadline => return false,
+            Some(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 fn failure(task: &Task, code: &str, message: impl Into<String>) -> TaskResult {

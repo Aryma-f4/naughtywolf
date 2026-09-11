@@ -1047,13 +1047,16 @@ impl Repository {
         let process_snapshot = if ok && command == "nw/process-list" {
             let snapshot: nw_profile::control::ProcessListV1 = serde_json::from_slice(stdout)
                 .map_err(|_| AppError::Validation("invalid process list result".to_owned()))?;
-            if snapshot.schema != nw_profile::control::PROCESS_LIST_SCHEMA_V1
-                || chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at).is_err()
-            {
+            if snapshot.schema != nw_profile::control::PROCESS_LIST_SCHEMA_V1 {
                 return Err(AppError::Validation(
                     "invalid process list result schema or capture time".to_owned(),
                 ));
             }
+            chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at).map_err(|_| {
+                AppError::Validation(
+                    "invalid process list result schema or capture time".to_owned(),
+                )
+            })?;
             Some(snapshot)
         } else {
             None
@@ -1104,23 +1107,42 @@ impl Repository {
         .await
         .map_err(|_| AppError::Internal)?;
         if let Some(snapshot) = process_snapshot {
-            let snapshot_json = serde_json::to_value(&snapshot).map_err(|_| AppError::Internal)?;
-            sqlx::query(
-                "INSERT INTO c2_process_snapshots \
-                 (session_id, task_id, schema_version, snapshot_json, captured_at) \
-                 VALUES (?, ?, ?, ?, ?) \
-                 ON CONFLICT(session_id) DO UPDATE SET task_id = excluded.task_id, \
-                 schema_version = excluded.schema_version, snapshot_json = excluded.snapshot_json, \
-                 captured_at = excluded.captured_at",
+            let previous: Option<String> = sqlx::query_scalar(
+                "SELECT captured_at FROM c2_process_snapshots WHERE session_id = ?",
             )
             .bind(session_id)
-            .bind(task_id)
-            .bind(&snapshot.schema)
-            .bind(snapshot_json)
-            .bind(&snapshot.captured_at)
-            .execute(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(|_| AppError::Internal)?;
+            let is_newer = previous
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| {
+                    chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at)
+                        .map(|new_value| new_value > value)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            if is_newer {
+                let snapshot_json =
+                    serde_json::to_value(&snapshot).map_err(|_| AppError::Internal)?;
+                sqlx::query(
+                    "INSERT INTO c2_process_snapshots \
+                     (session_id, task_id, schema_version, snapshot_json, captured_at) \
+                     VALUES (?, ?, ?, ?, ?) \
+                     ON CONFLICT(session_id) DO UPDATE SET task_id = excluded.task_id, \
+                     schema_version = excluded.schema_version, snapshot_json = excluded.snapshot_json, \
+                     captured_at = excluded.captured_at",
+                )
+                .bind(session_id)
+                .bind(task_id)
+                .bind(&snapshot.schema)
+                .bind(snapshot_json)
+                .bind(&snapshot.captured_at)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| AppError::Internal)?;
+            }
         }
         sqlx::query(
             "UPDATE c2_tasks SET status = ?, completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \

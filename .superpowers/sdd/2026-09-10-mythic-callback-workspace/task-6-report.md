@@ -10,3 +10,9 @@
 - Files: Task 6 brief files plus `tests/callback_workspace_test.cjs` and this report; no unrelated files intentionally changed.
 - Concern: existing workspace formatting baseline still reports unrelated `tests/config_db_test.rs` differences under full `cargo fmt --check`; touched files were rustfmt-formatted individually.
 - Workspace regression: 37/39 library tests passed; two unrelated network/process tests failed with sandbox `Operation not permitted`.
+- Fix-round RED: `node --test tests/callback_workspace_test.cjs` → 9 passed, 4 failed (nested process dataset, before guard).
+- Fix-round GREEN: `node --test tests/callback_workspace_test.cjs` → 15 passed, 0 failed; `cargo test -p naughtywolf --test callback_workspace_test process_` → 6 passed, 0 failed.
+- Fix-round GREEN: `cargo test -p nw-profile control` → 1 passed; `cargo test -p nw-implant --test callback_controls process_ -- --nocapture` → 6 passed, 0 failed.
+- Windows exact blocker: `cargo check -p nw-implant --target x86_64-pc-windows-gnu` → `error[E0463]: can't find crate for core`; `rustup target add ...` reports up to date but target std is absent from active toolchains.
+- Fix-round final: `node --test tests/callback_workspace_test.cjs` → 16 passed, 0 failed; `cargo test -p naughtywolf --test callback_workspace_test` → 14 passed, 0 failed.
+- Fix-round final: `cargo test -p nw-profile control` → 1 passed, 0 failed; `cargo test -p nw-implant --test callback_controls process_ -- --nocapture` → 6 passed, 0 failed.

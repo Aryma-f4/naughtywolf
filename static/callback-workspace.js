@@ -25,6 +25,7 @@
     let draft = "";
     let closed = false;
     const processPanel = root.querySelector("[data-process-panel]");
+    const processDataset = processPanel?.dataset || root.dataset;
     const processSearch = root.querySelector("[data-process-search]");
     const processBody = root.querySelector("[data-process-table-body]");
     const processEmpty = root.querySelector("[data-process-empty]");
@@ -86,8 +87,6 @@
         element("p", "", `Memory: ${processValue(process, "memory_bytes")}`),
         element("p", "", `Started: ${unavailable(process.started_at)}`),
       );
-      // Keep the aggregate text useful to assistive technology and lightweight DOM clients.
-      processDetail.textContent = `${unavailable(process.name)} PID ${process.pid} Parent PID: ${processValue(process, "parent_pid")} Executable: ${unavailable(process.executable)} User: ${unavailable(process.user)} Architecture: ${unavailable(process.architecture)} CPU: ${processValue(process, "cpu_percent")} Memory: ${processValue(process, "memory_bytes")} Started: ${unavailable(process.started_at)}`;
     };
 
     const renderProcesses = () => {
@@ -124,8 +123,8 @@
     };
 
     const loadProcesses = async () => {
-      if (!processPanel || root.dataset.processCapable !== "true") return;
-      const response = await request(root.dataset.processesEndpoint, { credentials: "same-origin" });
+      if (!processPanel || processDataset.processCapable !== "true") return;
+      const response = await request(processDataset.processesEndpoint, { credentials: "same-origin" });
       if (!response.ok) throw new Error(`Process snapshot request failed (${response.status})`);
       const snapshot = await response.json();
       const data = snapshot?.snapshot_json || snapshot;
@@ -400,13 +399,19 @@
       if (processRefresh.disabled) return;
       processRefresh.disabled = true;
       try {
-        const response = await request(`${root.dataset.processesEndpoint}/refresh`, {
+        const response = await request(`${processDataset.processesEndpoint}/refresh`, {
           method: "POST",
           credentials: "same-origin",
           headers: { "x-csrf-token": root.dataset.csrfToken },
         });
         if (!response.ok) throw new Error(`Process refresh task failed (${response.status})`);
-        upsert(await response.json());
+        const task = await response.json();
+        upsert(task);
+        if (processTaskLink) {
+          processTaskLink.setAttribute("href", `#task-${task.id}`);
+          processTaskLink.textContent = `Task ${task.id}`;
+          processTaskLink.hidden = false;
+        }
         if (processMessage) processMessage.textContent = "Process refresh queued.";
       } catch (_) {
         if (processMessage) processMessage.textContent = "Unable to queue process refresh; check callback scope and connection.";
@@ -423,7 +428,7 @@
       const target = selectedProcess;
       processConfirmSubmit.disabled = true;
       try {
-        const response = await request(`${root.dataset.processesEndpoint}/${encodeURIComponent(target.pid)}/kill`, {
+        const response = await request(`${processDataset.processesEndpoint}/${encodeURIComponent(target.pid)}/kill`, {
           method: "POST",
           credentials: "same-origin",
           headers: { "x-csrf-token": root.dataset.csrfToken },
@@ -451,7 +456,7 @@
       offlineQueue.textContent = "Callback is offline. New tasks stay queued until its next check-in.";
     }
     if (processPanel) {
-      const capable = root.dataset.processCapable === "true";
+      const capable = processDataset.processCapable === "true";
       if (!capable) {
         if (processRefresh) processRefresh.disabled = true;
         if (processMessage) processMessage.textContent = "This callback does not advertise process control capability.";
@@ -461,7 +466,12 @@
     }
     setConnection("Connecting");
     const ready = loadPage()
-      .then(() => closed ? undefined : loadProcesses())
+      .then(() => {
+        if (closed) return undefined;
+        return loadProcesses().catch(() => {
+          if (processMessage) processMessage.textContent = "Process snapshot unavailable; Tasking remains connected.";
+        });
+      })
       .then(() => connect())
       .catch(() => setConnection("History unavailable — retry"));
 

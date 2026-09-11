@@ -10,7 +10,7 @@ class Element {
     this.attributes = {};
     this.listeners = {};
     this.className = '';
-    this.textContent = '';
+    this._textContent = '';
     this.value = '';
     this.hidden = false;
     this.disabled = false;
@@ -18,7 +18,9 @@ class Element {
   }
   append(...children) { for (const child of children) { child.parentNode = this; this.children.push(child); } }
   prepend(child) { child.parentNode = this; this.children.unshift(child); }
-  replaceChildren(...children) { this.children = []; this.append(...children); }
+  replaceChildren(...children) { this._textContent = ''; this.children = []; this.append(...children); }
+  get textContent() { return this._textContent + this.children.map(child => child.textContent).join(''); }
+  set textContent(value) { this._textContent = String(value); }
   remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this); }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
@@ -65,8 +67,6 @@ function skeleton() {
   root.dataset.eventsEndpoint = '/api/callbacks/callback-1/events';
   root.dataset.csrfToken = 'csrf';
   root.dataset.online = 'false';
-  root.dataset.processesEndpoint = '/api/callbacks/callback-1/processes';
-  root.dataset.processCapable = 'true';
   for (const key of ['taskList', 'taskEmpty', 'taskSearch', 'taskStateFilter', 'taskErrorFilter', 'loadOlder', 'connectionState', 'offlineQueue', 'commandInput', 'commandArguments', 'taskForm']) {
     const element = new Element(key === 'taskForm' ? 'form' : key.includes('Filter') ? 'select' : key.includes('Input') || key === 'taskSearch' || key === 'commandArguments' ? 'input' : 'div');
     element.dataset[key] = '';
@@ -77,6 +77,9 @@ function skeleton() {
     element.dataset[key] = '';
     root.append(element);
   }
+  const processPanel = root.querySelector('[data-process-panel]');
+  processPanel.dataset.processesEndpoint = '/api/callbacks/callback-1/processes';
+  processPanel.dataset.processCapable = 'true';
   const sortName = new Element('button');
   sortName.dataset.processSort = 'name';
   const sortPid = new Element('button');
@@ -274,6 +277,8 @@ test('process snapshot shows stale age and supports sorting, search, and detail 
   const visible = root.querySelectorAll('[data-process-row]').find(row => !row.hidden);
   root.querySelector('[data-process-table-body]').dispatch('click', { target: visible });
   assert.match(root.querySelector('[data-process-detail]').textContent, /alpha-worker.*PID 42.*Unavailable/s);
+  assert.equal(root.querySelector('[data-process-detail]').querySelector('.process-detail-name').textContent, 'alpha-worker');
+  assert.equal(root.querySelector('[data-process-detail]').querySelector('.process-detail-pid').textContent, 'PID 42');
   assert.equal(root.querySelector('[data-process-task-link]').getAttribute('href'), '#task-process-task-1');
 });
 
@@ -303,7 +308,7 @@ test('process kill confirmation names the exact process and PID and links the qu
 
 test('process controls explain unsupported capability and offline state', async () => {
   const unsupported = skeleton();
-  unsupported.dataset.processCapable = 'false';
+  unsupported.querySelector('[data-process-panel]').dataset.processCapable = 'false';
   const unsupportedWorkspace = createWorkspace(unsupported, dependencies());
   await unsupportedWorkspace.ready;
   assert.equal(unsupported.querySelector('[data-process-refresh]').disabled, true);
@@ -313,6 +318,33 @@ test('process controls explain unsupported capability and offline state', async 
   const offlineWorkspace = createWorkspace(offline, dependencies());
   await offlineWorkspace.ready;
   assert.match(offline.querySelector('[data-process-message]').textContent, /offline.*queued/i);
+});
+
+test('manual process refresh links its generated task in Tasking', async () => {
+  const root = skeleton();
+  const deps = dependencies();
+  deps.fetch = async url => {
+    if (url.endsWith('/processes')) return { ok: true, json: async () => null };
+    if (url.endsWith('/processes/refresh')) return { ok: true, json: async () => task({ id: 'refresh-task-manual', command: 'nw/process-list' }) };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  const refresh = root.querySelector('[data-process-refresh]').dispatch('click');
+  await refresh.pending;
+  assert.equal(root.querySelector('[data-process-task-link]').getAttribute('href'), '#task-refresh-task-manual');
+});
+
+test('process snapshot failure does not prevent Tasking SSE connection', async () => {
+  const root = skeleton();
+  const deps = dependencies();
+  deps.fetch = async url => url.endsWith('/processes')
+    ? ({ ok: false, status: 503 })
+    : ({ ok: true, json: async () => ({ tasks: [], next_before: null }) });
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  assert.ok(deps.source, 'Tasking EventSource should connect despite process failure');
+  assert.match(root.querySelector('[data-process-message]').textContent, /unavailable.*tasking.*connected/i);
 });
 
 test('process kill refreshes the snapshot only after the linked task completes', async () => {
@@ -339,4 +371,25 @@ test('process kill refreshes the snapshot only after the linked task completes',
   deps.source.listeners.task({ data: JSON.stringify(task({ id: 'refresh-task-10', command: 'nw/process-list', parent_task_id: 'kill-task-10', status: 'completed', state_label: 'Completed' })) });
   await flush();
   assert.equal(calls.filter(([url]) => url.endsWith('/processes')).length, 2);
+});
+
+test('failed process kill does not refresh the process snapshot', async () => {
+  const root = skeleton();
+  const deps = dependencies();
+  const calls = [];
+  deps.fetch = async (url, options = {}) => {
+    calls.push([url, options]);
+    if (url.endsWith('/processes')) return { ok: true, json: async () => processSnapshot() };
+    if (url.includes('/processes/7331/kill')) return { ok: true, json: async () => task({ id: 'kill-task-failed', command: 'nw/process-kill' }) };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  const row = root.querySelectorAll('[data-process-row]').find(candidate => candidate.dataset.processPid === '7331');
+  root.querySelector('[data-process-table-body]').dispatch('click', { target: row.querySelector('[data-process-kill]') });
+  const submit = root.querySelector('[data-process-confirm-submit]').dispatch('click');
+  await submit.pending;
+  deps.source.listeners.task({ data: JSON.stringify(task({ id: 'kill-task-failed', command: 'nw/process-kill', status: 'error', state_label: 'Error' })) });
+  await flush();
+  assert.equal(calls.filter(([url]) => url.endsWith('/processes')).length, 1);
 });

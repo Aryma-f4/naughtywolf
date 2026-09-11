@@ -73,7 +73,7 @@ fn process_list_contains_the_current_test_process() {
     let snapshot = nw_implant::processes::list();
 
     assert_eq!(snapshot.schema, "nw.process-list.v1");
-    assert!(snapshot.captured_at.ends_with('Z'));
+    assert!(chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at).is_ok());
     assert!(
         snapshot
             .processes
@@ -136,6 +136,14 @@ fn process_kill_terminates_only_its_dedicated_child() {
     let result = nw_implant::processes::kill(child_pid).expect("terminate dedicated child");
     assert_eq!(result.pid, child_pid);
     assert!(result.terminated);
+    assert!(
+        child
+            .0
+            .try_wait()
+            .expect("inspect terminated dedicated child")
+            .is_some(),
+        "kill must not return before the dedicated child exits"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
