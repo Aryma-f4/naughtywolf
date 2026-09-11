@@ -67,9 +67,12 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
         repository.clone(),
         &config,
     )?;
+    transfer_store.cleanup_orphans().await?;
     let app = Router::<Repository>::new()
         .route("/login", post(login_handler))
-        .merge(portal::authenticated_router())
+        .merge(portal::authenticated_router_with_transfer_limit(
+            config.max_transfer_bytes,
+        ))
         .merge(c2::router(c2_psk.clone()))
         .with_state(repository.clone())
         .merge(public_router())

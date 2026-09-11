@@ -406,6 +406,147 @@ async fn transfer_store_upload_chunks_resume_from_durable_acks_with_fifo_fairnes
 }
 
 #[tokio::test]
+async fn transfer_tasks_are_delivered_one_head_per_direction_until_terminal() {
+    let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let first_download = store
+        .queue_download(
+            &session_id,
+            "/srv/first.bin",
+            Some(1),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let second_download = store
+        .queue_download(
+            &session_id,
+            "/srv/second.bin",
+            Some(1),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let mut stage = store.begin_upload_stage().unwrap();
+    stage.write(b"a").unwrap();
+    let first_upload = store
+        .finish_upload_stage(
+            stage,
+            &session_id,
+            "/srv/first-upload.bin",
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    let mut stage = store.begin_upload_stage().unwrap();
+    stage.write(b"b").unwrap();
+    let second_upload = store
+        .finish_upload_stage(
+            stage,
+            &session_id,
+            "/srv/second-upload.bin",
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+
+    let delivered = repo.tasks_for_delivery(&session_id).await.unwrap();
+    assert_eq!(
+        delivered
+            .iter()
+            .filter(|task| task.id == first_download.task_id.clone().unwrap())
+            .count(),
+        1
+    );
+    assert_eq!(
+        delivered
+            .iter()
+            .filter(|task| task.id == first_upload.task_id.clone().unwrap())
+            .count(),
+        1
+    );
+    assert!(
+        !delivered
+            .iter()
+            .any(|task| task.id == second_download.task_id.clone().unwrap())
+    );
+    assert!(
+        !delivered
+            .iter()
+            .any(|task| task.id == second_upload.task_id.clone().unwrap())
+    );
+
+    let first_ids = delivered
+        .iter()
+        .map(|task| uuid::Uuid::parse_str(&task.id).unwrap())
+        .collect::<Vec<_>>();
+    repo.acknowledge_tasks(&session_id, &first_ids)
+        .await
+        .unwrap();
+    assert!(
+        repo.tasks_for_delivery(&session_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    sqlx::query("UPDATE c2_file_transfers SET status = 'completed' WHERE id IN (?, ?)")
+        .bind(&first_download.id)
+        .bind(&first_upload.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    let next = repo.tasks_for_delivery(&session_id).await.unwrap();
+    assert!(
+        next.iter()
+            .any(|task| task.id == second_download.task_id.clone().unwrap())
+    );
+    assert!(
+        next.iter()
+            .any(|task| task.id == second_upload.task_id.clone().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_pending_transfer_task_cancels_its_transfer_atomically() {
+    let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/cancel.bin",
+            Some(1),
+            None,
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.request_task_cancellation(
+            &session_id,
+            transfer.task_id.as_deref().unwrap(),
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap(),
+        naughtywolf::db::models::TaskCancellation::Cancelled
+    );
+    assert_eq!(
+        repo.file_transfer(&transfer.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+}
+
+#[tokio::test]
 async fn transfer_endpoints_require_role_scope_and_csrf_and_audit_exact_destination() {
     let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
     let app = authenticated_transfer_app(repo.clone(), operator, store.clone()).await;

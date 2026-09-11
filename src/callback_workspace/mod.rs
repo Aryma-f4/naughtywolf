@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 
@@ -11,6 +12,12 @@ pub mod tasks;
 pub mod transfers;
 
 pub fn router() -> Router<Repository> {
+    router_with_transfer_limit(crate::callback_workspace::transfers::DEFAULT_MAX_TRANSFER_BYTES)
+}
+
+pub fn router_with_transfer_limit(max_transfer_bytes: u64) -> Router<Repository> {
+    let body_limit =
+        usize::try_from(max_transfer_bytes.saturating_add(64 * 1024)).unwrap_or(usize::MAX);
     Router::new()
         .route(
             "/api/callbacks/{session_id}/tasks",
@@ -56,7 +63,7 @@ pub fn router() -> Router<Repository> {
         )
         .route(
             "/api/callbacks/{session_id}/files/upload",
-            post(files::upload),
+            post(files::upload).layer(DefaultBodyLimit::max(body_limit)),
         )
         .route(
             "/api/callbacks/{session_id}/files/download",

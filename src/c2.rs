@@ -73,6 +73,16 @@ pub async fn process_sealed(
     wire: &[u8],
     protocol: &str,
 ) -> Result<Vec<u8>, C2Error> {
+    process_sealed_with_store(repo, psk, wire, protocol, None).await
+}
+
+async fn process_sealed_with_store(
+    repo: &Repository,
+    psk: &[u8],
+    wire: &[u8],
+    protocol: &str,
+    transfer_store: Option<&crate::callback_workspace::transfers::TransferStore>,
+) -> Result<Vec<u8>, C2Error> {
     let wire = std::str::from_utf8(wire).map_err(|_| C2Error::BadRequest)?;
     let key = match Envelope::routing_id(wire) {
         None => session_key(psk),
@@ -86,7 +96,7 @@ pub async fn process_sealed(
         }
     };
     let env = Envelope::open(&key, wire).map_err(|_| C2Error::Unauthorized)?;
-    let reply = process_envelope(repo, psk, env, protocol).await?;
+    let reply = process_envelope(repo, psk, env, protocol, transfer_store).await?;
     reply
         .seal(&key)
         .map(String::into_bytes)
@@ -98,12 +108,20 @@ async fn process_envelope(
     psk: &[u8],
     env: Envelope,
     protocol: &str,
+    transfer_store: Option<&crate::callback_workspace::transfers::TransferStore>,
 ) -> Result<Envelope, C2Error> {
     match env.kind {
         Kind::Register => process_sealed_register(repo, psk, env, protocol).await,
-        Kind::TaskResult | Kind::Heartbeat => process_sealed_poll(repo, env).await,
+        Kind::TaskResult | Kind::Heartbeat => {
+            process_sealed_poll_with_store(repo, env, transfer_store).await
+        }
         _ => Err(C2Error::BadRequest),
     }
+}
+
+#[cfg(test)]
+async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelope, C2Error> {
+    process_sealed_poll_with_store(repo, env, None).await
 }
 
 async fn process_sealed_register(
@@ -144,10 +162,6 @@ async fn process_sealed_register(
     ))
 }
 
-async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelope, C2Error> {
-    process_sealed_poll_with_store(repo, env, None).await
-}
-
 async fn process_sealed_poll_with_store(
     repo: &Repository,
     env: Envelope,
@@ -164,6 +178,11 @@ async fn process_sealed_poll_with_store(
         crypto::decrypt(&key, env.id, &env.encrypted).map_err(|_| C2Error::Unauthorized)?;
     let request: PollRequest =
         serde_json::from_slice(&plaintext).map_err(|_| C2Error::BadRequest)?;
+    let frame_budget = if request.inner_budget == 0 {
+        usize::MAX
+    } else {
+        request.inner_budget
+    };
     repo.touch_callback(&session_id.to_string())
         .await
         .map_err(|_| C2Error::Internal)?;
@@ -217,10 +236,12 @@ async fn process_sealed_poll_with_store(
             );
         }
         for ack in &request.upload_acks {
-            store
-                .ack_upload(&session_id.to_string(), ack)
-                .await
-                .map_err(transfer_c2_error)?;
+            file_acks.push(
+                store
+                    .ack_upload(&session_id.to_string(), ack)
+                    .await
+                    .map_err(transfer_c2_error)?,
+            );
         }
     }
     let tasks = repo
@@ -242,24 +263,54 @@ async fn process_sealed_poll_with_store(
     } else {
         Kind::Task
     };
-    let push_chunks = if let Some(store) = transfer_store.as_ref() {
+    let mut push_chunks = if let Some(store) = transfer_store.as_ref() {
         store
-            .next_upload_chunks(&session_id.to_string(), request.inner_budget)
+            .next_upload_chunks(&session_id.to_string(), frame_budget)
             .await
             .map_err(transfer_c2_error)?
     } else {
         Vec::new()
     };
-    let reply = PollReply {
+    let mut reply = PollReply {
         tasks,
         result_acks,
         acks: file_acks,
-        push_chunks,
+        push_chunks: Vec::new(),
     };
     let reply_id = env.id + 1;
+    // `inner_budget` is the complete sealed frame budget. Reserve the
+    // non-transfer reply first, then admit only the largest contiguous prefix
+    // of chunks that fits after JSON/base64/AEAD overhead.
+    while !push_chunks.is_empty() {
+        reply.push_chunks = push_chunks.clone();
+        let plaintext = serde_json::to_vec(&reply).map_err(|_| C2Error::Internal)?;
+        let encrypted =
+            crypto::encrypt(&key, reply_id, &plaintext).map_err(|_| C2Error::Internal)?;
+        let frame = Envelope::new(
+            if reply.tasks.is_empty() {
+                Kind::Heartbeat
+            } else {
+                Kind::Task
+            },
+            reply_id,
+            Some(session_id),
+            encrypted,
+        )
+        .seal(&key)
+        .map_err(|_| C2Error::Internal)?;
+        if frame.len() <= frame_budget {
+            break;
+        }
+        push_chunks.pop();
+    }
+    reply.push_chunks = push_chunks;
     let plaintext = serde_json::to_vec(&reply).map_err(|_| C2Error::Internal)?;
     let encrypted = crypto::encrypt(&key, reply_id, &plaintext).map_err(|_| C2Error::Internal)?;
-    Ok(Envelope::new(kind, reply_id, Some(session_id), encrypted))
+    let envelope = Envelope::new(kind, reply_id, Some(session_id), encrypted);
+    if envelope.seal(&key).map_err(|_| C2Error::Internal)?.len() > frame_budget {
+        return Err(C2Error::BadRequest);
+    }
+    Ok(envelope)
 }
 
 fn transfer_c2_error(error: crate::callback_workspace::transfers::TransferError) -> C2Error {
@@ -275,12 +326,19 @@ fn transfer_c2_error(error: crate::callback_workspace::transfers::TransferError)
 async fn checkin(
     State(repo): State<Repository>,
     Extension(psk): Extension<Arc<Vec<u8>>>,
+    store: Option<Extension<crate::callback_workspace::transfers::TransferStore>>,
     body: axum::body::Bytes,
 ) -> Result<axum::body::Bytes, StatusCode> {
-    process_sealed(&repo, &psk, &body, "http")
-        .await
-        .map(axum::body::Bytes::from)
-        .map_err(|error| error.status())
+    process_sealed_with_store(
+        &repo,
+        &psk,
+        &body,
+        "http",
+        store.as_ref().map(|Extension(store)| store),
+    )
+    .await
+    .map(axum::body::Bytes::from)
+    .map_err(|error| error.status())
 }
 
 async fn register(
@@ -666,7 +724,7 @@ mod tests {
                 total: 3,
                 data: b"xyz".to_vec(),
             }],
-            inner_budget: 4,
+            inner_budget: 4096,
             ..Default::default()
         };
         let id = 41;
@@ -688,7 +746,7 @@ mod tests {
                 .iter()
                 .map(|chunk| chunk.data.len())
                 .sum::<usize>(),
-            4
+            6
         );
         assert!(
             reply

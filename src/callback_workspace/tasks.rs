@@ -309,8 +309,9 @@ pub async fn task_events(
         }
     }
     for transfer in repository.list_file_transfers(&session_id).await? {
-        let serialized = serde_json::to_string(&transfer).map_err(|_| AppError::Internal)?;
-        known_transfers.insert(transfer.id.clone(), serialized.clone());
+        let view = crate::callback_workspace::transfers::TransferView::from(transfer);
+        let serialized = serde_json::to_string(&view).map_err(|_| AppError::Internal)?;
+        known_transfers.insert(view.id.clone(), serialized.clone());
         queued.push_back(("transfer", serialized));
     }
 
@@ -346,11 +347,12 @@ pub async fn task_events(
                     Err(_) => return None,
                 };
                 for transfer in transfers.into_iter().rev() {
-                    let Ok(serialized) = serde_json::to_string(&transfer) else {
+                    let view = crate::callback_workspace::transfers::TransferView::from(transfer);
+                    let Ok(serialized) = serde_json::to_string(&view) else {
                         continue;
                     };
-                    if known_transfers.get(&transfer.id) != Some(&serialized) {
-                        known_transfers.insert(transfer.id, serialized.clone());
+                    if known_transfers.get(&view.id) != Some(&serialized) {
+                        known_transfers.insert(view.id, serialized.clone());
                         queued.push_back(("transfer", serialized));
                     }
                 }

@@ -6,17 +6,15 @@ use axum::{
     response::Response,
 };
 use serde::Deserialize;
+use tokio_util::io::ReaderStream;
 use tower_sessions::Session;
 
 use super::tasks::{TaskView, require_csrf, require_visible_callback, task_view};
 use crate::{
     AppError,
     auth::{middleware::AuthenticatedUserGuard, rbac::Role},
-    callback_workspace::transfers::{TransferError, TransferStore},
-    db::{
-        models::{FileSnapshot, FileTransfer},
-        repositories::Repository,
-    },
+    callback_workspace::transfers::{TransferError, TransferStore, TransferView},
+    db::{models::FileSnapshot, repositories::Repository},
 };
 
 #[derive(Debug, Deserialize)]
@@ -197,10 +195,17 @@ pub async fn transfers(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repository): State<Repository>,
     Path(session_id): Path<String>,
-) -> Result<Json<Vec<FileTransfer>>, AppError> {
+) -> Result<Json<Vec<TransferView>>, AppError> {
     user.require(Role::Operator)?;
     require_visible_callback(&repository, &user, &session_id).await?;
-    Ok(Json(repository.list_file_transfers(&session_id).await?))
+    Ok(Json(
+        repository
+            .list_file_transfers(&session_id)
+            .await?
+            .into_iter()
+            .map(TransferView::from)
+            .collect(),
+    ))
 }
 
 pub async fn download(
@@ -211,7 +216,7 @@ pub async fn download(
     headers: HeaderMap,
     Extension(store): Extension<TransferStore>,
     Json(request): Json<DownloadRequest>,
-) -> Result<Json<FileTransfer>, AppError> {
+) -> Result<Json<TransferView>, AppError> {
     user.require(Role::Operator)?;
     require_visible_callback(&repository, &user, &session_id).await?;
     require_csrf(&session, &headers).await?;
@@ -227,7 +232,7 @@ pub async fn download(
         )
         .await
         .map_err(transfer_app_error)?;
-    Ok(Json(transfer))
+    Ok(Json(transfer.into()))
 }
 
 pub async fn upload(
@@ -238,10 +243,20 @@ pub async fn upload(
     headers: HeaderMap,
     Extension(store): Extension<TransferStore>,
     mut multipart: Multipart,
-) -> Result<Json<FileTransfer>, AppError> {
+) -> Result<Json<TransferView>, AppError> {
     user.require(Role::Operator)?;
     require_visible_callback(&repository, &user, &session_id).await?;
     require_csrf(&session, &headers).await?;
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > store.max_bytes().saturating_add(64 * 1024))
+    {
+        return Err(AppError::Validation(
+            "multipart upload exceeds configured size limit".to_owned(),
+        ));
+    }
     let mut destination: Option<String> = None;
     let mut stage = None;
     while let Some(mut field) = multipart
@@ -257,7 +272,11 @@ pub async fn upload(
                     .await
                     .map_err(|_| AppError::Validation("invalid upload destination".to_owned()))?
                 {
-                    if value.len().saturating_add(chunk.len()) > 4096 {
+                    if value
+                        .len()
+                        .checked_add(chunk.len())
+                        .is_none_or(|length| length > 4096)
+                    {
                         return Err(AppError::Validation(
                             "upload destination is too long".to_owned(),
                         ));
@@ -301,7 +320,7 @@ pub async fn upload(
         )
         .await
         .map_err(transfer_app_error)?;
-    Ok(Json(transfer))
+    Ok(Json(transfer.into()))
 }
 
 pub async fn download_completed(
@@ -316,16 +335,16 @@ pub async fn download_completed(
         .file_transfer_for_session(&session_id, &transfer_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let bytes = store
-        .read_completed(&transfer)
-        .await
+    let file = store
+        .open_completed(&transfer)
         .map_err(transfer_app_error)?;
     let disposition = HeaderValue::from_str(&format!(
         "attachment; filename=\"download-{}.bin\"",
         transfer.id
     ))
     .map_err(|_| AppError::Internal)?;
-    let mut response = Response::new(Body::from(bytes));
+    let file = tokio::fs::File::from_std(file);
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),

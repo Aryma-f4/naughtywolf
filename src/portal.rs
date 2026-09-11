@@ -108,8 +108,16 @@ pub fn public_router() -> Router {
 /// The binary supplies the repository state and session layer when composing
 /// this router with the public routes.
 pub fn authenticated_router() -> Router<Repository> {
+    authenticated_router_with_transfer_limit(
+        crate::callback_workspace::transfers::DEFAULT_MAX_TRANSFER_BYTES,
+    )
+}
+
+pub fn authenticated_router_with_transfer_limit(max_transfer_bytes: u64) -> Router<Repository> {
     Router::new()
-        .merge(crate::callback_workspace::router())
+        .merge(crate::callback_workspace::router_with_transfer_limit(
+            max_transfer_bytes,
+        ))
         .route("/dashboard", get(dashboard))
         .route("/guide", get(guide))
         .route("/topology", get(workspace::topology_page))

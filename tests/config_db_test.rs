@@ -1,5 +1,5 @@
-use sqlx::Row;
 use sha2::Digest;
+use sqlx::Row;
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, sqlx::FromRow)]
@@ -22,12 +22,23 @@ struct CallbackPreservationRow {
 #[tokio::test]
 async fn callback_workspace_migration_preserves_completed_task_results() {
     let path = std::env::temp_dir().join(format!("naughtywolf-schema-{}.db", uuid::Uuid::new_v4()));
-    let url = format!("sqlite:///{}?mode=rwc", path.to_string_lossy().trim_start_matches('/'));
+    let url = format!(
+        "sqlite:///{}?mode=rwc",
+        path.to_string_lossy().trim_start_matches('/')
+    );
     let pool = naughtywolf::db::create_pool(&url).await.unwrap();
     for (migration, version, description) in [
         (include_str!("../migrations/001_core.sql"), 1_i64, "core"),
-        (include_str!("../migrations/002_payload_features.sql"), 2, "payload_features"),
-        (include_str!("../migrations/003_c2_sessions.sql"), 3, "c2_sessions"),
+        (
+            include_str!("../migrations/002_payload_features.sql"),
+            2,
+            "payload_features",
+        ),
+        (
+            include_str!("../migrations/003_c2_sessions.sql"),
+            3,
+            "c2_sessions",
+        ),
     ] {
         sqlx::raw_sql(migration).execute(&pool).await.unwrap();
         let checksum = sha2::Sha384::digest(migration.as_bytes());
@@ -50,8 +61,14 @@ async fn callback_workspace_migration_preserves_completed_task_results() {
     assert_eq!(tasks_before, tasks_after);
     let results_after: Vec<(String, i64, Vec<u8>, Vec<u8>, i64, String)> = sqlx::query_as("SELECT task_id, ok, stdout, stderr, exit_code, completed_at FROM c2_task_results ORDER BY task_id").fetch_all(&pool).await.unwrap();
     assert_eq!(results_before, results_after);
-    let fk_violations: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check").fetch_all(&pool).await.unwrap();
-    assert!(fk_violations.is_empty(), "foreign key violations: {fk_violations:?}");
+    let fk_violations: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        fk_violations.is_empty(),
+        "foreign key violations: {fk_violations:?}"
+    );
     pool.close().await;
     let _ = std::fs::remove_file(path);
 }
@@ -62,12 +79,11 @@ async fn callback_workspace_schema_persists_lifecycle_snapshots_and_transfers() 
         .await
         .unwrap();
     naughtywolf::db::run_migrations(&pool).await.unwrap();
-    let task_columns: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM pragma_table_info('c2_tasks') ORDER BY cid",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let task_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('c2_tasks') ORDER BY cid")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert!(task_columns.contains(&"operator_id".into()));
     assert!(task_columns.contains(&"parent_task_id".into()));
     assert!(task_columns.contains(&"updated_at".into()));
@@ -77,13 +93,12 @@ async fn callback_workspace_schema_persists_lifecycle_snapshots_and_transfers() 
         "c2_file_snapshots",
         "c2_file_transfers",
     ] {
-        let found: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
-        )
-        .bind(table)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let found: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(found, 1, "missing {table}");
     }
 

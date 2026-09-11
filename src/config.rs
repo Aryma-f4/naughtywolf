@@ -49,7 +49,7 @@ impl Config {
                 Ok(value) => value
                     .parse::<u64>()
                     .ok()
-                    .filter(|value| *value > 0)
+                    .filter(|value| *value > 0 && *value <= i64::MAX as u64)
                     .ok_or(ConfigError::InvalidMaxTransferBytes)?,
                 Err(env::VarError::NotPresent) => 268_435_456,
                 Err(env::VarError::NotUnicode(_)) => {

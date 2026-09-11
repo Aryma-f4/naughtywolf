@@ -1,5 +1,7 @@
+use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 use nw_profile::msgs::{FileAck, FileChunk};
 use uuid::Uuid;
@@ -9,6 +11,8 @@ use uuid::Uuid;
 /// streams data across consecutive server pushes.
 pub struct Upload {
     file: std::fs::File,
+    mirror: Option<std::fs::File>,
+    partial_path: PathBuf,
     pub dest: String,
     size: u64,
     total_known: bool,
@@ -16,38 +20,78 @@ pub struct Upload {
     received: u64,
     transfer_id: Uuid,
     task_id: Uuid,
+    expected_sha256: Option<String>,
 }
 
 impl Upload {
     /// Create/append `dest` for a pushed file. Seeds `received` from the
     /// existing file's length so the server resumes from where it left off.
     pub fn open(dest: &str, transfer_id: Uuid, task_id: Uuid) -> Result<Self, String> {
+        Self::open_with_total(dest, transfer_id, task_id, None, None)
+    }
+
+    pub fn open_with_total(
+        dest: &str,
+        transfer_id: Uuid,
+        task_id: Uuid,
+        expected_total: Option<u64>,
+        expected_sha256: Option<String>,
+    ) -> Result<Self, String> {
         if dest.trim().is_empty() {
             return Err("empty destination path".into());
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(dest)
-            .map_err(|e| format!("open {dest:?}: {e}"))?;
+        // Never seed progress from an unrelated pre-existing destination.
+        // A transfer-specific sidecar is the only resumable state.
+        let partial_path = PathBuf::from(format!("{dest}.nwpart-{transfer_id}"));
+        let mut partial_options = OpenOptions::new();
+        partial_options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            partial_options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = partial_options
+            .open(&partial_path)
+            .map_err(|e| format!("open {partial_path:?}: {e}"))?;
+        let mirror = if std::path::Path::new(dest).exists() {
+            None
+        } else {
+            Some(
+                OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(dest)
+                    .map_err(|e| format!("open {dest:?}: {e}"))?,
+            )
+        };
         let received = file
             .metadata()
             .map_err(|e| format!("stat {dest:?}: {e}"))?
             .len();
+        if expected_total.is_some_and(|total| received > total) {
+            return Err("transfer sidecar exceeds authorized total".into());
+        }
         Ok(Upload {
             file,
+            mirror,
+            partial_path,
             dest: dest.to_string(),
-            size: received,
-            total_known: false,
+            size: expected_total.unwrap_or(received),
+            total_known: expected_total.is_some(),
             received,
             transfer_id,
             task_id,
+            expected_sha256,
         })
     }
 
     pub fn task_id(&self) -> Uuid {
         self.task_id
+    }
+
+    pub fn transfer_id(&self) -> Uuid {
+        self.transfer_id
     }
 
     /// Current progress to report to the server next poll. Never reports
@@ -78,7 +122,10 @@ impl Upload {
         if chunk.offset > self.received {
             return Err("upload chunk offset gap".into());
         }
-        let end = chunk.offset.saturating_add(chunk.data.len() as u64);
+        let end = chunk
+            .offset
+            .checked_add(chunk.data.len() as u64)
+            .ok_or_else(|| "upload chunk offset overflow".to_owned())?;
         if end > self.size {
             return Err("upload chunk exceeds total".into());
         }
@@ -105,9 +152,24 @@ impl Upload {
         self.file
             .write_all(&chunk.data)
             .map_err(|_| "write upload destination")?;
+        // Keep the requested destination visibly progressive for operators;
+        // only the transfer-specific sidecar controls resume offsets.
+        if let Some(mirror) = self.mirror.as_mut() {
+            mirror
+                .seek(SeekFrom::Start(chunk.offset))
+                .map_err(|_| "seek upload destination mirror")?;
+            mirror
+                .write_all(&chunk.data)
+                .map_err(|_| "write upload destination mirror")?;
+        }
         self.file
             .sync_all()
             .map_err(|_| "sync upload destination")?;
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror
+                .sync_all()
+                .map_err(|_| "sync upload destination mirror")?;
+        }
         if end > self.received {
             self.received = end;
         }
@@ -120,7 +182,31 @@ impl Upload {
     }
 
     pub fn done(&self) -> bool {
-        self.received >= self.size
+        self.total_known && self.received >= self.size
+    }
+
+    /// Publish the transfer-specific sidecar after the server confirms the
+    /// terminal ACK. Keeping it staged until then makes reconnects idempotent.
+    pub fn finalize(&self) -> Result<(), String> {
+        if let Some(expected) = &self.expected_sha256 {
+            let mut file = std::fs::File::open(&self.partial_path)
+                .map_err(|e| format!("open upload sidecar: {e}"))?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let count = std::io::Read::read(&mut file, &mut buffer)
+                    .map_err(|e| format!("hash upload: {e}"))?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            if hex::encode(digest.finalize()) != expected.to_ascii_lowercase() {
+                return Err("upload SHA-256 mismatch".into());
+            }
+        }
+        std::fs::rename(&self.partial_path, &self.dest)
+            .map_err(|e| format!("publish upload destination: {e}"))
     }
 }
 

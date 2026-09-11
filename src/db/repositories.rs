@@ -72,7 +72,11 @@ impl Repository {
         .bind(&task_id)
         .bind(session_id)
         .bind(command)
-        .bind(serde_json::json!([remote_path, transfer_id]))
+        .bind(if direction == "upload" {
+            serde_json::json!([remote_path, transfer_id, expected_size.unwrap_or_default(), sha256.unwrap_or("")])
+        } else {
+            serde_json::json!([remote_path, transfer_id])
+        })
         .bind(operator_id)
         .execute(&mut *transaction)
         .await
@@ -279,6 +283,15 @@ impl Repository {
             .fetch_one(&self.pool)
             .await
             .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_all_file_transfers(&self) -> Result<Vec<FileTransfer>, AppError> {
+        sqlx::query_as::<_, FileTransfer>(
+            "SELECT * FROM c2_file_transfers ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
     }
 
     pub async fn create_operation_with_audit(
@@ -1094,22 +1107,48 @@ impl Repository {
         session_id: &str,
     ) -> Result<Vec<crate::db::models::C2Task>, AppError> {
         let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
-        let rows: Vec<crate::db::models::C2Task> = sqlx::query_as(
-            "SELECT * FROM c2_tasks WHERE session_id = ? AND status IN ('pending', 'delivered') \
-             ORDER BY created_at, id",
+        let mut rows: Vec<crate::db::models::C2Task> = sqlx::query_as(
+            "UPDATE c2_tasks AS t SET status = 'delivered', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ') \
+             WHERE t.rowid IN (SELECT candidate.rowid FROM c2_tasks candidate \
+               WHERE candidate.session_id = ? AND candidate.status = 'pending' \
+                 AND NOT EXISTS (SELECT 1 FROM c2_file_transfers current_transfer \
+                   JOIN c2_file_transfers predecessor \
+                     ON predecessor.session_id = current_transfer.session_id \
+                    AND predecessor.direction = current_transfer.direction \
+                    AND (predecessor.created_at < current_transfer.created_at \
+                         OR (predecessor.created_at = current_transfer.created_at AND predecessor.id < current_transfer.id)) \
+                    AND predecessor.status IN ('queued', 'active') \
+                   WHERE current_transfer.task_id = candidate.id)) \
+             AND t.status = 'pending' RETURNING *",
         )
         .bind(session_id)
         .fetch_all(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
-        sqlx::query(
-            "UPDATE c2_tasks SET status = 'delivered', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE session_id = ? AND status = 'pending'",
+        let mut redeliveries: Vec<crate::db::models::C2Task> = sqlx::query_as(
+            "SELECT t.* FROM c2_tasks t WHERE t.session_id = ? AND t.status = 'delivered' \
+             AND NOT EXISTS (SELECT 1 FROM c2_file_transfers current_transfer \
+               JOIN c2_file_transfers predecessor \
+                 ON predecessor.session_id = current_transfer.session_id \
+                AND predecessor.direction = current_transfer.direction \
+                AND (predecessor.created_at < current_transfer.created_at \
+                     OR (predecessor.created_at = current_transfer.created_at AND predecessor.id < current_transfer.id)) \
+                AND predecessor.status IN ('queued', 'active') \
+               WHERE current_transfer.task_id = t.id) ORDER BY t.created_at, t.id",
         )
         .bind(session_id)
-        .execute(&mut *transaction)
+        .fetch_all(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
+        let claimed_ids: std::collections::HashSet<_> =
+            rows.iter().map(|row| row.id.as_str()).collect();
+        redeliveries.retain(|row| !claimed_ids.contains(row.id.as_str()));
+        rows.append(&mut redeliveries);
+        rows.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
         transaction.commit().await.map_err(|_| AppError::Internal)?;
         Ok(rows)
     }
@@ -1523,6 +1562,23 @@ impl Repository {
         .execute(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
+        if matches!(command.as_str(), "nw/download" | "nw/upload") && !ok {
+            let transfer_status = if status == "cancelled" {
+                "cancelled"
+            } else {
+                "error"
+            };
+            sqlx::query(
+                "UPDATE c2_file_transfers SET status = ?, error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE task_id = ? AND status IN ('queued', 'active')",
+            )
+            .bind(transfer_status)
+            .bind(String::from_utf8_lossy(stderr).to_string())
+            .bind(task_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        }
         let action = match status {
             "completed" => "task_completed",
             "cancelled" => "task_cancelled",
@@ -1634,6 +1690,14 @@ impl Repository {
             )
             .bind(task_id)
             .bind(session_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+            sqlx::query(
+                "UPDATE c2_file_transfers SET status = 'cancelled', error = 'cancelled by operator', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE task_id = ? AND status IN ('queued', 'active')",
+            )
+            .bind(task_id)
             .execute(&mut *transaction)
             .await
             .map_err(|_| AppError::Internal)?;

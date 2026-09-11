@@ -93,8 +93,7 @@ fn wait_for_exit(pid: u32) -> bool {
         system.refresh_processes(ProcessesToUpdate::All, true);
         match system.process(sys_pid) {
             None => return true,
-            Some(process) if matches!(process.status(), ProcessStatus::Zombie) =>
-            {
+            Some(process) if matches!(process.status(), ProcessStatus::Zombie) => {
                 return true;
             }
             Some(_) if Instant::now() >= deadline => return false,

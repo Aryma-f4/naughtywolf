@@ -105,7 +105,8 @@ pub struct FileChunk {
     /// Task that authorized this transfer. Absent only for legacy decoding.
     #[serde(default)]
     pub task_id: Option<Uuid>,
-    /// Remote basename — the server's storage key for the transfer.
+    /// Untrusted remote/display metadata supplied by the callback; never use
+    /// this value as a local filesystem path or storage key.
     pub name: String,
     /// Absolute byte offset of this chunk in the file.
     pub offset: u64,
