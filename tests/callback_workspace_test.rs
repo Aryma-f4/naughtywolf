@@ -59,6 +59,82 @@ fn operation_lock_is_held_elsewhere(path: &std::path::Path) -> bool {
     }
 }
 
+// A scoped subscriber pauses real storage operations at diagnostic boundaries.
+// Dropping a received boundary also unblocks its task, including on assertion
+// failure; no global subscriber or production test API is needed.
+#[cfg(unix)]
+struct StorageBoundary {
+    phase: String,
+    resume: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(unix)]
+fn storage_boundaries(
+    phases: &'static [&'static str],
+) -> (
+    tracing::Dispatch,
+    tokio::sync::mpsc::UnboundedReceiver<StorageBoundary>,
+) {
+    use tracing_subscriber::{Layer, prelude::*};
+
+    struct PauseStorage {
+        phases: &'static [&'static str],
+        events: tokio::sync::mpsc::UnboundedSender<StorageBoundary>,
+    }
+    #[derive(Default)]
+    struct Phase(Option<String>);
+    impl tracing::field::Visit for Phase {
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "phase" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+    }
+    impl<S: tracing::Subscriber> Layer<S> for PauseStorage {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "naughtywolf::callback_workspace::transfers" {
+                return;
+            }
+            let mut phase = Phase::default();
+            event.record(&mut phase);
+            if let Some(phase) = phase
+                .0
+                .filter(|phase| self.phases.contains(&phase.as_str()))
+            {
+                let (resume, paused) = std::sync::mpsc::channel();
+                if self.events.send(StorageBoundary { phase, resume }).is_ok() {
+                    let _ = paused.recv();
+                }
+            }
+        }
+    }
+
+    let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let subscriber = tracing_subscriber::registry().with(PauseStorage { phases, events });
+    (tracing::Dispatch::new(subscriber), receiver)
+}
+
+#[cfg(unix)]
+async fn next_storage_boundary(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<StorageBoundary>,
+    expected: &str,
+) -> StorageBoundary {
+    // This deadline only bounds a broken test; progress requires an event from
+    // the actual operation, never elapsed time or a sufficiently large file.
+    let boundary = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+        .await
+        .unwrap_or_else(|_| panic!("storage did not reach {expected}"))
+        .unwrap_or_else(|| panic!("storage finished without reaching {expected}"));
+    assert_eq!(boundary.phase, expected);
+    boundary
+}
+
 async fn test_repository() -> Repository {
     let pool = db::create_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
@@ -882,8 +958,23 @@ async fn cross_store_lock_precedes_part_write() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_lease_cannot_take_over_held_finalization_lock() {
+    use tracing::instrument::WithSubscriber;
+
+    // Dropping the operation lock before publication or directory sync must
+    // let a fresh competing attempt acquire it and fail this regression.
+    const PHASES: &[&str] = &[
+        "file_sync",
+        "part_directory_sync",
+        "hash",
+        "publish",
+        "publication_directory_sync",
+        "durable_update",
+        "durable_update_complete",
+        "operation_complete",
+    ];
+    const DIGEST: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("transfers.sqlite");
     std::fs::File::create(&database).unwrap();
@@ -895,7 +986,7 @@ async fn expired_lease_cannot_take_over_held_finalization_lock() {
     let operator = create_user(&repo, "final-lock", Role::Operator).await;
     let session_id = uuid::Uuid::new_v4().to_string();
     create_scoped_callback(&repo, &operator.id, &session_id).await;
-    let max_bytes = 80 * 1024 * 1024;
+    let max_bytes = 4096;
     let store = TransferStore::new(repo.clone(), directory.path(), max_bytes).unwrap();
     let second = TransferStore::new(
         Repository {
@@ -905,70 +996,40 @@ async fn expired_lease_cannot_take_over_held_finalization_lock() {
         max_bytes,
     )
     .unwrap();
-    let prefix = vec![0x5a; 64 * 1024 * 1024];
-    let mut expected = prefix.clone();
-    expected.push(0x21);
     let transfer = store
         .queue_download(
             &session_id,
             "/srv/final-lock.bin",
-            Some(expected.len() as u64),
-            Some(&hex::encode(Sha256::digest(&expected))),
+            Some(3),
+            None,
             &operator.id,
             &operator.username,
         )
         .await
         .unwrap();
     store
-        .receive_chunk(
-            &session_id,
-            &transfer_chunk(&transfer, 0, expected.len() as u64, &prefix),
-        )
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 3, b"ab"))
         .await
         .unwrap();
 
-    let final_chunk = transfer_chunk(&transfer, prefix.len() as u64, expected.len() as u64, b"!");
+    let final_chunk = transfer_chunk(&transfer, 2, 3, b"c");
     let first_store = store.clone();
     let first_session = session_id.clone();
     let first_chunk = final_chunk.clone();
-    let first = tokio::spawn(async move {
-        first_store
-            .receive_chunk(&first_session, &first_chunk)
-            .await
-    });
-    let lock_path = directory
-        .path()
-        .join("callback-transfers")
-        .join(format!("{}.lock", transfer.storage_key));
-    let mut observed = false;
-    for _ in 0..10_000 {
-        if operation_lock_is_held_elsewhere(&lock_path) {
-            observed = true;
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        observed,
-        "the first finalization must hold the generated OS lock"
-    );
-    let mut active_lease: Option<String> = None;
-    for _ in 0..10_000 {
-        active_lease =
-            sqlx::query_scalar("SELECT owner FROM c2_transfer_leases WHERE transfer_id = ?")
-                .bind(&transfer.id)
-                .fetch_optional(&repo.pool)
+    let (first_trace, mut first_events) = storage_boundaries(PHASES);
+    let first = tokio::spawn(
+        async move {
+            first_store
+                .receive_chunk(&first_session, &first_chunk)
                 .await
-                .unwrap();
-        if active_lease.is_some() {
-            break;
         }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        active_lease.is_some(),
-        "the first finalization must acquire its metadata lease after the OS lock"
+        .with_subscriber(first_trace),
     );
+    let mut first_boundary = next_storage_boundary(&mut first_events, PHASES[0]).await;
+    let root = directory.path().join("callback-transfers");
+    let lock_path = root.join(format!("{}.lock", transfer.storage_key));
+    let completed_path = root.join(&transfer.storage_key);
+    let part_path = root.join(format!("{}.part", transfer.storage_key));
     sqlx::query("UPDATE c2_transfer_leases SET expires_at = unixepoch() - 1 WHERE transfer_id = ?")
         .bind(&transfer.id)
         .execute(&repo.pool)
@@ -982,48 +1043,89 @@ async fn expired_lease_cannot_take_over_held_finalization_lock() {
             .unwrap();
     let second_session = session_id.clone();
     let second_chunk = final_chunk.clone();
-    let second_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let second_started_in_task = second_started.clone();
-    let second_task = tokio::spawn(async move {
-        second_started_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
-        second.receive_chunk(&second_session, &second_chunk).await
-    });
-    while !second_started.load(std::sync::atomic::Ordering::SeqCst) {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    assert!(
-        !second_task.is_finished(),
-        "a competing store must wait for the held finalization lock"
+    let (second_trace, mut second_events) =
+        storage_boundaries(&["operation_lock_contended", "operation_lock_acquired"]);
+    let second_task = tokio::spawn(
+        async move { second.receive_chunk(&second_session, &second_chunk).await }
+            .with_subscriber(second_trace),
     );
-    assert!(operation_lock_is_held_elsewhere(&lock_path));
-    assert!(
-        !directory
-            .path()
-            .join("callback-transfers")
-            .join(&transfer.storage_key)
-            .exists(),
-        "the competing store must not publish while the first finalization owns the lock"
-    );
-    let lease_after_overlap: String =
-        sqlx::query_scalar("SELECT owner FROM c2_transfer_leases WHERE transfer_id = ?")
-            .bind(&transfer.id)
-            .fetch_one(&repo.pool)
-            .await
-            .unwrap();
-    assert_eq!(lease_after_overlap, expired_lease);
-    assert!(first.await.unwrap().unwrap().done);
-    assert!(second_task.await.unwrap().unwrap().done);
-    assert_eq!(
-        std::fs::read(
-            directory
-                .path()
-                .join("callback-transfers")
-                .join(&transfer.storage_key),
+    let mut contention =
+        next_storage_boundary(&mut second_events, "operation_lock_contended").await;
+
+    for (index, phase) in PHASES.iter().enumerate() {
+        assert_eq!(first_boundary.phase, *phase);
+        // Each boundary requires a NEW failed OS-lock attempt by the independent
+        // store. The subscriber only pauses after that real syscall returns.
+        contention.resume.send(()).unwrap();
+        contention = next_storage_boundary(&mut second_events, "operation_lock_contended").await;
+        assert!(
+            !second_task.is_finished(),
+            "competing store finished at {phase}"
+        );
+        assert!(
+            operation_lock_is_held_elsewhere(&lock_path),
+            "lock released at {phase}"
+        );
+
+        let published = index >= 4;
+        assert_eq!(completed_path.exists(), published, "publication at {phase}");
+        assert_eq!(part_path.exists(), !published, "staging at {phase}");
+        assert_eq!(
+            std::fs::read(if published {
+                &completed_path
+            } else {
+                &part_path
+            })
+            .unwrap(),
+            b"abc"
+        );
+        let state = repo.file_transfer(&transfer.id).await.unwrap().unwrap();
+        assert_eq!(
+            state.received_bytes,
+            if index < 2 { 2 } else { 3 },
+            "offset at {phase}"
+        );
+        assert_eq!(
+            state.sha256.as_deref(),
+            if index < 6 { None } else { Some(DIGEST) },
+            "digest at {phase}"
+        );
+        let lease: Option<(String, i64)> = sqlx::query_as(
+            "SELECT owner, expires_at <= unixepoch() FROM c2_transfer_leases WHERE transfer_id = ?",
         )
-        .unwrap(),
-        expected
-    );
+        .bind(&transfer.id)
+        .fetch_optional(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            lease,
+            if index < 7 {
+                Some((expired_lease.clone(), 1))
+            } else {
+                None
+            },
+            "lease at {phase}"
+        );
+        first_boundary.resume.send(()).unwrap();
+        if let Some(next) = PHASES.get(index + 1) {
+            first_boundary = next_storage_boundary(&mut first_events, next).await;
+        }
+    }
+
+    assert!(first.await.unwrap().unwrap().done);
+    // Only the explicit release of operation_complete permits acquisition.
+    contention.resume.send(()).unwrap();
+    next_storage_boundary(&mut second_events, "operation_lock_acquired")
+        .await
+        .resume
+        .send(())
+        .unwrap();
+    assert!(second_task.await.unwrap().unwrap().done);
+    assert_eq!(std::fs::read(&completed_path).unwrap(), b"abc");
+    assert!(!operation_lock_is_held_elsewhere(&lock_path));
+    let state = repo.file_transfer(&transfer.id).await.unwrap().unwrap();
+    assert_eq!(state.received_bytes, 3);
+    assert_eq!(state.sha256.as_deref(), Some(DIGEST));
 }
 
 #[cfg(unix)]
@@ -1055,7 +1157,18 @@ async fn cross_store_lock_precedes_part_write() {
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
-    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("transfers.sqlite");
+    std::fs::File::create(&database).unwrap();
+    let database_url = format!("sqlite://{}", database.display());
+    let repo = Repository {
+        pool: db::create_pool(&database_url).await.unwrap(),
+    };
+    db::run_migrations(&repo.pool).await.unwrap();
+    let operator = create_user(&repo, "cross-store-lock", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let store = TransferStore::new(repo.clone(), directory.path(), 4096).unwrap();
     let transfer = store
         .queue_download(
             &session_id,
@@ -1067,7 +1180,14 @@ async fn cross_store_lock_precedes_part_write() {
         )
         .await
         .unwrap();
-    let second = TransferStore::new(repo.clone(), directory.path(), 4096).unwrap();
+    let second = TransferStore::new(
+        Repository {
+            pool: db::create_pool(&database_url).await.unwrap(),
+        },
+        directory.path(),
+        4096,
+    )
+    .unwrap();
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

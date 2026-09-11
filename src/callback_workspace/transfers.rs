@@ -161,6 +161,13 @@ impl TransferOperationLock {
                 return Err(TransferError::UnsafeStorage);
             }
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                    tracing::debug!(
+                        storage_key,
+                        phase = "operation_lock_contended",
+                        "transfer storage lock busy"
+                    );
+                }
                 return Err(TransferError::Storage);
             }
             return Ok(Self { file });
@@ -190,6 +197,15 @@ impl TransferOperationLock {
                 )
             } == 0
             {
+                if std::io::Error::last_os_error().raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+                {
+                    tracing::debug!(
+                        storage_key,
+                        phase = "operation_lock_contended",
+                        "transfer storage lock busy"
+                    );
+                }
                 return Err(TransferError::Storage);
             }
             return Ok(Self { file });
@@ -214,7 +230,14 @@ async fn acquire_operation_lock(
     const ATTEMPTS: usize = 100;
     for attempt in 0..ATTEMPTS {
         match TransferOperationLock::try_acquire(root, storage_key) {
-            Ok(lock) => return Ok(lock),
+            Ok(lock) => {
+                tracing::debug!(
+                    storage_key,
+                    phase = "operation_lock_acquired",
+                    "transfer storage lock acquired"
+                );
+                return Ok(lock);
+            }
             Err(TransferError::Storage) if attempt + 1 < ATTEMPTS => {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
@@ -620,6 +643,7 @@ impl TransferStore {
             .receive_chunk_inner(session_id, chunk, transfer_id, &lease)
             .await;
         self.release_lease(&transfer_id.to_string(), &lease).await?;
+        tracing::debug!(%transfer_id, phase = "operation_complete", "transfer storage operation complete");
         result
     }
 
@@ -790,8 +814,10 @@ impl TransferStore {
             .map_err(|_| TransferError::Storage)?;
         file.write_all(&chunk.data)
             .map_err(|_| TransferError::Storage)?;
+        tracing::debug!(%transfer_id, phase = "file_sync", "synchronizing transfer file");
         file.sync_all().map_err(|_| TransferError::Storage)?;
         self.renew_lease(&transfer.id, lease).await?;
+        tracing::debug!(%transfer_id, phase = "part_directory_sync", "synchronizing staging directory");
         sync_directory_handle(&self.root_dir)?;
         let next = received
             .checked_add(chunk.data.len() as u64)
@@ -813,6 +839,7 @@ impl TransferStore {
             let mut verify = file.try_clone().map_err(|_| TransferError::Storage)?;
             #[cfg(not(windows))]
             let mut verify = open_existing_regular_at(&self.root_dir, &part_name, false)?;
+            tracing::debug!(%transfer_id, phase = "hash", "verifying transfer digest");
             let digest =
                 sha256_open_file_with_lease(&self.repository, &mut verify, &transfer.id, lease)
                     .await?;
@@ -824,6 +851,7 @@ impl TransferStore {
                 self.fail(&transfer.id, "SHA-256 mismatch").await?;
                 return Err(TransferError::ChecksumMismatch);
             }
+            tracing::debug!(%transfer_id, phase = "publish", "publishing verified transfer");
             publish_no_replace_at(
                 &self.root_dir,
                 &part_name,
@@ -831,7 +859,9 @@ impl TransferStore {
                 #[cfg(windows)]
                 &file,
             )?;
+            tracing::debug!(%transfer_id, phase = "publication_directory_sync", "synchronizing published directory");
             sync_directory_handle(&self.root_dir)?;
+            tracing::debug!(%transfer_id, phase = "durable_update", "persisting verified transfer state");
             let verified = sqlx::query("UPDATE c2_file_transfers SET received_bytes = ?, sha256 = ?, error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status = 'active'")
                 .bind(next as i64)
                 .bind(&digest)
@@ -842,6 +872,7 @@ impl TransferStore {
             if verified.rows_affected() != 1 {
                 return Err(TransferError::Repository);
             }
+            tracing::debug!(%transfer_id, phase = "durable_update_complete", "verified transfer state persisted");
             transfer.received_bytes = next as i64;
             transfer.sha256 = Some(digest.clone());
             return Ok(FileAck {
