@@ -1102,7 +1102,15 @@ async fn windows_guards_reparse_ancestors_until_publication() {
         .receive_chunk(&session_id, &transfer_chunk(&transfer, 0, 3, b"a"))
         .await
         .unwrap();
-    assert!(original.join(&transfer.storage_key).is_file());
+    let published = store
+        .receive_chunk(&session_id, &transfer_chunk(&transfer, 1, 3, b"bc"))
+        .await
+        .unwrap();
+    assert!(published.done);
+    assert_eq!(
+        std::fs::read(original.join(&transfer.storage_key)).unwrap(),
+        b"abc"
+    );
 }
 
 #[tokio::test]

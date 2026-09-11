@@ -270,6 +270,12 @@ impl UploadStage {
 
 impl Drop for UploadStage {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(file) = self.file.take() {
+            let _ = windows_delete_open_file(&file);
+            return;
+        }
+        #[cfg(not(windows))]
         if self.file.is_some() {
             let _ = unlink_relative(&self.root_dir, &format!("{}.part", self.storage_key));
         }
@@ -803,6 +809,9 @@ impl TransferStore {
 
         if next == chunk.total {
             self.renew_lease(&transfer.id, lease).await?;
+            #[cfg(windows)]
+            let mut verify = file.try_clone().map_err(|_| TransferError::Storage)?;
+            #[cfg(not(windows))]
             let mut verify = open_existing_regular_at(&self.root_dir, &part_name, false)?;
             let digest =
                 sha256_open_file_with_lease(&self.repository, &mut verify, &transfer.id, lease)
@@ -1698,11 +1707,13 @@ fn windows_open_path_unchecked_with_sharing(
     delete_access: bool,
 ) -> Result<File, TransferError> {
     use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
+        FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
     };
 
     let wide = windows_wide(path);

@@ -240,11 +240,12 @@ fn publish_no_replace(
 fn open_sidecar(path: &std::path::Path) -> Result<(std::fs::File, WindowsPathGuard), String> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE,
-        OPEN_ALWAYS,
+        FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
     };
 
     let guard = WindowsPathGuard::open(path)?;
@@ -342,11 +343,10 @@ impl WindowsPathGuard {
     fn open(path: &std::path::Path) -> Result<Self, String> {
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
-            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
         };
 
         let mut ancestors = Vec::new();
