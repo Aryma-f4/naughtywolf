@@ -19,6 +19,46 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
 
+#[cfg(unix)]
+#[test]
+fn operation_lock_probe() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let Some(path) = std::env::var_os("NAUGHTYWOLF_OPERATION_LOCK_PROBE") else {
+        return;
+    };
+    let status = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(lock)
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 =>
+        {
+            0
+        }
+        Ok(_) if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock => 42,
+        Ok(_) | Err(_) => 43,
+    };
+    std::process::exit(status);
+}
+
+#[cfg(unix)]
+fn operation_lock_is_held_elsewhere(path: &std::path::Path) -> bool {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "operation_lock_probe"])
+        .env("NAUGHTYWOLF_OPERATION_LOCK_PROBE", path)
+        .status()
+        .unwrap();
+    match status.code() {
+        Some(0) => false,
+        Some(42) => true,
+        code => panic!("operation lock probe failed with exit status {code:?}"),
+    }
+}
+
 async fn test_repository() -> Repository {
     let pool = db::create_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
@@ -771,7 +811,17 @@ async fn cross_store_lock_precedes_part_write() {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    let (directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("transfers.sqlite");
+    std::fs::File::create(&database).unwrap();
+    let database_url = format!("sqlite://{}", database.display());
+    let pool = db::create_pool(&database_url).await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    let repo = Repository { pool };
+    let operator = create_user(&repo, "cross-store-lock", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let store = TransferStore::new(repo.clone(), directory.path(), 4096).unwrap();
     let transfer = store
         .queue_download(
             &session_id,
@@ -783,7 +833,14 @@ async fn cross_store_lock_precedes_part_write() {
         )
         .await
         .unwrap();
-    let second = TransferStore::new(repo.clone(), directory.path(), 4096).unwrap();
+    let second = TransferStore::new(
+        Repository {
+            pool: db::create_pool(&database_url).await.unwrap(),
+        },
+        directory.path(),
+        4096,
+    )
+    .unwrap();
     let lock_path = directory
         .path()
         .join("callback-transfers")
@@ -821,6 +878,151 @@ async fn cross_store_lock_precedes_part_write() {
             .received_bytes,
         0,
         "a blocked writer must not advance the durable offset"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn expired_lease_cannot_take_over_held_finalization_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("transfers.sqlite");
+    std::fs::File::create(&database).unwrap();
+    let database_url = format!("sqlite://{}", database.display());
+    let repo = Repository {
+        pool: db::create_pool(&database_url).await.unwrap(),
+    };
+    db::run_migrations(&repo.pool).await.unwrap();
+    let operator = create_user(&repo, "final-lock", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let max_bytes = 80 * 1024 * 1024;
+    let store = TransferStore::new(repo.clone(), directory.path(), max_bytes).unwrap();
+    let second = TransferStore::new(
+        Repository {
+            pool: db::create_pool(&database_url).await.unwrap(),
+        },
+        directory.path(),
+        max_bytes,
+    )
+    .unwrap();
+    let prefix = vec![0x5a; 64 * 1024 * 1024];
+    let mut expected = prefix.clone();
+    expected.push(0x21);
+    let transfer = store
+        .queue_download(
+            &session_id,
+            "/srv/final-lock.bin",
+            Some(expected.len() as u64),
+            Some(&hex::encode(Sha256::digest(&expected))),
+            &operator.id,
+            &operator.username,
+        )
+        .await
+        .unwrap();
+    store
+        .receive_chunk(
+            &session_id,
+            &transfer_chunk(&transfer, 0, expected.len() as u64, &prefix),
+        )
+        .await
+        .unwrap();
+
+    let final_chunk = transfer_chunk(&transfer, prefix.len() as u64, expected.len() as u64, b"!");
+    let first_store = store.clone();
+    let first_session = session_id.clone();
+    let first_chunk = final_chunk.clone();
+    let first = tokio::spawn(async move {
+        first_store
+            .receive_chunk(&first_session, &first_chunk)
+            .await
+    });
+    let lock_path = directory
+        .path()
+        .join("callback-transfers")
+        .join(format!("{}.lock", transfer.storage_key));
+    let mut observed = false;
+    for _ in 0..10_000 {
+        if operation_lock_is_held_elsewhere(&lock_path) {
+            observed = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        observed,
+        "the first finalization must hold the generated OS lock"
+    );
+    let mut active_lease: Option<String> = None;
+    for _ in 0..10_000 {
+        active_lease =
+            sqlx::query_scalar("SELECT owner FROM c2_transfer_leases WHERE transfer_id = ?")
+                .bind(&transfer.id)
+                .fetch_optional(&repo.pool)
+                .await
+                .unwrap();
+        if active_lease.is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        active_lease.is_some(),
+        "the first finalization must acquire its metadata lease after the OS lock"
+    );
+    sqlx::query("UPDATE c2_transfer_leases SET expires_at = unixepoch() - 1 WHERE transfer_id = ?")
+        .bind(&transfer.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+    let expired_lease: String =
+        sqlx::query_scalar("SELECT owner FROM c2_transfer_leases WHERE transfer_id = ?")
+            .bind(&transfer.id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    let second_session = session_id.clone();
+    let second_chunk = final_chunk.clone();
+    let second_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let second_started_in_task = second_started.clone();
+    let second_task = tokio::spawn(async move {
+        second_started_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        second.receive_chunk(&second_session, &second_chunk).await
+    });
+    while !second_started.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !second_task.is_finished(),
+        "a competing store must wait for the held finalization lock"
+    );
+    assert!(operation_lock_is_held_elsewhere(&lock_path));
+    assert!(
+        !directory
+            .path()
+            .join("callback-transfers")
+            .join(&transfer.storage_key)
+            .exists(),
+        "the competing store must not publish while the first finalization owns the lock"
+    );
+    let lease_after_overlap: String =
+        sqlx::query_scalar("SELECT owner FROM c2_transfer_leases WHERE transfer_id = ?")
+            .bind(&transfer.id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+    assert_eq!(lease_after_overlap, expired_lease);
+    assert!(first.await.unwrap().unwrap().done);
+    assert!(second_task.await.unwrap().unwrap().done);
+    assert_eq!(
+        std::fs::read(
+            directory
+                .path()
+                .join("callback-transfers")
+                .join(&transfer.storage_key),
+        )
+        .unwrap(),
+        expected
     );
 }
 
