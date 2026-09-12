@@ -630,33 +630,33 @@ git commit -m "feat: add resumable callback file transfers"
 - Consumes: authoritative task, metadata, process, filesystem, and transfer APIs.
 - Produces: complete four-tab progressive workspace with URL-backed tab/path state and supervised implant guidance.
 
-- [ ] **Step 1: Add complete workspace rendering tests**
+- [x] **Step 1: Add complete workspace rendering tests**
 
 Assert the callback page exposes Tasking, Processes, Files, and Metadata tabs; no secret/session key; correct online/offline copy; callback ID and safe metadata; URL state; keyboard focus; and disabled capability messaging for a legacy implant.
 
-- [ ] **Step 2: Add navigation and confirmation tests**
+- [x] **Step 2: Add navigation and confirmation tests**
 
 Assert SPA navigation closes the prior EventSource, returning restores the selected tab/path, Escape closes a destructive dialog, Enter cannot activate the obscured page, and focus returns to the action button.
 
-- [ ] **Step 3: Run UI tests and observe missing metadata, liveness, URL, and focus behavior**
+- [x] **Step 3: Run UI tests and observe missing metadata, liveness, URL, and focus behavior**
 
 Run: `cargo test -p naughtywolf --test callback_workspace_test workspace_ && node --test tests/navigation_test.cjs tests/callback_workspace_test.cjs`  
 Expected: FAIL on missing metadata/offline/URL/focus behavior.
 
-- [ ] **Step 4: Complete the workspace shell and responsive styling**
+- [x] **Step 4: Complete the workspace shell and responsive styling**
 
 Add callback identity header, connection indicator, tablist semantics, responsive split/detail layouts, empty/loading/error states, metadata definition list, and consistent state/action styling. Preserve server-rendered fallback content when JavaScript is unavailable.
 
-- [ ] **Step 5: Document why callbacks become offline and how to supervise implants**
+- [x] **Step 5: Document why callbacks become offline and how to supervise implants**
 
 Add an operator section explaining that closing the launching shell stops an unsupervised implant, show a narrowly scoped systemd unit template with an absolute payload path and unprivileged user, and document checking `last_seen`, PID, logs, and queued task state. Do not install or enable a service automatically.
 
-- [ ] **Step 6: Run accessibility, syntax, and portal suites**
+- [x] **Step 6: Run accessibility, syntax, and portal suites**
 
 Run: `cargo test -p naughtywolf --test callback_workspace_test && cargo test -p naughtywolf --test portal_routes_test && node --test tests/navigation_test.cjs tests/callback_workspace_test.cjs && node --check static/callback-workspace.js`  
 Expected: PASS.
 
-- [ ] **Step 7: Commit final workspace UX and documentation**
+- [x] **Step 7: Commit final workspace UX and documentation**
 
 ```bash
 git add src/portal/templates.rs static/callback-workspace.js static/callback-workspace.css README.md tests/callback_workspace_test.rs tests/navigation_test.cjs
@@ -678,20 +678,20 @@ git commit -m "feat: finish the callback operator workspace"
 - Consumes: all prior tasks.
 - Produces: Linux and Windows CI evidence plus exact-SHA, health-checked VPS deployment.
 
-- [ ] **Step 1: Add CI workflow assertions**
+- [x] **Step 1: Add CI workflow assertions**
 
 Create a repository test that parses workflow YAML and asserts jobs named `linux` and `windows`, Linux commands for `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, JavaScript tests, and Windows commands for profile/implant/control tests.
 
-- [ ] **Step 2: Run the workflow test and observe missing `ci.yml`**
+- [x] **Step 2: Run the workflow test and observe missing `ci.yml`**
 
 Run: `python3 tests/workflow_test.py`  
 Expected: FAIL because `.github/workflows/ci.yml` does not exist.
 
-- [ ] **Step 3: Implement Linux/Windows CI and deployment gating**
+- [x] **Step 3: Implement Linux/Windows CI and deployment gating**
 
 Use `ubuntu-latest` and `windows-latest`. Cache Cargo by lockfile. Make deployment run the Linux verification commands before SSH deployment so an untested push cannot replace the healthy VPS container. Rename the intentionally retained but unread `CredentialStore.pool` field to `_pool` and update its initializers so the existing dead-code warning does not defeat `-D warnings`.
 
-- [ ] **Step 4: Run fresh local verification**
+- [x] **Step 4: Run fresh local verification**
 
 Run:
 
