@@ -534,7 +534,13 @@ mod tests {
         let result = execute(&task).await.unwrap();
         assert!(result.ok, "{}", String::from_utf8_lossy(&result.stderr));
         assert_eq!(result.task_id, task.id);
-        assert_eq!(result.stdout, b"module-ok");
+        assert_eq!(
+            result.stdout,
+            b"module-ok",
+            "exit_code={} stderr={}",
+            result.exit_code,
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     #[cfg(unix)]

@@ -45,7 +45,13 @@ pub fn run(
         anyhow::bail!("cargo build failed with exit code {:?}", status.code());
     }
 
-    let src = std::path::PathBuf::from(&target_dir).join("release/nw-implant");
+    let src = std::path::PathBuf::from(&target_dir)
+        .join("release")
+        .join(if cfg!(windows) {
+            "nw-implant.exe"
+        } else {
+            "nw-implant"
+        });
     if !src.exists() {
         anyhow::bail!("built binary not found at {}", src.display());
     }
