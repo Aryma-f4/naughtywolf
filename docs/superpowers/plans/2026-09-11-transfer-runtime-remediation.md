@@ -177,7 +177,7 @@ git commit -m "fix: keep transfer jobs cancellable"
 - Produces: `application::router(repository, c2_psk, evidence_store, transfer_store, max_transfer_bytes) -> Router`, containing the same portal, C2, public, and extension composition used by `serve()` before the session layer.
 - Consumes: Task 1 storage/exclusion and Task 2 runtime lifecycle/wire budgeting.
 
-- [ ] **Step 1: Write the production-stack test first**
+- [x] **Step 1: Write the production-stack test first**
 
 Create a temporary file-backed SQLite database and evidence directory. Build the application with the exported production router, attach a test session layer/login route, bind a real TCP listener, and spawn a real `BeaconRuntime` pointed at `/c2/checkin`.
 
@@ -191,7 +191,7 @@ The test must:
 6. Let the same implant runtime reconnect; do not call `TransferStore::{receive_chunk,next_upload_chunks,ack_upload}` directly from the test.
 7. Assert both final files equal their hand-built 3 KiB fixtures and SHA-256 values; transfers/tasks are terminal; result ACKs converge; partial files are gone; followers are delivered only afterward.
 
-- [ ] **Step 2: Run the new test and capture RED**
+- [x] **Step 2: Run the new test and capture RED**
 
 Run:
 
@@ -201,15 +201,15 @@ cargo test -p naughtywolf --test transfer_production_e2e -- --nocapture
 
 Expected: compile failure because `application::router` does not exist, followed by behavioral failures until the test drives real C2 chunks and reconnects after pool/store reconstruction.
 
-- [ ] **Step 3: Extract production router composition without changing behavior**
+- [x] **Step 3: Extract production router composition without changing behavior**
 
 Move only the router composition from `main::serve` into `src/application.rs`. `main` remains responsible for config loading, migrations, production `SqliteStore`, secure cookie key, listener binding, and background raw TCP listener. The test and `main` must call the same `application::router` function.
 
-- [ ] **Step 4: Implement condition-based restart orchestration**
+- [x] **Step 4: Implement condition-based restart orchestration**
 
 Use `Notify`/watch channels tied to observed durable offsets; no fixed sleep decides when to restart. Hold a response after the real C2 handler has persisted partial progress, abort the Axum server, close/reopen the database, rebuild dependencies, and release the implant to retry against the reconstructed server.
 
-- [ ] **Step 5: Run integration and full verification**
+- [x] **Step 5: Run integration and full verification**
 
 Run:
 
@@ -224,7 +224,7 @@ git diff --check
 
 Expected: all pass. The production E2E must report actual partial offsets before restart and terminal byte/hash equality after reconnect.
 
-- [ ] **Step 6: Commit production-stack proof**
+- [x] **Step 6: Commit production-stack proof**
 
 ```bash
 git add Cargo.toml src/application.rs src/lib.rs src/main.rs tests/transfer_production_e2e.rs
