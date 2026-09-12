@@ -43,6 +43,8 @@ jobs:
         run: python3 tests/workflow_test.py
 
       - name: Deployment script validation
+        env:
+          NAUGHTYWOLF_SESSION_SECRET: ci-compose-validation-dummy-secret-32-bytes
         run: |
           bash -n deploy/vps/deploy.sh
           bash tests/vps_deploy_test.sh
