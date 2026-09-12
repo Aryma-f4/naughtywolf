@@ -73,7 +73,7 @@ impl Repository {
         .bind(session_id)
         .bind(command)
         .bind(if direction == "upload" {
-            serde_json::json!([remote_path, transfer_id, expected_size.unwrap_or_default(), sha256.unwrap_or("")])
+            serde_json::json!([remote_path, transfer_id, expected_size.unwrap_or_default().to_string(), sha256.unwrap_or("")])
         } else {
             serde_json::json!([remote_path, transfer_id])
         })

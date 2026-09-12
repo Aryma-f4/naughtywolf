@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Extension, Form, Router,
+    Form, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Redirect},
@@ -9,8 +9,8 @@ use axum::{
 };
 use clap::Parser;
 use naughtywolf::{
+    application,
     auth::{authenticate, middleware::AuthSession},
-    c2,
     cli::{Cli, Commands},
     config::Config,
     db::{self, repositories::Repository},
@@ -70,15 +70,14 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
     transfer_store.cleanup_orphans().await?;
     let app = Router::<Repository>::new()
         .route("/login", post(login_handler))
-        .merge(portal::authenticated_router_with_transfer_limit(
+        .merge(application::router(
+            c2_psk.clone(),
+            evidence_store,
+            transfer_store,
             config.max_transfer_bytes,
         ))
-        .merge(c2::router(c2_psk.clone()))
         .with_state(repository.clone())
         .merge(public_router())
-        .layer(Extension(c2_psk.clone()))
-        .layer(axum::Extension(evidence_store))
-        .layer(axum::Extension(transfer_store))
         .layer(session_layer);
 
     if let Some(bind) = config.tcp_bind {

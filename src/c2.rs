@@ -824,7 +824,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let inner_budget = 1200;
+        let inner_budget = 2200;
         let wire = sealed_poll_request(
             session_id,
             &key,
