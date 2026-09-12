@@ -93,6 +93,31 @@ async fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("write temporary module: {e}"))
 }
 
+#[cfg(unix)]
+fn blocking_drain<S>(stream: S, limit: usize) -> Vec<u8>
+where
+    S: std::os::unix::io::AsRawFd,
+{
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd as _;
+    let stream = std::mem::ManuallyDrop::new(stream);
+    let file = unsafe { std::fs::File::from_raw_fd(stream.as_raw_fd()) };
+    let mut reader = std::io::BufReader::new(file);
+    let mut kept = Vec::with_capacity(limit.min(64 * 1024));
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let remaining = limit.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }
+    }
+    kept
+}
+
+#[cfg(not(unix))]
 async fn drain_capped<R>(mut reader: R, limit: usize) -> Vec<u8>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -112,6 +137,19 @@ where
     kept
 }
 
+#[cfg(unix)]
+async fn drain_capped<S>(stream: Option<S>, limit: usize) -> Vec<u8>
+where
+    S: std::os::unix::io::AsRawFd + Send + 'static,
+{
+    match stream {
+        Some(stream) => tokio::task::spawn_blocking(move || blocking_drain(stream, limit))
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
 async fn run_bounded(task: Task) -> TaskResult {
     use tokio::process::Command;
     let timeout_ms = if task.timeout_ms == 0 {
@@ -126,15 +164,6 @@ async fn run_bounded(task: Task) -> TaskResult {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    if let Some(Ok(script)) = task.args.last().map(std::fs::read) {
-        eprintln!(
-            "run_bounded spawn {:?} {:?} script_len={} script_head={:?}",
-            task.command,
-            task.args,
-            script.len(),
-            String::from_utf8_lossy(&script[..script.len().min(40)]).as_ref(),
-        );
-    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return failure(&task, format!("failed to spawn: {error}")),
@@ -154,22 +183,11 @@ async fn run_bounded(task: Task) -> TaskResult {
             (false, -1, true)
         }
     };
-    let stdout = match stdout {
-        Some(stream) => drain_capped(stream, MAX_OUTPUT_BYTES).await,
-        None => Vec::new(),
-    };
-    let mut stderr = match stderr {
-        Some(stream) => drain_capped(stream, MAX_OUTPUT_BYTES).await,
-        None => Vec::new(),
-    };
+    let stdout = drain_capped(stdout, MAX_OUTPUT_BYTES).await;
+    let mut stderr = drain_capped(stderr, MAX_OUTPUT_BYTES).await;
     if timed_out {
         stderr.extend_from_slice(format!("\ntask timed out after {timeout_ms}ms").as_bytes());
     }
-    eprintln!(
-        "run_bounded result ok={ok} exit={exit_code} stdout_len={} stderr_len={}",
-        stdout.len(),
-        stderr.len()
-    );
     let (stdout, stderr) = bound_output(stdout, stderr);
     TaskResult {
         task_id: task.id,
