@@ -126,6 +126,15 @@ async fn run_bounded(task: Task) -> TaskResult {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if let Some(Ok(script)) = task.args.last().map(|arg| std::fs::read(arg)) {
+        eprintln!(
+            "run_bounded spawn {:?} {:?} script_len={} script_head={:?}",
+            task.command,
+            task.args,
+            script.len(),
+            String::from_utf8_lossy(&script[..script.len().min(40)]).as_ref(),
+        );
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return failure(&task, format!("failed to spawn: {error}")),
@@ -156,6 +165,11 @@ async fn run_bounded(task: Task) -> TaskResult {
     if timed_out {
         stderr.extend_from_slice(format!("\ntask timed out after {timeout_ms}ms").as_bytes());
     }
+    eprintln!(
+        "run_bounded result ok={ok} exit={exit_code} stdout_len={} stderr_len={}",
+        stdout.len(),
+        stderr.len()
+    );
     let (stdout, stderr) = bound_output(stdout, stderr);
     TaskResult {
         task_id: task.id,
