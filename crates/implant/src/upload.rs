@@ -30,6 +30,11 @@ pub struct Upload {
         std::sync::Arc<std::sync::Barrier>,
         std::sync::Arc<std::sync::Barrier>,
     )>,
+    #[cfg(test)]
+    validation_channels: Option<(
+        std::sync::mpsc::Sender<()>,
+        std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    )>,
 }
 
 impl Upload {
@@ -77,6 +82,8 @@ impl Upload {
             expected_sha256,
             #[cfg(test)]
             finalize_barriers: None,
+            #[cfg(test)]
+            validation_channels: None,
         })
     }
 
@@ -172,6 +179,16 @@ impl Upload {
     }
 
     pub fn finalize_with_cancellation(&self, cancelled: &AtomicBool) -> Result<(), String> {
+        let validation = self.validate();
+        if cancelled.load(Ordering::SeqCst) {
+            remove_cancelled_sidecar(&self.partial_path, &self.file)?;
+            return Err("task cancelled".into());
+        }
+        validation?;
+        self.publish()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
         if !self.total_known
             || self
                 .file
@@ -182,7 +199,7 @@ impl Upload {
         {
             return Err("upload sidecar size mismatch".into());
         }
-        if let Some(expected) = &self.expected_sha256 {
+        let integrity = if let Some(expected) = &self.expected_sha256 {
             let mut file = self
                 .file
                 .try_clone()
@@ -199,19 +216,28 @@ impl Upload {
                 }
                 digest.update(&buffer[..count]);
             }
-            if hex::encode(digest.finalize()) != expected.to_ascii_lowercase() {
-                return Err("upload SHA-256 mismatch".into());
+            if hex::encode(digest.finalize()) == expected.to_ascii_lowercase() {
+                Ok(())
+            } else {
+                Err("upload SHA-256 mismatch".into())
             }
-        }
+        } else {
+            Ok(())
+        };
         #[cfg(test)]
         if let Some((reached, release)) = &self.finalize_barriers {
             reached.wait();
             release.wait();
         }
-        if cancelled.load(Ordering::SeqCst) {
-            remove_cancelled_sidecar(&self.partial_path, &self.file)?;
-            return Err("task cancelled".into());
+        #[cfg(test)]
+        if let Some((reached, release)) = &self.validation_channels {
+            let _ = reached.send(());
+            let _ = release.lock().unwrap().recv();
         }
+        integrity
+    }
+
+    pub fn publish(&self) -> Result<(), String> {
         // hard_link is an atomic create-without-replace on local filesystems:
         // an existing destination is never truncated or overwritten.
         publish_no_replace(
@@ -243,6 +269,16 @@ impl Upload {
         release: std::sync::Arc<std::sync::Barrier>,
     ) {
         self.finalize_barriers = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_validation_channels(
+        &mut self,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.validation_channels =
+            Some((reached, std::sync::Arc::new(std::sync::Mutex::new(release))));
     }
 }
 

@@ -99,16 +99,21 @@ impl Download {
     }
 
     pub fn finalize_with_cancellation(&self, cancelled: &AtomicBool) -> Result<(), String> {
-        #[cfg(test)]
-        if let Some((reached, release)) = &self.finalize_barriers {
-            reached.wait();
-            release.wait();
-        }
+        self.validate()?;
         if cancelled.load(Ordering::SeqCst) {
             Err("task cancelled".into())
         } else {
             Ok(())
         }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some((reached, release)) = &self.finalize_barriers {
+            reached.wait();
+            release.wait();
+        }
+        Ok(())
     }
 
     #[cfg(test)]

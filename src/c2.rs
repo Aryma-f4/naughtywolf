@@ -210,7 +210,7 @@ async fn process_sealed_poll_with_store(
         .map_err(|_| C2Error::BadRequest)?;
     let mut result_acks = Vec::new();
     for result in request.results {
-        if repo
+        let stored = repo
             .store_task_result_for_session(
                 &session_id.to_string(),
                 &result.task_id.to_string(),
@@ -220,8 +220,14 @@ async fn process_sealed_poll_with_store(
                 result.exit_code,
             )
             .await
-            .map_err(|_| C2Error::Internal)?
-        {
+            .map_err(|_| C2Error::Internal)?;
+        if stored {
+            if let Some(store) = transfer_store.as_ref() {
+                store
+                    .cleanup_cancelled_task(&session_id.to_string(), &result.task_id.to_string())
+                    .await
+                    .map_err(transfer_c2_error)?;
+            }
             result_acks.push(result.task_id);
         }
     }
@@ -885,6 +891,14 @@ mod tests {
         let response = sealed_checkin(repo, psk, store, wire).await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.len() <= inner_budget,
+            "oversized fixed-reply rejection body was {} bytes",
+            body.len()
+        );
     }
 
     #[tokio::test]
@@ -1139,6 +1153,239 @@ mod tests {
             }
         }
         Ok(axum::body::Bytes::from(response))
+    }
+
+    #[derive(Clone)]
+    struct TransferCancelPollState {
+        repo: Repository,
+        psk: Arc<Vec<u8>>,
+        store: crate::callback_workspace::transfers::TransferStore,
+        transfer_id: Arc<std::sync::Mutex<Option<String>>>,
+        polls_released: Arc<AtomicBool>,
+        poll_release: Arc<tokio::sync::Notify>,
+        partial_paused: Arc<AtomicBool>,
+        partial_reached: Arc<tokio::sync::Notify>,
+        partial_release: Arc<tokio::sync::Notify>,
+        terminal_paused: Arc<AtomicBool>,
+        terminal_reached: Arc<tokio::sync::Notify>,
+        terminal_release: Arc<tokio::sync::Notify>,
+    }
+
+    async fn transfer_cancel_checkin(
+        State(state): State<TransferCancelPollState>,
+        body: axum::body::Bytes,
+    ) -> Result<axum::body::Bytes, StatusCode> {
+        if std::str::from_utf8(&body)
+            .ok()
+            .and_then(Envelope::routing_id)
+            .is_some()
+        {
+            while !state.polls_released.load(Ordering::SeqCst) {
+                state.poll_release.notified().await;
+            }
+        }
+        let response =
+            process_sealed_with_store(&state.repo, &state.psk, &body, "http", Some(&state.store))
+                .await
+                .map_err(|error| error.status())?;
+        let transfer_id = state.transfer_id.lock().unwrap().clone();
+        if let Some(transfer_id) = transfer_id {
+            let transfer = state
+                .repo
+                .file_transfer(&transfer_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            if transfer.status == "active"
+                && transfer.received_bytes > 0
+                && transfer.received_bytes < transfer.expected_size.unwrap_or_default()
+                && !state.partial_paused.swap(true, Ordering::SeqCst)
+            {
+                state.partial_reached.notify_one();
+                state.partial_release.notified().await;
+            }
+            if transfer.status == "cancelled" && !state.terminal_paused.swap(true, Ordering::SeqCst)
+            {
+                state.terminal_reached.notify_one();
+                state.terminal_release.notified().await;
+            }
+        }
+        Ok(axum::body::Bytes::from(response))
+    }
+
+    #[tokio::test]
+    async fn cancelled_download_result_cleans_partial_and_advances_repository_fifo() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES ('transfer-cancel-operator', 'alice', 'x', 'operator')")
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let psk = Arc::new(b"transfer-cancel-psk".to_vec());
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::callback_workspace::transfers::TransferStore::new(
+            repo.clone(),
+            directory.path(),
+            16 * 1024,
+        )
+        .unwrap();
+        let state = TransferCancelPollState {
+            repo: repo.clone(),
+            psk: psk.clone(),
+            store: store.clone(),
+            transfer_id: Arc::new(std::sync::Mutex::new(None)),
+            polls_released: Arc::new(AtomicBool::new(false)),
+            poll_release: Arc::new(tokio::sync::Notify::new()),
+            partial_paused: Arc::new(AtomicBool::new(false)),
+            partial_reached: Arc::new(tokio::sync::Notify::new()),
+            partial_release: Arc::new(tokio::sync::Notify::new()),
+            terminal_paused: Arc::new(AtomicBool::new(false)),
+            terminal_reached: Arc::new(tokio::sync::Notify::new()),
+            terminal_release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/c2/checkin", post(transfer_cancel_checkin))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let runtime = Arc::new(BeaconRuntime::new(
+            Profile {
+                endpoint: format!("http://127.0.0.1:{port}"),
+                interval: Duration::from_millis(50),
+                jitter: Duration::ZERO,
+                hostname: "transfer-cancel-host".into(),
+                username: "tester".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                pid: 4243,
+                addr: "127.0.0.1".into(),
+            },
+            psk.as_ref().clone(),
+        ));
+        let beacon_runtime = runtime.clone();
+        let beacon = tokio::spawn(async move { beacon_runtime.run().await });
+        let session_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM callbacks WHERE host = 'transfer-cancel-host' LIMIT 1",
+                )
+                .fetch_optional(&repo.pool)
+                .await
+                .unwrap()
+                {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("implant registration");
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let first_source = source_dir.path().join("first-download.bin");
+        let follower_source = source_dir.path().join("follower-download.bin");
+        std::fs::write(&first_source, vec![0x41; 8192]).unwrap();
+        std::fs::write(&follower_source, b"follower").unwrap();
+        let first = store
+            .queue_download(
+                &session_id,
+                first_source.to_str().unwrap(),
+                Some(8192),
+                None,
+                "transfer-cancel-operator",
+                "alice",
+            )
+            .await
+            .unwrap();
+        let follower = store
+            .queue_download(
+                &session_id,
+                follower_source.to_str().unwrap(),
+                Some(8),
+                None,
+                "transfer-cancel-operator",
+                "alice",
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE c2_file_transfers SET created_at = '2026-01-01T00:00:00.001Z' WHERE id = ?",
+        )
+        .bind(&first.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE c2_file_transfers SET created_at = '2026-01-01T00:00:00.002Z' WHERE id = ?",
+        )
+        .bind(&follower.id)
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        *state.transfer_id.lock().unwrap() = Some(first.id.clone());
+        state.polls_released.store(true, Ordering::SeqCst);
+        state.poll_release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), state.partial_reached.notified())
+            .await
+            .expect("real partial download persisted");
+        let partial = directory
+            .path()
+            .join("callback-transfers")
+            .join(format!("{}.part", first.storage_key));
+        let destination = directory
+            .path()
+            .join("callback-transfers")
+            .join(&first.storage_key);
+        assert!(partial.exists());
+        assert!(!destination.exists());
+        let partial_len = std::fs::metadata(&partial).unwrap().len();
+        assert!(partial_len > 0 && partial_len < 8192);
+        let task_id = first.task_id.as_deref().unwrap();
+        assert!(matches!(
+            repo.request_task_cancellation(
+                &session_id,
+                task_id,
+                "transfer-cancel-operator",
+                "alice",
+            )
+            .await
+            .unwrap(),
+            crate::db::models::TaskCancellation::Requested { .. }
+        ));
+        state.partial_release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), state.terminal_reached.notified())
+            .await
+            .expect("cancelled terminal result persisted");
+        let task_status: String = sqlx::query_scalar("SELECT status FROM c2_tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap();
+        let transfer_status = repo.file_transfer(&first.id).await.unwrap().unwrap().status;
+        let deliverable = repo.tasks_for_delivery(&session_id).await.unwrap();
+        let first_absent = !deliverable.iter().any(|task| task.id == task_id);
+        let follower_deliverable = deliverable
+            .iter()
+            .any(|task| Some(task.id.as_str()) == follower.task_id.as_deref());
+        let partial_cleaned = !partial.exists();
+        let unpublished = !destination.exists();
+
+        state.terminal_release.notify_one();
+        runtime.trigger_stop();
+        let _ = tokio::time::timeout(Duration::from_secs(2), beacon).await;
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(task_status, "cancelled");
+        assert_eq!(transfer_status, "cancelled");
+        assert!(first_absent);
+        assert!(follower_deliverable);
+        assert!(partial_cleaned, "cancelled transfer partial remained");
+        assert!(unpublished, "cancelled transfer was published");
     }
 
     #[tokio::test]

@@ -494,6 +494,57 @@ impl TransferStore {
             .map_err(Into::into)
     }
 
+    /// Remove both staging and published artifacts after the repository has
+    /// committed a terminal cancellation for the owning task.
+    pub async fn cleanup_cancelled_task(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<(), TransferError> {
+        let Some(transfer) = sqlx::query_as::<_, FileTransfer>(
+            "SELECT * FROM c2_file_transfers \
+             WHERE session_id = ? AND task_id = ? AND status = 'cancelled'",
+        )
+        .bind(session_id)
+        .bind(task_id)
+        .fetch_optional(&self.repository.pool)
+        .await
+        .map_err(|_| TransferError::Repository)?
+        else {
+            return Ok(());
+        };
+        let lock = self.lock_for(&transfer.id);
+        let _guard = lock.lock().await;
+        let _operation_lock = acquire_operation_lock(&self.root_dir, &transfer.storage_key).await?;
+        let lease = self.acquire_lease(&transfer.id).await?;
+        let result = async {
+            let still_cancelled: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM c2_file_transfers \
+                 WHERE id = ? AND session_id = ? AND task_id = ? AND status = 'cancelled'",
+            )
+            .bind(&transfer.id)
+            .bind(session_id)
+            .bind(task_id)
+            .fetch_optional(&self.repository.pool)
+            .await
+            .map_err(|_| TransferError::Repository)?;
+            if still_cancelled.is_none() {
+                return Ok(());
+            }
+            for name in [
+                format!("{}.part", transfer.storage_key),
+                transfer.storage_key.clone(),
+            ] {
+                unlink_relative(&self.root_dir, &name)?;
+            }
+            sync_directory_handle(&self.root_dir)
+        }
+        .await;
+        let release = self.release_lease(&transfer.id, &lease).await;
+        result?;
+        release
+    }
+
     /// Remove staged/orphaned artifacts which are no longer owned by a live
     /// queued or active transfer. This is safe to run at every server start.
     pub async fn cleanup_orphans(&self) -> Result<(), TransferError> {
