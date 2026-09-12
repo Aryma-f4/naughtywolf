@@ -89,20 +89,26 @@ pub fn building_jobs() -> Vec<BuildJob> {
         .unwrap_or_default()
 }
 
+pub fn is_building(file: &str) -> bool {
+    BUILDING
+        .lock()
+        .map(|map| map.contains_key(file))
+        .unwrap_or(false)
+}
+
 /// `(file, error, at)` for recent failed builds, surfaced in the payload UI.
 static RECENT_ERRORS: LazyLock<Mutex<Vec<(String, String, String)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static PAYLOAD_METADATA_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static PUBLIC_DOWNLOAD_INDEX: LazyLock<Mutex<PublicDownloadIndex>> =
-    LazyLock::new(|| Mutex::new(PublicDownloadIndex::default()));
-static PUBLIC_INDEX_LOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[cfg(test)]
 #[derive(Default)]
 struct PublicDownloadIndex {
     loaded: bool,
     entries: HashMap<Uuid, (PathBuf, String)>,
 }
 
+#[cfg(test)]
 impl PublicDownloadIndex {
     fn replace(&mut self, dir: &Path, metadata: &[PayloadMeta]) {
         self.entries.clear();
@@ -115,20 +121,29 @@ impl PublicDownloadIndex {
         self.loaded = true;
     }
 
-    fn register(&mut self, dir: &Path, meta: &PayloadMeta) {
-        if !self.loaded {
-            return;
-        }
-        if let Some(public_id) = valid_public_uuid(&meta.public_id) {
-            self.entries
-                .insert(public_id, (dir.join(&meta.file), meta.file.clone()));
-        }
-    }
-
     fn resolve(&self, token: &str) -> Option<(PathBuf, String)> {
         let public_id = valid_public_uuid(token)?;
         self.entries.get(&public_id).cloned()
     }
+}
+
+/// Remove a built payload (binary + sidecar) for good.
+pub fn delete(file: &str) -> Result<()> {
+    delete_from_dir(Path::new(PAYLOAD_DIR), file)
+}
+
+fn delete_from_dir(dir: &Path, file: &str) -> Result<()> {
+    let known = list_from_dir(dir)?.iter().any(|meta| meta.file == file);
+    anyhow::ensure!(known, "payload not found");
+    anyhow::ensure!(!is_building(file), "payload is still building");
+    let _guard = PAYLOAD_METADATA_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("payload metadata lock poisoned"))?;
+    let binary = dir.join(file);
+    std::fs::remove_file(&binary)?;
+    let _ = std::fs::remove_file(dir.join(format!("{file}.json")));
+    clear_build_errors(file);
+    Ok(())
 }
 
 pub fn record_build_error(file: &str, err: &str) {
@@ -407,20 +422,11 @@ async fn do_build(
         built_at: chrono::Utc::now().to_rfc3339(),
     };
     store_payload_metadata(Path::new(PAYLOAD_DIR), &mut meta)?;
-    if let Ok(mut index) = PUBLIC_DOWNLOAD_INDEX.lock() {
-        index.register(Path::new(PAYLOAD_DIR), &meta);
-    }
     Ok(meta)
 }
 
 pub fn list() -> Result<Vec<PayloadMeta>> {
-    let dir = Path::new(PAYLOAD_DIR);
-    let metadata = list_from_dir(dir)?;
-    let mut index = PUBLIC_DOWNLOAD_INDEX
-        .lock()
-        .map_err(|_| anyhow::anyhow!("public download index lock poisoned"))?;
-    index.replace(dir, &metadata);
-    Ok(metadata)
+    list_from_dir(Path::new(PAYLOAD_DIR))
 }
 
 fn list_from_dir(dir: &Path) -> Result<Vec<PayloadMeta>> {
@@ -552,25 +558,16 @@ pub fn download_path(file: &str) -> Option<PathBuf> {
 
 /// Resolve an unguessable public download token to the artifact it names.
 /// The path comes from the directory entry, never from sidecar-controlled data.
+/// Resolved from disk on every request: the directory is small and this avoids
+/// a stale once-loaded cache racing concurrent writers.
 pub fn public_download(token: &str) -> Option<(PathBuf, String)> {
     valid_public_uuid(token)?;
-    if let Ok(index) = PUBLIC_DOWNLOAD_INDEX.lock()
-        && index.loaded
-    {
-        return index.resolve(token);
-    }
-
-    let _load_guard = PUBLIC_INDEX_LOAD_LOCK.lock().ok()?;
-    if let Ok(index) = PUBLIC_DOWNLOAD_INDEX.lock()
-        && index.loaded
-    {
-        return index.resolve(token);
-    }
     let dir = Path::new(PAYLOAD_DIR);
-    let metadata = list_from_dir(dir).ok()?;
-    let mut index = PUBLIC_DOWNLOAD_INDEX.lock().ok()?;
-    index.replace(dir, &metadata);
-    index.resolve(token)
+    let meta = list_from_dir(dir)
+        .ok()?
+        .into_iter()
+        .find(|m| m.public_id == token)?;
+    Some((dir.join(&meta.file), meta.file))
 }
 
 #[cfg(test)]
@@ -624,7 +621,11 @@ mod tests {
         record_build_error("win-1.windows.amd64", "boom");
         assert_eq!(recent_errors()[0].0, "win-1.windows.amd64");
         clear_build_errors("win-1.windows.amd64");
-        assert!(recent_errors().is_empty());
+        assert!(
+            !recent_errors()
+                .iter()
+                .any(|(file, _, _)| file == "win-1.windows.amd64")
+        );
     }
 
     #[test]
@@ -847,6 +848,53 @@ mod tests {
         std::fs::write(temp.path().join("artifact.550e8400.tmp"), b"partial").unwrap();
 
         assert!(list_from_dir(temp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_removes_binary_sidecar_and_build_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = "gone.linux.amd64";
+        std::fs::write(temp.path().join(file), b"payload").unwrap();
+        let sidecar = temp.path().join(format!("{file}.json"));
+        std::fs::write(
+            &sidecar,
+            serde_json::to_vec_pretty(&fallback_meta(file, &temp.path().join(file))).unwrap(),
+        )
+        .unwrap();
+        record_build_error(file, "boom");
+        let public_id = list_from_dir(temp.path()).unwrap()[0].public_id.clone();
+
+        delete_from_dir(temp.path(), file).unwrap();
+
+        assert!(!temp.path().join(file).exists());
+        assert!(!sidecar.exists());
+        assert!(!recent_errors().iter().any(|(f, _, _)| f == file));
+        assert!(Uuid::parse_str(&public_id).is_ok());
+    }
+
+    #[test]
+    fn delete_refuses_missing_or_building_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = "busy.linux.amd64";
+        std::fs::write(temp.path().join(file), b"payload").unwrap();
+
+        assert!(delete_from_dir(temp.path(), "nope.linux.amd64").is_err());
+
+        let file = file.to_owned();
+        mark_building(BuildJob {
+            file: file.clone(),
+            name: "busy".into(),
+            target: String::new(),
+            os: "linux".into(),
+            arch: "amd64".into(),
+            started_at: "now".into(),
+        });
+        let busy = delete_from_dir(temp.path(), &file);
+        unmark_building(&file);
+        assert!(
+            busy.unwrap_err().to_string().contains("still building"),
+            "expected building guard to block deletion"
+        );
     }
 
     #[tokio::test]

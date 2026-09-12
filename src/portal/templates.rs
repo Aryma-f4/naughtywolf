@@ -601,7 +601,7 @@ pub fn payloads_page(
         .iter()
         .map(|b| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}/{}</td><td>{}</td><td>{} bytes</td><td>{}</td><td><a class=\"btn btn-sm\" href=\"/payloads/download/{}\">Download</a> <a class=\"btn btn-sm\" href=\"/payloads/edit/{file}\">Edit</a></td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}/{}</td><td>{}</td><td>{} bytes</td><td>{}</td><td><a class=\"btn btn-sm\" href=\"/payloads/download/{}\">Download</a> <a class=\"btn btn-sm\" href=\"/payloads/edit/{file}\">Edit</a> <form method=\"post\" action=\"/payloads/delete/{file}\" class=\"callback-delete\" onsubmit=\"return confirm('Delete this payload artifact? This cannot be undone.');\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><button type=\"submit\" class=\"btn btn-sm btn-danger\">Delete</button></form></td></tr>",
                 escape_html(&b.name),
                 escape_html(&b.protocol),
                 escape_html(&b.os),
@@ -611,6 +611,7 @@ pub fn payloads_page(
                 escape_html(&b.built_at),
                 url_encode(&b.public_id),
                 file = url_encode(&b.file),
+                csrf = csrf_token,
             )
         })
         .collect::<String>();

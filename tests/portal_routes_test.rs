@@ -1152,6 +1152,85 @@ async fn operator_deletes_callback_in_their_operation_with_audit() {
 }
 
 #[tokio::test]
+async fn operator_deletes_a_payload_artifact_with_csrf() {
+    let repository = test_repository().await;
+    let operator = create_user(&repository, "op-payload", Role::Operator).await;
+    let app = app_with_user_and_repository(repository.clone(), operator).await;
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let file = format!("delete-route-test-{token}..linux.amd64");
+    let dir = std::path::Path::new("payloads");
+    std::fs::create_dir_all(dir).unwrap();
+    let artifact = dir.join(&file);
+    let sidecar = dir.join(format!("{file}.json"));
+    let _cleanup = PayloadArtifactCleanup {
+        paths: vec![artifact.clone(), sidecar.clone()],
+    };
+    std::fs::write(&artifact, b"delete-me").unwrap();
+    std::fs::write(
+        &sidecar,
+        serde_json::to_vec(&serde_json::json!({
+            "file": file,
+            "name": "delete-route-test",
+            "os": "linux",
+            "arch": "amd64",
+            "protocol": "https",
+            "lhost": "gateofbabylon.space",
+            "lport": 443,
+            "interval_ms": 5000,
+            "jitter_ms": 1000,
+            "target": "",
+            "size": 9,
+            "built_at": "2026-09-10T00:00:00Z",
+            "public_id": token
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let list_page = app
+        .clone()
+        .oneshot(Request::get("/payloads").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let list = body_string(list_page).await;
+    let csrf = csrf_token(&list);
+    assert!(list.contains(&format!("action=\"/payloads/delete/{file}\"")));
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            &format!("/payloads/delete/{file}"),
+            format!("csrf_token={csrf}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/payloads");
+    assert!(!artifact.exists());
+    assert!(!sidecar.exists());
+
+    let bad_csrf = app
+        .clone()
+        .oneshot(post_form(
+            &format!("/payloads/delete/{file}"),
+            "csrf_token=wrong".to_owned(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_csrf.status(), StatusCode::BAD_REQUEST);
+
+    let missing = app
+        .oneshot(post_form(
+            "/payloads/delete/ghost.linux.amd64",
+            format!("csrf_token={csrf}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn operator_can_create_an_event_rule_with_audit() {
     let repository = test_repository().await;
     let operator = create_user(&repository, "op", Role::Operator).await;

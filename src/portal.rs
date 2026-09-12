@@ -137,6 +137,7 @@ pub fn authenticated_router_with_transfer_limit(max_transfer_bytes: u64) -> Rout
         .route("/payloads", get(payloads))
         .route("/payloads/generate", post(generate_payload))
         .route("/payloads/edit/{file}", get(edit_payload))
+        .route("/payloads/delete/{file}", post(delete_payload))
         .route("/callbacks", get(callbacks))
         .route("/callbacks/{session_id}", get(callback_detail))
         .route("/callbacks/{session_id}/delete", post(delete_callback))
@@ -613,6 +614,29 @@ async fn edit_payload(
     )))
 }
 
+/// Delete a generated payload artifact (binary + metadata sidecar).
+async fn delete_payload(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    session: Session,
+    Path(file): Path<String>,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let form = match Form::<CsrfForm>::from_request(request, &user).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return Err(AppError::Validation(
+                "delete request must carry a CSRF token".to_owned(),
+            ));
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await? {
+        return Err(AppError::Validation("The request is invalid.".to_owned()));
+    }
+    crate::payload::delete(&file).map_err(|_| AppError::NotFound)?;
+    Ok(Redirect::to("/payloads").into_response())
+}
+
 async fn public_download_payload(Path(token): Path<String>) -> Result<Response, AppError> {
     let Some((path, filename)) = crate::payload::public_download(&token) else {
         return Err(AppError::NotFound);
@@ -706,7 +730,7 @@ async fn callbacks(
 }
 
 #[derive(Default, Deserialize)]
-struct CallbackDeleteForm {
+struct CsrfForm {
     #[serde(default)]
     csrf_token: Option<String>,
 }
@@ -726,7 +750,7 @@ async fn delete_callback(
         .find_callback_visible_to(&session_id, &user.id, user.role == Role::Admin)
         .await?
         .ok_or(AppError::NotFound)?;
-    let form = match Form::<CallbackDeleteForm>::from_request(request, &repository).await {
+    let form = match Form::<CsrfForm>::from_request(request, &repository).await {
         Ok(Form(form)) => form,
         Err(_) => {
             return Err(AppError::Validation(
