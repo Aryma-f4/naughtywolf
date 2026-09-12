@@ -1371,26 +1371,35 @@ fn publish_no_replace_at(
     }
 }
 
+// macOS exposes /var as a system symlink to /private/var. Resolve this fixed
+// system alias before the component-by-component no-follow walk; the alias is
+// not user-controlled so opening under /private is still safe with O_NOFOLLOW.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn resolve_system_symlinks(path: PathBuf) -> PathBuf {
+    if path.starts_with("/var") {
+        PathBuf::from("/private").join(path.strip_prefix("/").unwrap())
+    } else {
+        path
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn resolve_system_symlinks(path: PathBuf) -> PathBuf {
+    path
+}
+
 #[cfg(unix)]
 fn open_or_create_directory(path: &Path) -> Result<RootHandle, TransferError> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::OpenOptionsExt;
-
-    let mut absolute = if path.is_absolute() {
+    let absolute = resolve_system_symlinks(if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .map_err(|_| TransferError::UnsafeStorage)?
             .join(path)
-    };
-    // macOS exposes /var as a system symlink to /private/var. Resolve this
-    // fixed system alias before the component-by-component no-follow walk;
-    // user-controlled ancestors are still opened with O_NOFOLLOW below.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    if absolute.starts_with("/var") {
-        absolute = PathBuf::from("/private").join(absolute.strip_prefix("/").unwrap());
-    }
+    });
     let components = absolute.components();
     let mut current = OpenOptions::new()
         .read(true)

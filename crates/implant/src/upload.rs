@@ -311,7 +311,7 @@ fn remove_cancelled_sidecar(
             source.as_raw_handle() as _,
             FileDispositionInfo,
             &info as *const _ as _,
-            std::mem::size_of::<FILE_DISPOSITION_INFO>(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
         )
     } == 0
     {
