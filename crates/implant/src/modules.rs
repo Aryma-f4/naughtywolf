@@ -130,8 +130,8 @@ async fn run_bounded(task: Task) -> TaskResult {
         Ok(child) => child,
         Err(error) => return failure(&task, format!("failed to spawn: {error}")),
     };
-    let stdout_task = tokio::spawn(drain_capped(child.stdout.take().unwrap(), MAX_OUTPUT_BYTES));
-    let stderr_task = tokio::spawn(drain_capped(child.stderr.take().unwrap(), MAX_OUTPUT_BYTES));
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let waited = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await;
     let (ok, exit_code, timed_out) = match waited {
         Ok(Ok(status)) => (status.success(), status.code().unwrap_or(-1), false),
@@ -145,8 +145,14 @@ async fn run_bounded(task: Task) -> TaskResult {
             (false, -1, true)
         }
     };
-    let stdout = stdout_task.await.unwrap_or_default();
-    let mut stderr = stderr_task.await.unwrap_or_default();
+    let stdout = match stdout {
+        Some(stream) => drain_capped(stream, MAX_OUTPUT_BYTES).await,
+        None => Vec::new(),
+    };
+    let mut stderr = match stderr {
+        Some(stream) => drain_capped(stream, MAX_OUTPUT_BYTES).await,
+        None => Vec::new(),
+    };
     if timed_out {
         stderr.extend_from_slice(format!("\ntask timed out after {timeout_ms}ms").as_bytes());
     }
