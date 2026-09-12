@@ -707,28 +707,28 @@ bash tests/vps_deploy_test.sh
 
 Expected: every command exits 0 with zero test failures.
 
-- [ ] **Step 5: Build and smoke-test the production image**
+- [x] **Step 5: Build and smoke-test the production image**
 
-Run the repository's container smoke command used by CI and assert migrations apply, `/healthz` succeeds, static workspace assets return JavaScript/CSS content types, and pre-004 task history remains readable.
+Run the repository's container smoke command used by CI and assert migrations apply, `/healthz` succeeds, static workspace assets return JavaScript/CSS content types, and pre-004 task history remains readable. Local linux/amd64 image builds run under QEMU emulation on this arm64 Mac (~1h+); the user deferred the image smoke to the native CI job.
 
-- [ ] **Step 6: Commit CI and verification changes**
+- [x] **Step 6: Commit CI and verification changes**
 
 ```bash
 git add .github/workflows/ci.yml .github/workflows/deploy-vps.yml Dockerfile tests/container_smoke.py tests/workflow_test.py docs/superpowers/plans/2026-09-10-mythic-callback-workspace.md
 git commit -m "ci: verify callback workspace on Linux and Windows"
 ```
 
-- [ ] **Step 7: Push `develop` and obtain both workflow IDs**
+- [x] **Step 7: Push `develop` and obtain both workflow IDs**
 
 Run: `git push origin develop`, then `gh run list --branch develop --limit 4 --json databaseId,workflowName,headSha,status,url`.  
 Expected: output contains CI and deployment runs whose `headSha` equals local `git rev-parse HEAD`.
 
-- [ ] **Step 8: Monitor the exact numeric IDs printed by Step 7**
+- [x] **Step 8: Monitor the exact numeric IDs printed by Step 7**
 
 Run `gh run watch` once for each numeric `databaseId` printed by Step 7, passing `--exit-status`.  
 Expected: CI succeeds before the deployment job reports success.
 
-- [ ] **Step 9: Verify the deployed production state**
+- [x] **Step 9: Verify the deployed production state**
 
 Over the authorized SSH connection, assert `/opt/naughtywolf` resolves to the pushed commit, `naughtywolf-app-1` is `running healthy`, and migrations include version 004. Assert `https://gateofbabylon.space/` and `/login` return 200.
 
@@ -736,6 +736,31 @@ Over the authorized SSH connection, assert `/opt/naughtywolf` resolves to the pu
 
 Start a freshly built supervised Linux test implant, wait for a real hostname and advancing `last_seen`, queue `nw/process-list` and `nw/fs-list /tmp`, and assert both transition pending → delivered → processing → completed, persist after page reload, and populate their tabs. Do not invoke kill/delete during deployment smoke.
 
+Status: partial — the `nw/fs-list /tmp` path completed end-to-end on production; `nw/process-list` is blocked by a real payload-budget bug found by this smoke (details in the Task 10 evidence below). Step 10 stays open until that bug is fixed and a `nw/process-list` task completes.
+
 - [ ] **Step 11: Mark the plan complete only after evidence is recorded**
 
 Check every task box only when its named command has fresh exit-0 output. Record the final commit SHA, CI URLs, container health, callback ID, and the two non-destructive smoke task IDs in the implementation handoff.
+
+### Task 10 verification evidence
+
+**Final pushed commit:** `08a3890` (`9205135` → `7d847a3` compositing, `08a3890` CI-vars). Head SHA matching the VPS checkout: `08a38905dc8e95a0579f72e454aed2d897284458`.
+
+**Green workflow runs (all `headSha` == local HEAD, deploy gated behind its own verify job):**
+- CI: `34714669416` — linux + windows (fmt, clippy `-D warnings`, all Rust tests, JS, workflow self-check, compose config, image build, container smoke).
+- Deploy: `34714669313` — `08a3890` → `naughtywolf-app-1 Healthy` at `https://gateofbabylon.space`.
+
+**Deployed production state (2026-09-12T20:26Z):**
+- `/opt/naughtywolf` commit == `08a38905dc8e95a0579f72e454aed2d897284458`.
+- `naughtywolf-app-1` `Up (healthy)`; `naughtywolf-gsocket-1` up.
+- Migrations present incl. `004_callback_workspace.sql` (001–005 on disk).
+- `https://gateofbabylon.space/` = 200, `/login` = 200, `/healthz` = 204.
+
+**Callback smoke (supervised systemd implant `nw-implant`, built at `08a3890`, NW_INTERVAL=3000):**
+- Registered as callback `a775f98d-48ba-45f7-be3d-df884fcde848` — host `VM-16-208-ubuntu`, user `root`, `linux/x86_64`; `last_seen` advanced `20:36:38 → 20:37:22Z`.
+- `nw/fs-list /tmp` task `ac9f69c6-41aa-4e94-a3be-412831bb840e`: pending → processing `20:37:06.992Z` → completed `20:37:06.999Z`, exit 0, 5184-byte result. Survives reload (re-GET still complete). Files tab snapshot persisted in `c2_file_snapshots` (`/tmp`, schema `nw.fs-list.v1`, 23 entries).
+- `nw/process-list` did **not** complete: on hosts with many processes the result JSON (~263 processes here) exceeds the 32 KiB sealed-frame `inner_budget`; the implant logs `poll request fixed payload exceeds sealed wire budget` every cycle and cannot deliver the result (task `b08a5c5f…` stayed `delivered`; `c2_process_snapshots` untouched, Processes tab empty). `fit_poll_request_to_budget` only chunk-fits file chunks, not task `results`.
+
+**Cleanup:** temp operator `smoke-BC6982` disabled; `nw-implant-smoke` systemd unit stopped + removed; `SYSTEMD psk` copies deleted. Smoke session/task rows kept as non-destructive evidence.
+
+**Recommended follow-up (new task, not part of this plan):** chunk or allow task results larger than the wire `inner_budget` (or raise the HTTP budget), so `nw/process-list` reports on busy hosts.
