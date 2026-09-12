@@ -258,12 +258,7 @@ async fn process_sealed_poll_with_store(
             })
         })
         .collect::<Vec<_>>();
-    let kind = if tasks.is_empty() {
-        Kind::Heartbeat
-    } else {
-        Kind::Task
-    };
-    let mut push_chunks = if let Some(store) = transfer_store.as_ref() {
+    let push_chunks = if let Some(store) = transfer_store.as_ref() {
         store
             .next_upload_chunks(&session_id.to_string(), frame_budget)
             .await
@@ -271,46 +266,99 @@ async fn process_sealed_poll_with_store(
     } else {
         Vec::new()
     };
-    let mut reply = PollReply {
+    let reply = PollReply {
         tasks,
         result_acks,
         acks: file_acks,
         push_chunks: Vec::new(),
     };
     let reply_id = env.id + 1;
-    // `inner_budget` is the complete sealed frame budget. Reserve the
-    // non-transfer reply first, then admit only the largest contiguous prefix
-    // of chunks that fits after JSON/base64/AEAD overhead.
-    while !push_chunks.is_empty() {
-        reply.push_chunks = push_chunks.clone();
-        let plaintext = serde_json::to_vec(&reply).map_err(|_| C2Error::Internal)?;
-        let encrypted =
-            crypto::encrypt(&key, reply_id, &plaintext).map_err(|_| C2Error::Internal)?;
-        let frame = Envelope::new(
-            if reply.tasks.is_empty() {
-                Kind::Heartbeat
-            } else {
-                Kind::Task
-            },
-            reply_id,
-            Some(session_id),
-            encrypted,
-        )
-        .seal(&key)
-        .map_err(|_| C2Error::Internal)?;
-        if frame.len() <= frame_budget {
-            break;
-        }
-        push_chunks.pop();
-    }
-    reply.push_chunks = push_chunks;
+    fit_poll_reply_to_budget(&key, reply_id, session_id, frame_budget, reply, push_chunks)
+}
+
+fn poll_reply_envelope(
+    key: &[u8; crypto::KEY_LEN],
+    reply_id: u64,
+    session_id: Uuid,
+    reply: &PollReply,
+) -> Result<Envelope, C2Error> {
     let plaintext = serde_json::to_vec(&reply).map_err(|_| C2Error::Internal)?;
     let encrypted = crypto::encrypt(&key, reply_id, &plaintext).map_err(|_| C2Error::Internal)?;
-    let envelope = Envelope::new(kind, reply_id, Some(session_id), encrypted);
-    if envelope.seal(&key).map_err(|_| C2Error::Internal)?.len() > frame_budget {
+    Ok(Envelope::new(
+        if reply.tasks.is_empty() {
+            Kind::Heartbeat
+        } else {
+            Kind::Task
+        },
+        reply_id,
+        Some(session_id),
+        encrypted,
+    ))
+}
+
+fn poll_reply_fits(
+    key: &[u8; crypto::KEY_LEN],
+    reply_id: u64,
+    session_id: Uuid,
+    reply: &PollReply,
+    inner_budget: usize,
+) -> Result<bool, C2Error> {
+    Ok(poll_reply_envelope(key, reply_id, session_id, reply)?
+        .seal(key)
+        .map_err(|_| C2Error::Internal)?
+        .len()
+        <= inner_budget)
+}
+
+/// Reserve the fixed poll reply first, then fit a contiguous transfer prefix
+/// against the bytes emitted by `Envelope::seal` (not plaintext JSON size).
+fn fit_poll_reply_to_budget(
+    key: &[u8; crypto::KEY_LEN],
+    reply_id: u64,
+    session_id: Uuid,
+    inner_budget: usize,
+    mut reply: PollReply,
+    push_chunks: Vec<nw_profile::msgs::FileChunk>,
+) -> Result<Envelope, C2Error> {
+    reply.push_chunks.clear();
+    if !poll_reply_fits(key, reply_id, session_id, &reply, inner_budget)? {
         return Err(C2Error::BadRequest);
     }
-    Ok(envelope)
+
+    for chunk in push_chunks {
+        reply.push_chunks.push(chunk.clone());
+        if poll_reply_fits(key, reply_id, session_id, &reply, inner_budget)? {
+            continue;
+        }
+        reply.push_chunks.pop();
+        if chunk.data.is_empty() {
+            break;
+        }
+
+        let mut low = 1usize;
+        let mut high = chunk.data.len();
+        let mut fitted = None;
+        while low <= high {
+            let midpoint = low + (high - low) / 2;
+            let mut truncated = chunk.clone();
+            truncated.data.truncate(midpoint);
+            reply.push_chunks.push(truncated.clone());
+            let fits = poll_reply_fits(key, reply_id, session_id, &reply, inner_budget)?;
+            reply.push_chunks.pop();
+            if fits {
+                fitted = Some(truncated);
+                low = midpoint + 1;
+            } else {
+                high = midpoint - 1;
+            }
+        }
+        if let Some(chunk) = fitted {
+            reply.push_chunks.push(chunk);
+        }
+        break;
+    }
+
+    poll_reply_envelope(key, reply_id, session_id, &reply)
 }
 
 fn transfer_c2_error(error: crate::callback_workspace::transfers::TransferError) -> C2Error {
@@ -671,6 +719,172 @@ mod tests {
         .unwrap();
         let plaintext = crypto::decrypt(key, reply.id, &reply.encrypted).unwrap();
         serde_json::from_slice(&plaintext).unwrap()
+    }
+
+    fn sealed_poll_request(
+        session_id: Uuid,
+        key: &[u8; crypto::KEY_LEN],
+        id: u64,
+        request: &PollRequest,
+    ) -> String {
+        let plaintext = serde_json::to_vec(request).unwrap();
+        let encrypted = crypto::encrypt(key, id, &plaintext).unwrap();
+        Envelope::new(Kind::TaskResult, id, Some(session_id), encrypted)
+            .seal(key)
+            .unwrap()
+    }
+
+    async fn sealed_checkin(
+        repo: Repository,
+        psk: Arc<Vec<u8>>,
+        store: crate::callback_workspace::transfers::TransferStore,
+        wire: String,
+    ) -> axum::response::Response {
+        router(psk)
+            .with_state(repo)
+            .layer(Extension(store))
+            .oneshot(Request::post("/c2/checkin").body(Body::from(wire)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sealed_wire_non_transfer_reply_fits_advertised_budget() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let psk = Arc::new(b"sealed-budget-psk".to_vec());
+        let key = crypto::derive_key(b"sealed-budget-session", b"test");
+        let session_id = seed_poll_session(&repo, &key).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::callback_workspace::transfers::TransferStore::new(
+            repo.clone(),
+            directory.path(),
+            4096,
+        )
+        .unwrap();
+        let inner_budget = 1200;
+        let wire = sealed_poll_request(
+            session_id,
+            &key,
+            100,
+            &PollRequest {
+                inner_budget,
+                ..Default::default()
+            },
+        );
+
+        let response = sealed_checkin(repo, psk, store, wire).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.len() <= inner_budget,
+            "sealed reply was {} bytes",
+            body.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_wire_truncates_one_upload_chunk_and_makes_progress() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let psk = Arc::new(b"sealed-chunk-psk".to_vec());
+        let key = crypto::derive_key(b"sealed-chunk-session", b"test");
+        let session_id = seed_poll_session(&repo, &key).await;
+        sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES ('sealed-operator', 'alice', 'x', 'operator')")
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::callback_workspace::transfers::TransferStore::new(
+            repo.clone(),
+            directory.path(),
+            4096,
+        )
+        .unwrap();
+        let mut stage = store.begin_upload_stage().unwrap();
+        stage.write(&vec![0x5a; 1024]).unwrap();
+        store
+            .finish_upload_stage(
+                stage,
+                &session_id.to_string(),
+                "/tmp/to-agent.bin",
+                "sealed-operator",
+                "alice",
+            )
+            .await
+            .unwrap();
+        let inner_budget = 1200;
+        let wire = sealed_poll_request(
+            session_id,
+            &key,
+            101,
+            &PollRequest {
+                inner_budget,
+                ..Default::default()
+            },
+        );
+
+        let response = sealed_checkin(repo, psk, store, wire).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.len() <= inner_budget,
+            "sealed reply was {} bytes",
+            body.len()
+        );
+        let opened = Envelope::open(&key, std::str::from_utf8(&body).unwrap()).unwrap();
+        let plaintext = crypto::decrypt(&key, opened.id, &opened.encrypted).unwrap();
+        let reply: PollReply = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(reply.push_chunks.len(), 1);
+        assert!(!reply.push_chunks[0].data.is_empty());
+        assert!(reply.push_chunks[0].data.len() < 1024);
+    }
+
+    #[tokio::test]
+    async fn sealed_wire_rejects_fixed_reply_that_cannot_fit() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool };
+        let psk = Arc::new(b"sealed-fixed-psk".to_vec());
+        let key = crypto::derive_key(b"sealed-fixed-session", b"test");
+        let session_id = seed_poll_session(&repo, &key).await;
+        repo.enqueue_task(
+            &session_id.to_string(),
+            "fixed-payload",
+            &serde_json::json!(["x".repeat(2048)]),
+            5_000,
+        )
+        .await
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::callback_workspace::transfers::TransferStore::new(
+            repo.clone(),
+            directory.path(),
+            4096,
+        )
+        .unwrap();
+        let inner_budget = 1200;
+        let wire = sealed_poll_request(
+            session_id,
+            &key,
+            102,
+            &PollRequest {
+                inner_budget,
+                ..Default::default()
+            },
+        );
+
+        let response = sealed_checkin(repo, psk, store, wire).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

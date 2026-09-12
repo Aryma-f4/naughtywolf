@@ -14,6 +14,8 @@ pub enum AppError {
     Conflict(String),
     #[error("validation failed: {0}")]
     Validation(String),
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
     #[error("internal application error")]
     Internal,
 }
@@ -34,6 +36,10 @@ impl IntoResponse for AppError {
                 "The requested change conflicts with the current state.",
             ),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "The request is invalid."),
+            Self::PayloadTooLarge(_) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "The request payload is too large.",
+            ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "The request could not be completed.",

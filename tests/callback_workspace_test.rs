@@ -1593,6 +1593,51 @@ async fn multipart_upload_streams_bounded_fixture_and_completed_download_has_saf
 }
 
 #[tokio::test]
+async fn configured_multipart_limit_accepts_three_kib_and_rejects_five_kib_with_413() {
+    let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let app = authenticated_transfer_app_with_limit(repo, operator, store, 4096).await;
+    let page = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csrf = csrf_token(&response_text(page).await);
+
+    for (size, destination, expected) in [
+        (3 * 1024, "/srv/within-limit.bin", StatusCode::OK),
+        (
+            5 * 1024,
+            "/srv/over-limit.bin",
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let boundary = format!("nw-configured-limit-{size}");
+        let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"destination\"\r\n\r\n{destination}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n").into_bytes();
+        body.extend(std::iter::repeat_n(0x5a, size));
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/callbacks/{session_id}/files/upload"))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header("x-csrf-token", &csrf)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "multipart file size {size}");
+    }
+}
+
+#[tokio::test]
 async fn file_backed_application_transfer_survives_http_disconnect_and_db_reopen() {
     let workspace = tempfile::tempdir().unwrap();
     let db_path = workspace.path().join("transfers.sqlite");
@@ -1960,9 +2005,21 @@ async fn authenticated_transfer_app(
     user: AuthenticatedUser,
     store: TransferStore,
 ) -> Router {
+    let max_transfer_bytes = store.max_bytes();
+    authenticated_transfer_app_with_limit(repository, user, store, max_transfer_bytes).await
+}
+
+async fn authenticated_transfer_app_with_limit(
+    repository: Repository,
+    user: AuthenticatedUser,
+    store: TransferStore,
+    max_transfer_bytes: u64,
+) -> Router {
     let app = Router::<Repository>::new()
         .route("/test/login", post(login))
-        .merge(portal::authenticated_router())
+        .merge(portal::authenticated_router_with_transfer_limit(
+            max_transfer_bytes,
+        ))
         .with_state(repository)
         .layer(Extension(store))
         .layer(Extension(user))

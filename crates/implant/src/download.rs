@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nw_profile::msgs::FileChunk;
 use uuid::Uuid;
@@ -19,6 +20,11 @@ pub struct Download {
     offset: u64,
     transfer_id: Uuid,
     task_id: Uuid,
+    #[cfg(test)]
+    finalize_barriers: Option<(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    )>,
 }
 
 impl Download {
@@ -37,6 +43,8 @@ impl Download {
             offset: 0,
             transfer_id,
             task_id,
+            #[cfg(test)]
+            finalize_barriers: None,
         })
     }
 
@@ -88,6 +96,28 @@ impl Download {
             break;
         }
         chunks
+    }
+
+    pub fn finalize_with_cancellation(&self, cancelled: &AtomicBool) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some((reached, release)) = &self.finalize_barriers {
+            reached.wait();
+            release.wait();
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            Err("task cancelled".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_finalize_barriers(
+        &mut self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        release: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        self.finalize_barriers = Some((reached, release));
     }
 }
 

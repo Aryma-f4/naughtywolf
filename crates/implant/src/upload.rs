@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nw_profile::msgs::{FileAck, FileChunk};
 use uuid::Uuid;
@@ -24,6 +25,11 @@ pub struct Upload {
     transfer_id: Uuid,
     task_id: Uuid,
     expected_sha256: Option<String>,
+    #[cfg(test)]
+    finalize_barriers: Option<(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    )>,
 }
 
 impl Upload {
@@ -69,6 +75,8 @@ impl Upload {
             transfer_id,
             task_id,
             expected_sha256,
+            #[cfg(test)]
+            finalize_barriers: None,
         })
     }
 
@@ -159,6 +167,11 @@ impl Upload {
     /// Publish the transfer-specific sidecar after the server confirms the
     /// terminal ACK. Keeping it staged until then makes reconnects idempotent.
     pub fn finalize(&self) -> Result<(), String> {
+        let cancelled = AtomicBool::new(false);
+        self.finalize_with_cancellation(&cancelled)
+    }
+
+    pub fn finalize_with_cancellation(&self, cancelled: &AtomicBool) -> Result<(), String> {
         if !self.total_known
             || self
                 .file
@@ -190,6 +203,15 @@ impl Upload {
                 return Err("upload SHA-256 mismatch".into());
             }
         }
+        #[cfg(test)]
+        if let Some((reached, release)) = &self.finalize_barriers {
+            reached.wait();
+            release.wait();
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            remove_cancelled_sidecar(&self.partial_path, &self.file)?;
+            return Err("task cancelled".into());
+        }
         // hard_link is an atomic create-without-replace on local filesystems:
         // an existing destination is never truncated or overwritten.
         publish_no_replace(
@@ -209,6 +231,59 @@ impl Upload {
         }
         Ok(())
     }
+
+    pub fn cancel(self) -> Result<(), String> {
+        remove_cancelled_sidecar(&self.partial_path, &self.file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_finalize_barriers(
+        &mut self,
+        reached: std::sync::Arc<std::sync::Barrier>,
+        release: std::sync::Arc<std::sync::Barrier>,
+    ) {
+        self.finalize_barriers = Some((reached, release));
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_cancelled_sidecar(
+    partial_path: &std::path::Path,
+    _source: &std::fs::File,
+) -> Result<(), String> {
+    match std::fs::remove_file(partial_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove cancelled upload sidecar: {error}")),
+    }
+}
+
+#[cfg(windows)]
+fn remove_cancelled_sidecar(
+    _partial_path: &std::path::Path,
+    source: &std::fs::File,
+) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    if unsafe {
+        SetFileInformationByHandle(
+            source.as_raw_handle() as _,
+            FileDispositionInfo,
+            &info as *const _ as _,
+            std::mem::size_of::<FILE_DISPOSITION_INFO>(),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "remove cancelled upload sidecar: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]

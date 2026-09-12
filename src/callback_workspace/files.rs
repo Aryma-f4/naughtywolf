@@ -364,8 +364,8 @@ pub async fn download_completed(
 
 fn transfer_app_error(error: TransferError) -> AppError {
     match error {
-        TransferError::SizeLimit { .. }
-        | TransferError::ChecksumMismatch
+        TransferError::SizeLimit { .. } => AppError::PayloadTooLarge(error.to_string()),
+        TransferError::ChecksumMismatch
         | TransferError::TotalMismatch
         | TransferError::MissingProtocolId
         | TransferError::ProtocolMismatch

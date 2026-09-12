@@ -16,8 +16,10 @@ pub fn router() -> Router<Repository> {
 }
 
 pub fn router_with_transfer_limit(max_transfer_bytes: u64) -> Router<Repository> {
-    let body_limit =
-        usize::try_from(max_transfer_bytes.saturating_add(64 * 1024)).unwrap_or(usize::MAX);
+    let body_limit = max_transfer_bytes
+        .checked_add(64 * 1024)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .unwrap_or(usize::MAX);
     Router::new()
         .route(
             "/api/callbacks/{session_id}/tasks",
