@@ -3340,7 +3340,7 @@ async fn tasking_tab_exposes_persistent_controls_and_local_assets() {
         "data-events-endpoint=\"/api/callbacks/{session_id}/events\""
     )));
     assert!(page.contains(&format!(
-        "data-process-panel data-processes-endpoint=\"/api/callbacks/{session_id}/processes\""
+        "data-process-panel data-tab-panel=\"processes\" data-processes-endpoint=\"/api/callbacks/{session_id}/processes\""
     )));
     assert!(page.contains("data-process-capable=\"false\""));
     for label in [
@@ -3397,4 +3397,242 @@ async fn filesystem_workspace_renders_url_navigation_controls_and_disabled_trans
     );
     assert!(page.contains("data-file-upload disabled"));
     assert!(page.contains("data-file-download disabled"));
+}
+
+#[tokio::test]
+async fn workspace_exposes_four_tabs_and_url_backed_state() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "workspace-tabs", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let app = authenticated_app(repo, operator).await;
+
+    let response = app
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    for tab in ["tasking", "processes", "files", "metadata"] {
+        assert!(
+            page.contains(&format!(r#"data-callback-tab="{tab}""#)),
+            "missing {tab} tab link"
+        );
+        assert!(
+            page.contains(&format!(r#"data-tab-panel="{tab}""#)),
+            "missing {tab} tab panel hook"
+        );
+    }
+    assert!(
+        page.contains(r#"href="?tab=tasking#tasking""#),
+        "tasking URL state"
+    );
+    assert!(
+        page.contains(r#"href="?tab=processes#processes""#),
+        "processes URL state"
+    );
+    assert!(
+        page.contains(r#"href="?tab=files&amp;path=%2F#files""#),
+        "files URL state keeps the remote path"
+    );
+    assert!(
+        page.contains(r#"href="?tab=metadata#metadata""#),
+        "metadata URL state"
+    );
+    assert!(
+        page.contains(r#"tabindex="-1""#),
+        "focusable main content target missing"
+    );
+}
+
+#[tokio::test]
+async fn workspace_page_does_not_echo_c2_session_secret() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "workspace-secrets", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let app = authenticated_app(repo, operator).await;
+
+    let response = app
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    assert!(
+        !page.contains("session_key"),
+        "session key column name must never reach the operator page"
+    );
+    assert!(
+        !page.contains("test-session-key"),
+        "session key value must never reach the operator page"
+    );
+}
+
+async fn enrich_callback_metadata(
+    repo: &Repository,
+    session_id: &str,
+    last_seen: &str,
+    online: bool,
+) {
+    let capabilities = serde_json::to_string(&nw_profile::control::CallbackCapabilities {
+        process_browser: true,
+        file_browser: true,
+        file_transfer: true,
+        task_ack: true,
+    })
+    .unwrap();
+    sqlx::query(
+        "UPDATE callbacks SET os_version = ?, executable_path = ?, local_addr = ?, \
+         implant_version = ?, interval_ms = ?, jitter_ms = ?, last_seen = ?, \
+         capabilities_json = CASE WHEN ? = 1 THEN ? ELSE capabilities_json END \
+         WHERE id = ?",
+    )
+    .bind("6.8.0-arch1")
+    .bind("/opt/nw/implant")
+    .bind("10.0.0.5:42424")
+    .bind("1.2.3")
+    .bind(30_000i64)
+    .bind(1_000i64)
+    .bind(last_seen)
+    .bind(online)
+    .bind(&capabilities)
+    .bind(session_id)
+    .execute(&repo.pool)
+    .await
+    .unwrap();
+}
+
+async fn load_workspace_page() -> String {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "workspace-meta", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let app = authenticated_app(repo, operator).await;
+    let response = app
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
+}
+
+#[tokio::test]
+async fn workspace_metadata_renders_authoritative_values_and_liveness() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "workspace-meta-detail", Role::Operator).await;
+    let callback_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &callback_id).await;
+    let last_seen = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    enrich_callback_metadata(&repo, &callback_id, &last_seen, true).await;
+    let app = authenticated_app(repo, operator).await;
+    let response = app
+        .oneshot(
+            Request::get(format!("/callbacks/{callback_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+
+    assert!(
+        page.contains(r#"data-liveness>Online"#),
+        "online copy missing"
+    );
+    for marker in [
+        r#"data-metadata-value="callback-id""#,
+        r#">6.8.0-arch1<"#,
+        r#">/opt/nw/implant<"#,
+        r#">10.0.0.5:42424<"#,
+        r#">1.2.3<"#,
+        r#">30000<"#,
+        r#">1000<"#,
+    ] {
+        assert!(page.contains(marker), "metadata missing {marker}");
+    }
+    assert!(
+        page.contains(&format!(
+            r#"data-metadata-value="callback-id">{}<"#,
+            escape_test_html(&callback_id)
+        )),
+        "full callback id must render in metadata"
+    );
+    assert!(
+        !page.contains("session_key"),
+        "metadata tab must not expose session material"
+    );
+}
+
+fn escape_test_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[tokio::test]
+async fn workspace_metadata_shows_offline_for_stale_callback() {
+    let repo = test_repository().await;
+    let operator = create_user(&repo, "workspace-offline", Role::Operator).await;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    create_scoped_callback(&repo, &operator.id, &session_id).await;
+    let stale = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let last_seen = stale.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    enrich_callback_metadata(&repo, &session_id, &last_seen, false).await;
+    let app = authenticated_app(repo, operator).await;
+    let response = app
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    assert!(
+        page.contains(r#"data-liveness>Offline"#),
+        "offline copy missing"
+    );
+}
+
+#[tokio::test]
+async fn workspace_disables_controls_for_legacy_callback() {
+    let page = load_workspace_page().await;
+    assert!(
+        page.contains(r#"data-process-capable="false""#),
+        "legacy process capability"
+    );
+    assert!(
+        page.contains(r#"data-file-capable="false""#),
+        "legacy file capability"
+    );
+    assert!(
+        page.contains(r#"data-transfer-capable="false""#),
+        "legacy transfer capability"
+    );
+    assert!(
+        page.contains(r#"data-online="true""#),
+        "fresh legacy callback must surface online state"
+    );
+    assert_eq!(
+        page.matches("Transfer support is being initialized")
+            .count(),
+        2
+    );
 }

@@ -1,4 +1,13 @@
 .callback-tasking { display: grid; gap: 1rem; padding: 1.25rem; }
+.callback-tasking [data-tab-panel][hidden] { display: none !important; }
+.metadata-panel { display: grid; gap: 1rem; padding: 1.25rem; }
+.metadata-head h3 { margin: .15rem 0; }
+.metadata-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: .4rem 1.5rem; margin: 0; }
+.metadata-list > div { display: grid; gap: .1rem; padding-block: .45rem; border-bottom: 1px solid var(--border, #d8d7d2); }
+.metadata-list dt { color: var(--muted, #6d7178); font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; }
+.metadata-list dd { margin: 0; overflow-wrap: anywhere; }
+.metadata-list dd.status-success { color: var(--success, #2f9e68); }
+.metadata-list dd.status-neutral { color: var(--muted, #6d7178); }
 .callback-tasking-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
 .callback-tasking-title h3 { margin: .15rem 0; }
 .connection-label { display: block; color: var(--muted, #7b8089); font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; }
@@ -85,6 +94,7 @@
 .file-confirm button + button { margin-left: .5rem; }
 @media (max-width: 850px) {
   .task-filters { grid-template-columns: 1fr; }
+  .metadata-list { grid-template-columns: 1fr; }
   .session-context-wrap { position: static; }
   .callback-task-meta { grid-template-columns: 1fr; }
   .process-panel-head, .process-toolbar { align-items: stretch; flex-direction: column; }

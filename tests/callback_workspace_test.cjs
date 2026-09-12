@@ -28,6 +28,7 @@ class Element {
   remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this); }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
+  removeAttribute(name) { delete this.attributes[name]; }
   addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
   dispatch(type, values = {}) {
     const event = { target: this, preventDefault() { this.defaultPrevented = true; }, ...values };
@@ -36,8 +37,12 @@ class Element {
   }
   matches(selector) {
     if (selector.startsWith('[data-')) {
-      const key = selector.slice(6, -1).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-      return key in this.dataset;
+      const inner = selector.slice(1, -1);
+      const eq = inner.indexOf('=');
+      const key = (eq === -1 ? inner : inner.slice(0, eq)).slice('data-'.length).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      if (eq === -1) return key in this.dataset;
+      const expected = inner.slice(eq + 1).replace(/^"|"$/g, '');
+      return String(this.dataset[key]) === expected;
     }
     if (selector.startsWith('.')) return this.className.split(/\s+/).includes(selector.slice(1));
     if (selector.startsWith('#')) return this.attributes.id === selector.slice(1);
@@ -60,6 +65,7 @@ class Element {
     while (node) { if (node.matches(selector)) return node; node = node.parentNode; }
     return null;
   }
+  focus() { this.focused = true; }
 }
 
 const document = { createElement: tag => new Element(tag) };
@@ -67,6 +73,7 @@ const document = { createElement: tag => new Element(tag) };
 function skeleton() {
   const root = new Element('section');
   root.dataset.callbackTasking = '';
+  root.dataset.tabPanel = 'tasking';
   root.dataset.tasksEndpoint = '/api/callbacks/callback-1/tasks';
   root.dataset.eventsEndpoint = '/api/callbacks/callback-1/events';
   root.dataset.csrfToken = 'csrf';
@@ -74,6 +81,7 @@ function skeleton() {
   for (const key of ['taskList', 'taskEmpty', 'taskSearch', 'taskStateFilter', 'taskErrorFilter', 'loadOlder', 'connectionState', 'offlineQueue', 'commandInput', 'commandArguments', 'taskForm']) {
     const element = new Element(key === 'taskForm' ? 'form' : key.includes('Filter') ? 'select' : key.includes('Input') || key === 'taskSearch' || key === 'commandArguments' ? 'input' : 'div');
     element.dataset[key] = '';
+    if (key === 'offlineQueue') element.dataset.tabPanel = 'tasking';
     root.append(element);
   }
   for (const key of ['processPanel', 'processSearch', 'processTableBody', 'processEmpty', 'processSnapshotAge', 'processMessage', 'processRefresh', 'processDetail', 'processConfirm', 'processConfirmText', 'processConfirmSubmit', 'processConfirmCancel', 'processTaskLink']) {
@@ -84,6 +92,7 @@ function skeleton() {
   const processPanel = root.querySelector('[data-process-panel]');
   processPanel.dataset.processesEndpoint = '/api/callbacks/callback-1/processes';
   processPanel.dataset.processCapable = 'true';
+  processPanel.dataset.tabPanel = 'processes';
   const sortName = new Element('button');
   sortName.dataset.processSort = 'name';
   const sortPid = new Element('button');
@@ -103,12 +112,17 @@ function skeleton() {
   filePanel.dataset.fileCapable = 'true';
   filePanel.dataset.transferCapable = 'false';
   filePanel.dataset.defaultPath = '/';
+  filePanel.dataset.tabPanel = 'files';
+  const metadataPanel = new Element('section');
+  metadataPanel.dataset.metadataPanel = '';
+  metadataPanel.dataset.tabPanel = 'metadata';
+  root.append(metadataPanel);
   for (const key of ['name', 'size', 'modified_at']) {
     const sort = new Element('button');
     sort.dataset.fileSort = key;
     root.append(sort);
   }
-  for (const tab of ['tasking', 'processes', 'files']) {
+  for (const tab of ['tasking', 'processes', 'files', 'metadata']) {
     const link = new Element('a');
     link.dataset.callbackTab = tab;
     link.setAttribute('href', `?tab=${tab}`);
@@ -645,4 +659,102 @@ test('transfer SSE renders progress checksum and unsafe errors as text only', as
   const item = root.querySelector('[data-transfer-id]');
   assert.match(item.textContent, /50%.*deadbeef.*<script>alert\(1\)<\/script>/s);
   assert.equal(item.querySelector('script'), null);
+});
+
+test('tab selection from the URL shows only the requested panel', async () => {
+  const root = skeleton();
+  const deps = urlDependencies('/srv/lab');
+  deps.location.href = 'https://lab.test/callbacks/callback-1?tab=files';
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  assert.equal(root.querySelector('[data-offline-queue]').hidden, true, 'tasking panels must hide');
+  assert.equal(root.querySelector('[data-process-panel]').hidden, true);
+  assert.equal(root.querySelector('[data-metadata-panel]').hidden, true);
+  assert.equal(root.querySelector('[data-file-panel]').hidden, false);
+  const filesLink = root.querySelector('[data-callback-tab="metadata"]');
+  assert.equal(filesLink.dataset.callbackTab, 'metadata');
+  assert.equal(root.querySelector('[data-callback-tab="files"]').getAttribute('aria-current'), 'page');
+  assert.equal(root.querySelector('[data-callback-tab="metadata"]').getAttribute('aria-current'), null);
+});
+
+test('clicking a tab link switches panels and pushes URL state', async () => {
+  const root = skeleton();
+  const deps = urlDependencies('/srv/lab');
+  deps.location.href = 'https://lab.test/callbacks/callback-1';
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  assert.equal(root.querySelector('[data-offline-queue]').hidden, false, 'defaults to tasking');
+
+  root.querySelector('[data-callback-tab="processes"]').dispatch('click');
+  assert.equal(root.querySelector('[data-offline-queue]').hidden, true, 'tasking panels must hide');
+  assert.equal(root.querySelector('[data-process-panel]').hidden, false);
+  assert.equal(root.querySelector('[data-callback-tab="processes"]').getAttribute('aria-current'), 'page');
+  assert.deepEqual(deps.history.calls, ['?tab=processes']);
+
+  root.querySelector('[data-callback-tab="metadata"]').dispatch('click');
+  assert.equal(root.querySelector('[data-metadata-panel]').hidden, false);
+  assert.equal(root.querySelector('[data-process-panel]').hidden, true);
+  assert.equal(root.querySelector('[data-callback-tab="metadata"]').getAttribute('aria-current'), 'page');
+  assert.equal(root.querySelector('[data-callback-tab="processes"]').getAttribute('aria-current'), null);
+  assert.deepEqual(deps.history.calls, ['?tab=processes', '?tab=metadata']);
+});
+
+test('browser back restores the selected tab and its filesystem path', async () => {
+  const root = skeleton();
+  const deps = urlDependencies('/srv/lab');
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  root.querySelector('[data-callback-tab="metadata"]').dispatch('click');
+  assert.equal(root.querySelector('[data-callback-tab="metadata"]').getAttribute('aria-current'), 'page');
+  deps.location.href = 'https://lab.test/callbacks/callback-1?tab=files&path=%2Fsrv%2Farchive';
+  await deps.window.dispatch('popstate');
+  assert.equal(root.querySelector('[data-file-panel]').hidden, false);
+  assert.equal(root.querySelector('[data-callback-tab="files"]').getAttribute('aria-current'), 'page');
+  assert.equal(root.querySelector('[data-callback-tab="metadata"]').getAttribute('aria-current'), null);
+});
+
+test('opening a confirmation traps Enter and Escape closes with focus returned to the trigger', async () => {
+  const root = skeleton();
+  const deps = dependencies();
+  deps.fetch = async url => {
+    if (url.endsWith('/processes')) return { ok: true, json: async () => processSnapshot() };
+    if (url.includes('/files?')) return { ok: true, json: async () => null };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  const confirm = root.querySelector('[data-process-confirm]');
+  const row = root.querySelectorAll('[data-process-row]').find(candidate => candidate.dataset.processPid === '7331');
+  const kill = row.querySelector('[data-process-kill]');
+  root.querySelector('[data-process-table-body]').dispatch('click', { target: kill });
+  assert.equal(confirm.hidden, false);
+
+  const target = root.querySelector('[data-process-refresh]');
+  const enter = root.dispatch('keydown', { key: 'Enter', target });
+  assert.equal(enter.defaultPrevented, true, 'Enter must not reach obscured page controls');
+
+  const escape = root.dispatch('keydown', { key: 'Escape', target });
+  assert.equal(confirm.hidden, true, 'Escape must close the confirmation');
+  assert.equal(kill.focused, true, 'focus must return to the kill trigger');
+
+  const after = root.dispatch('keydown', { key: 'Enter', target });
+  assert.notEqual(after.defaultPrevented, true, 'Enter is allowed again once the dialog is closed');
+});
+
+test('Enter inside an open confirmation is not suppressed', async () => {
+  const root = skeleton();
+  const deps = dependencies();
+  deps.fetch = async url => {
+    if (url.endsWith('/processes')) return { ok: true, json: async () => processSnapshot() };
+    if (url.includes('/files?')) return { ok: true, json: async () => null };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  const confirm = root.querySelector('[data-process-confirm]');
+  const row = root.querySelectorAll('[data-process-row]').find(candidate => candidate.dataset.processPid === '7331');
+  root.querySelector('[data-process-table-body]').dispatch('click', { target: row.querySelector('[data-process-kill]') });
+  assert.equal(confirm.hidden, false);
+  const inside = root.dispatch('keydown', { key: 'Enter', target: confirm });
+  assert.notEqual(inside.defaultPrevented, true);
 });

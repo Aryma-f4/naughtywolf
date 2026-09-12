@@ -896,8 +896,15 @@ pub fn callback_detail_page(
         .collect::<Vec<_>>()
         .join("\n");
 
+    let online = callback.is_online(time::OffsetDateTime::now_utc());
+    let (live_label, live_cls) = if online {
+        ("Online", "success")
+    } else {
+        ("Offline", "neutral")
+    };
+
     let callback_detail = format!(
-        "<header class=\"callback-header\"><div class=\"callback-meta\"><p class=\"eyebrow\">INTERACT / {}</p><h2>{}</h2><p class=\"muted\">{}@{} &mdash; {} {}</p></div><div class=\"callback-header-actions\">{}<a class=\"btn btn-ghost\" href=\"/callbacks\">All callbacks</a></div></header>",
+        "<header class=\"callback-header\"><div class=\"callback-meta\"><p class=\"eyebrow\">INTERACT / {}</p><h2>{}</h2><p class=\"muted\">{}@{} &mdash; {} {}</p></div><div class=\"callback-header-actions\"><span class=\"status-pill status-{live_cls}\" data-liveness>{live_label}</span>{}<a class=\"btn btn-ghost\" href=\"/callbacks\">All callbacks</a></div></header>",
         escape_html(&callback.id[..callback.id.len().min(8)]),
         escape_html(&callback.host),
         escape_html(&callback.user_name),
@@ -921,7 +928,6 @@ pub fn callback_detail_page(
         escape_html(&callback.last_seen),
     );
 
-    let online = callback.is_online(time::OffsetDateTime::now_utc());
     let process_capable = callback
         .capabilities_json
         .as_ref()
@@ -937,6 +943,60 @@ pub fn callback_detail_page(
         .as_ref()
         .map(|capabilities| capabilities.file_transfer)
         .unwrap_or(false);
+    let metadata_capabilities = {
+        let flags = [
+            (
+                "Process control",
+                callback
+                    .capabilities_json
+                    .as_ref()
+                    .map(|c| c.process_browser)
+                    .unwrap_or(false),
+            ),
+            (
+                "Filesystem browser",
+                callback
+                    .capabilities_json
+                    .as_ref()
+                    .map(|c| c.file_browser)
+                    .unwrap_or(false),
+            ),
+            (
+                "File transfer",
+                callback
+                    .capabilities_json
+                    .as_ref()
+                    .map(|c| c.file_transfer)
+                    .unwrap_or(false),
+            ),
+            (
+                "Task acknowledgement",
+                callback
+                    .capabilities_json
+                    .as_ref()
+                    .map(|c| c.task_ack)
+                    .unwrap_or(false),
+            ),
+        ];
+        let names: Vec<&str> = flags
+            .iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(label, _)| *label)
+            .collect();
+        if names.is_empty() {
+            "None advertised".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    let metadata_interval_ms = callback
+        .interval_ms
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let metadata_jitter_ms = callback
+        .jitter_ms
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "—".to_string());
     let file_default_path = if callback.os.to_ascii_lowercase().contains("windows") {
         r"C:\"
     } else {
@@ -948,20 +1008,20 @@ pub fn callback_detail_page(
         "C%3A%5C"
     };
     let tasking_panel = format!(
-        r##"<section class="callback-tasking panel" data-callback-tasking data-live-output
+        r##"<section class="callback-tasking panel" data-callback-tasking data-live-output data-tab-panel="tasking"
           data-tasks-endpoint="/api/callbacks/{callback_id}/tasks"
           data-events-endpoint="/api/callbacks/{callback_id}/events"
           data-csrf-token="{csrf}" data-online="{online}">
           <header class="callback-tasking-title"><div><p class="eyebrow">TASKING / PERSISTENT LEDGER</p><h3>Tasking</h3><p>Authoritative callback history, reconciled after every connection.</p></div><div><span class="connection-label">Connection</span><span class="stream-state" data-connection-state role="status">Connecting</span></div></header>
-          <nav class="callback-tabs" aria-label="Callback workspace tabs"><a data-callback-tab="tasking" aria-current="page" href="?tab=tasking#tasking">Tasking</a><a data-callback-tab="processes" href="?tab=processes#processes">Processes</a><a data-callback-tab="files" href="?tab=files&amp;path={file_default_path_url}#files">Files</a><span>Metadata</span></nav>
+          <nav class="callback-tabs" aria-label="Callback workspace tabs"><a data-callback-tab="tasking" aria-current="page" href="?tab=tasking#tasking">Tasking</a><a data-callback-tab="processes" href="?tab=processes#processes">Processes</a><a data-callback-tab="files" href="?tab=files&amp;path={file_default_path_url}#files">Files</a><a data-callback-tab="metadata" href="?tab=metadata#metadata">Metadata</a></nav>
           <p class="offline-queue" data-offline-queue hidden></p>
-          <div class="task-filters">
+          <div class="task-filters" data-tab-panel="tasking">
             <label>Search task history<input type="search" data-task-search placeholder="Command, operator, or output"></label>
             <label>State<select data-task-state-filter><option value="">All states</option><option value="pending">Queued</option><option value="delivering">Delivering</option><option value="delivered">Delivered</option><option value="processing">Processing</option><option value="completed">Completed</option><option value="error">Error</option><option value="cancelled">Cancelled</option></select></label>
             <label>Errors<select data-task-error-filter><option value="">All output</option><option value="errors">Errors only</option></select></label>
           </div>
-          <div class="callback-console-grid"><aside class="session-context-wrap">{session_context}</aside><div class="task-timeline"><div class="task-empty" data-task-empty><strong>No task history yet</strong><p>Submit a command from the dock below.</p></div><div class="task-card-list" data-task-list></div><button class="btn btn-ghost load-older" type="button" data-load-older hidden>Load older</button></div></div>
-          <section id="processes" class="process-panel panel" data-process-panel data-processes-endpoint="/api/callbacks/{callback_id}/processes" data-process-capable="{process_capable}" data-process-online="{online}">
+          <div class="callback-console-grid" data-tab-panel="tasking"><aside class="session-context-wrap">{session_context}</aside><div class="task-timeline"><div class="task-empty" data-task-empty><strong>No task history yet</strong><p>Submit a command from the dock below.</p></div><div class="task-card-list" data-task-list></div><button class="btn btn-ghost load-older" type="button" data-load-older hidden>Load older</button></div></div>
+          <section id="processes" class="process-panel panel" data-process-panel data-tab-panel="processes" data-processes-endpoint="/api/callbacks/{callback_id}/processes" data-process-capable="{process_capable}" data-process-online="{online}">
             <header class="process-panel-head"><div><p class="eyebrow">PROCESS CONTROL / AUDITED</p><h3>Processes</h3><p>Latest structured snapshot from this callback.</p></div><div class="process-controls"><span data-process-snapshot-age>Loading snapshot…</span><button type="button" class="btn btn-ghost" data-process-refresh>Refresh</button></div></header>
             <p class="process-message" data-process-message role="status" aria-live="polite"></p>
             <div class="process-toolbar"><label>Search processes<input type="search" data-process-search placeholder="PID, name, executable, or user"></label><a data-process-task-link href="#tasking" hidden>Open control task in Tasking</a></div>
@@ -970,7 +1030,7 @@ pub fn callback_detail_page(
             <aside class="process-detail" data-process-detail aria-live="polite"><p>Select a process to inspect its latest values.</p></aside>
             <div class="process-confirm" data-process-confirm hidden role="dialog" aria-modal="true" aria-labelledby="process-confirm-title"><h4 id="process-confirm-title">Confirm process termination</h4><p data-process-confirm-text></p><button type="button" class="btn btn-ghost" data-process-confirm-cancel>Cancel</button><button type="button" class="btn btn-danger" data-process-confirm-submit>Terminate exact PID</button></div>
           </section>
-          <section id="files" class="file-panel panel" data-file-panel data-files-endpoint="/api/callbacks/{callback_id}/files" data-transfers-endpoint="/api/callbacks/{callback_id}/transfers" data-file-capable="{file_capable}" data-transfer-capable="{transfer_capable}" data-default-path="{file_default_path}">
+          <section id="files" class="file-panel panel" data-file-panel data-tab-panel="files" data-files-endpoint="/api/callbacks/{callback_id}/files" data-transfers-endpoint="/api/callbacks/{callback_id}/transfers" data-file-capable="{file_capable}" data-transfer-capable="{transfer_capable}" data-default-path="{file_default_path}">
             <header class="file-panel-head"><div><p class="eyebrow">FILESYSTEM CONTROL / AUDITED</p><h3>Files</h3><p>Latest structured directory snapshot from this callback.</p></div><div class="file-controls"><span data-file-snapshot-age>Loading snapshot…</span><button type="button" class="btn btn-ghost" data-file-refresh>Refresh</button></div></header>
             <p class="file-message" data-file-message role="status" aria-live="polite"></p>
             <form class="file-path-form" data-file-path-form><button type="button" class="btn btn-ghost" data-file-parent aria-label="Open parent directory">Parent</button><label class="sr-only" for="callback-file-path">Remote path</label><input id="callback-file-path" type="text" data-file-path autocomplete="off" required><button type="submit" class="btn btn-ghost">Open path</button></form>
@@ -981,6 +1041,28 @@ pub fn callback_detail_page(
             <div class="table-scroll"><table class="data-table file-table"><caption class="sr-only">Callback filesystem</caption><thead><tr><th><button type="button" data-file-sort="name">Name</button></th><th><button type="button" data-file-sort="kind">Kind</button></th><th><button type="button" data-file-sort="size">Size</button></th><th><button type="button" data-file-sort="modified_at">Modified</button></th><th><button type="button" data-file-sort="permissions">Permissions</button></th><th><button type="button" data-file-sort="owner">Owner</button></th><th>Actions</th></tr></thead><tbody data-file-table-body></tbody></table></div>
             <p class="file-empty" data-file-empty hidden>No entries are available for this directory snapshot.</p>
             <div class="file-confirm" data-file-confirm hidden role="dialog" aria-modal="true" aria-labelledby="file-confirm-title"><h4 id="file-confirm-title">Confirm exact filesystem target</h4><p data-file-confirm-text></p><div data-file-move-fields hidden><label>Exact destination<input type="text" data-file-move-destination autocomplete="off"></label></div><div data-file-delete-fields hidden><label><input type="checkbox" data-file-delete-recursive> Delete directory contents recursively</label></div><button type="button" class="btn btn-ghost" data-file-confirm-cancel>Cancel</button><button type="button" class="btn btn-danger" data-file-confirm-submit>Queue exact action</button></div>
+          </section>
+          <section id="metadata" class="metadata-panel panel" data-metadata-panel data-tab-panel="metadata">
+            <header class="metadata-head"><div><p class="eyebrow">IMPLANT / AGENT IDENTITY</p><h3>Metadata</h3><p>Authoritative values captured from the last session handshake.</p></div></header>
+            <dl class="metadata-list">
+              <div><dt>Callback ID</dt><dd data-metadata-value="callback-id">{metadata_callback_id}</dd></div>
+              <div><dt>Host</dt><dd data-metadata-value="host">{metadata_host}</dd></div>
+              <div><dt>User</dt><dd data-metadata-value="user">{metadata_user}</dd></div>
+              <div><dt>Process</dt><dd data-metadata-value="process">{metadata_process}</dd></div>
+              <div><dt>OS</dt><dd data-metadata-value="os">{metadata_os}</dd></div>
+              <div><dt>OS version</dt><dd data-metadata-value="os-version">{metadata_os_version}</dd></div>
+              <div><dt>Architecture</dt><dd data-metadata-value="arch">{metadata_arch}</dd></div>
+              <div><dt>Executable path</dt><dd data-metadata-value="executable-path">{metadata_executable}</dd></div>
+              <div><dt>Local address</dt><dd data-metadata-value="local-addr">{metadata_local_addr}</dd></div>
+              <div><dt>Implant version</dt><dd data-metadata-value="implant-version">{metadata_implant_version}</dd></div>
+              <div><dt>Beacon interval (ms)</dt><dd data-metadata-value="interval-ms">{metadata_interval_ms}</dd></div>
+              <div><dt>Beacon jitter (ms)</dt><dd data-metadata-value="jitter-ms">{metadata_jitter_ms}</dd></div>
+              <div><dt>Protocol</dt><dd data-metadata-value="protocol">{metadata_protocol}</dd></div>
+              <div><dt>Registered</dt><dd data-metadata-value="registered-at">{metadata_registered}</dd></div>
+              <div><dt>Last check-in</dt><dd data-metadata-value="last-seen">{metadata_last_seen}</dd></div>
+              <div><dt>Capabilities</dt><dd data-metadata-value="capabilities">{metadata_capabilities}</dd></div>
+              <div><dt>Liveness</dt><dd data-metadata-value="liveness" class="status-{live_cls}">{live_label}</dd></div>
+            </dl>
           </section>
           <noscript><section class="task-history-panel">{rows}</section><section id="task-results">{persisted_output}</section></noscript>
           <div class="command-dock panel"><div class="command-dock-label"><span aria-hidden="true">&gt;_</span><div><strong>Task this callback</strong><small>Use ↑ and ↓ for persisted command history</small></div></div>
@@ -1006,6 +1088,40 @@ pub fn callback_detail_page(
         },
         file_default_path = escape_html(file_default_path),
         file_default_path_url = file_default_path_url,
+        metadata_callback_id = escape_html(&callback.id),
+        metadata_host = escape_html(&callback.host),
+        metadata_user = escape_html(&callback.user_name),
+        metadata_process = escape_html(&callback.process),
+        metadata_os = escape_html(&callback.os),
+        metadata_os_version = callback
+            .os_version
+            .as_ref()
+            .map(|v| escape_html(v))
+            .unwrap_or_else(|| "—".to_string()),
+        metadata_arch = escape_html(&callback.arch),
+        metadata_executable = callback
+            .executable_path
+            .as_ref()
+            .map(|v| escape_html(v))
+            .unwrap_or_else(|| "—".to_string()),
+        metadata_local_addr = callback
+            .local_addr
+            .as_ref()
+            .map(|v| escape_html(v))
+            .unwrap_or_else(|| "—".to_string()),
+        metadata_implant_version = callback
+            .implant_version
+            .as_ref()
+            .map(|v| escape_html(v))
+            .unwrap_or_else(|| "—".to_string()),
+        metadata_interval_ms = metadata_interval_ms,
+        metadata_jitter_ms = metadata_jitter_ms,
+        metadata_protocol = escape_html(&callback.protocol.to_uppercase()),
+        metadata_registered = escape_html(&callback.created_at),
+        metadata_last_seen = escape_html(&callback.last_seen),
+        metadata_capabilities = escape_html(&metadata_capabilities),
+        live_label = live_label,
+        live_cls = live_cls,
         session_context = session_context,
         rows = rows,
         persisted_output = persisted_output,

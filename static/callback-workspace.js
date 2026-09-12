@@ -83,14 +83,48 @@
       if (!browserLocation?.href) return "tasking";
       try {
         const value = new URL(browserLocation.href).searchParams.get("tab");
-        return ["tasking", "processes", "files"].includes(value) ? value : "tasking";
+        return ["tasking", "processes", "files", "metadata"].includes(value) ? value : "tasking";
       } catch (_) {
         return "tasking";
       }
     })();
-    root.querySelectorAll?.("[data-callback-tab]").forEach(link => {
-      link.setAttribute("aria-current", link.dataset.callbackTab === selectedTab ? "page" : "false");
-    });
+
+    const tabLinks = Array.from(root.querySelectorAll?.("[data-callback-tab]") || []);
+    const tabPanels = Array.from(root.querySelectorAll?.("[data-tab-panel]") || []);
+    let openDialog = null;
+    let dialogTrigger = null;
+
+    const switchTab = (tab, { push = true, fromHref = null } = {}) => {
+      if (!["tasking", "processes", "files", "metadata"].includes(tab)) return;
+      tabPanels.forEach(panel => { panel.hidden = panel.dataset.tabPanel !== tab; });
+      tabLinks.forEach(link => {
+        const active = link.dataset.callbackTab === tab;
+        if (active) link.setAttribute("aria-current", "page");
+        else link.removeAttribute?.("aria-current");
+      });
+      if (push && browserHistory?.pushState) {
+        browserHistory.pushState({}, "", fromHref || `?tab=${tab}`);
+      }
+    };
+
+    const containsNode = (ancestor, node) => {
+      for (let current = node; current; current = current.parentNode) {
+        if (current === ancestor) return true;
+      }
+      return false;
+    };
+
+    const closeDialog = () => {
+      if (openDialog) openDialog.hidden = true;
+      openDialog = null;
+      if (dialogTrigger?.focus) dialogTrigger.focus();
+      dialogTrigger = null;
+    };
+
+    const registerDialog = (dialog, trigger) => {
+      openDialog = dialog;
+      dialogTrigger = trigger;
+    };
 
     const parseRemotePath = value => {
       if (typeof value !== "string" || !value || value.includes("\0")) return null;
@@ -375,14 +409,17 @@
       }
     };
 
-    const openFileConfirmation = action => {
+    const openFileConfirmation = (action, trigger = null) => {
       pendingFileAction = action;
       if (fileMoveFields) fileMoveFields.hidden = action.kind !== "move";
       if (fileDeleteFields) fileDeleteFields.hidden = action.kind !== "delete";
       if (action.kind === "move" && fileMoveDestination) fileMoveDestination.value = action.source;
       if (action.kind === "delete" && fileDeleteRecursive) fileDeleteRecursive.checked = false;
       updateFileConfirmation();
-      if (fileConfirm) fileConfirm.hidden = false;
+      if (fileConfirm) {
+        fileConfirm.hidden = false;
+        registerDialog(fileConfirm, trigger);
+      }
     };
 
     const restoreFileLocation = async () => {
@@ -390,9 +427,7 @@
       try {
         const url = new URL(browserLocation.href);
         const path = normalizeRemotePath(url.searchParams.get("path") || "");
-        root.querySelectorAll?.("[data-callback-tab]").forEach(link => {
-          link.setAttribute("aria-current", link.dataset.callbackTab === url.searchParams.get("tab") ? "page" : "false");
-        });
+        switchTab(url.searchParams.get("tab") || "tasking", { push: false });
         if (path && path !== currentFilePath) await navigateFiles(path, false);
       } catch (_) { /* ignore malformed browser history entries */ }
     };
@@ -732,6 +767,7 @@
       if (kill && processConfirm && processConfirmText) {
         processConfirmText.textContent = `Terminate ${unavailable(process.name)} (PID ${process.pid})? This exact process will be targeted.`;
         processConfirm.hidden = false;
+        registerDialog(processConfirm, kill);
       }
     });
     processRefresh?.addEventListener("click", async () => {
@@ -759,7 +795,7 @@
       }
     });
     processConfirmCancel?.addEventListener("click", () => {
-      if (processConfirm) processConfirm.hidden = true;
+      closeDialog();
       selectedProcess = null;
     });
     processConfirmSubmit?.addEventListener("click", async () => {
@@ -781,7 +817,7 @@
           processTaskLink.hidden = false;
         }
         if (processMessage) processMessage.textContent = `Kill task ${task.id} queued; the table refreshes after successful completion.`;
-        if (processConfirm) processConfirm.hidden = true;
+        closeDialog();
         selectedProcess = null;
       } catch (_) {
         if (processMessage) processMessage.textContent = "Unable to queue process kill; check callback scope and connection.";
@@ -824,9 +860,9 @@
           if (fileMessage) fileMessage.textContent = "Unable to queue download; check callback scope and retry.";
         }
       } else if (event.target.closest?.("[data-file-move]")) {
-        openFileConfirmation({ kind: "move", source: row.dataset.filePath });
+        openFileConfirmation({ kind: "move", source: row.dataset.filePath }, event.target);
       } else if (event.target.closest?.("[data-file-delete]")) {
-        openFileConfirmation({ kind: "delete", path: row.dataset.filePath });
+        openFileConfirmation({ kind: "delete", path: row.dataset.filePath }, event.target);
       } else if (row.dataset.fileKind === "directory") {
         await navigateFiles(row.dataset.filePath);
       }
@@ -850,13 +886,13 @@
         if (fileMessage) fileMessage.textContent = "Directory name must be one path component.";
         return;
       }
-      openFileConfirmation({ kind: "mkdir", path });
+      openFileConfirmation({ kind: "mkdir", path }, fileMkdirName);
     });
     fileMoveDestination?.addEventListener("input", updateFileConfirmation);
     fileDeleteRecursive?.addEventListener("change", updateFileConfirmation);
     fileConfirmCancel?.addEventListener("click", () => {
       pendingFileAction = null;
-      if (fileConfirm) fileConfirm.hidden = true;
+      closeDialog();
     });
     fileConfirmSubmit?.addEventListener("click", async () => {
       if (!pendingFileAction || fileConfirmSubmit.disabled) return;
@@ -881,7 +917,7 @@
       try {
         const task = await queueFilesystemTask(route, body);
         if (fileMessage) fileMessage.textContent = `Filesystem ${route} task ${task.id} queued.`;
-        if (fileConfirm) fileConfirm.hidden = true;
+        closeDialog();
         pendingFileAction = null;
         if (fileMkdirName) fileMkdirName.value = "";
       } catch (_) {
@@ -924,6 +960,21 @@
     fileDownload?.addEventListener("click", () => {
       if (fileMessage) fileMessage.textContent = "Choose Download beside an exact remote file.";
     });
+    tabLinks.forEach(link => {
+      link.addEventListener("click", event => {
+        event.preventDefault();
+        switchTab(link.dataset.callbackTab, { fromHref: link.getAttribute("href") || `?tab=${link.dataset.callbackTab}` });
+      });
+    });
+    root.addEventListener?.("keydown", event => {
+      if (event.key === "Escape" && openDialog) {
+        closeDialog();
+        return;
+      }
+      if (event.key === "Enter" && openDialog && event.target && !containsNode(openDialog, event.target)) {
+        event.preventDefault();
+      }
+    });
     browserEvents?.addEventListener?.("popstate", restoreFileLocation);
 
     if (offlineQueue) {
@@ -957,6 +1008,7 @@
         fileMessage.textContent = "Callback is offline. Filesystem tasks remain queued until its next check-in.";
       }
     }
+    switchTab(selectedTab, { push: false });
     setConnection("Connecting");
     const ready = loadPage()
       .then(() => {

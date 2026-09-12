@@ -36,7 +36,7 @@ The portal callback routes (`/c2/register` and `/c2/poll`) and the native endpoi
 - **Interactive topology:** map operations, assets, registered callbacks, and saved DNS observations. Search, filter, pan, zoom, inspect nodes, or switch to a list.
 - **Integrated reconnaissance:** run DNS or DNS + HTTP/TLS observations against a selected active asset. Results persist in check history, enrich the topology, and leave an audit trail.
 - **Payload creation studio:** configure target, callback, and beacon timing in a four-step wizard, review the non-secret profile, then build or edit native artifacts.
-- **Active callback workspace:** scan session health from a compact status board, open a callback, and keep task history, live output, session context, and the command dock in one view.
+- **Active callback workspace:** scan session health from a compact status board, open a callback, and keep task history, live output, session context, and the command dock in one view. Tabbed Tasking / Processes / Files / Metadata sections keep their place through back/forward navigation, and offline callbacks queue new tasks until their next check-in.
 - **Evidence and reporting:** inspect stored artifacts and produce printable operation summaries.
 - **Traceability:** an append-only audit trail records operation, asset, and account changes.
 - **Local access control:** Admin, Operator, and Viewer roles, password hashing, signed sessions, and CSRF-protected forms.
