@@ -914,22 +914,23 @@ pub fn callback_detail_page(
     };
 
     let callback_detail = format!(
-        "<header class=\"callback-header\"><div class=\"callback-meta\"><p class=\"eyebrow\">INTERACT / {}</p><h2>{}</h2><p class=\"muted\">{}@{} &mdash; {} {}</p></div><div class=\"callback-header-actions\"><span class=\"status-pill status-{live_cls}\" data-liveness>{live_label}</span>{}<a class=\"btn btn-ghost\" href=\"/callbacks\">All callbacks</a></div></header>",
+        "<header class=\"callback-header\"><div class=\"callback-meta\"><p class=\"eyebrow\">INTERACT / {}</p><h2>{}</h2><p class=\"muted\">{}@{} &mdash; {} {}</p></div><div class=\"callback-header-actions\"><span class=\"status-pill status-{live_cls}\" data-liveness>{live_label}</span><a class=\"btn btn-ghost\" href=\"/callbacks\">All callbacks</a></div></header>",
         escape_html(&callback.id[..callback.id.len().min(8)]),
         escape_html(&callback.host),
         escape_html(&callback.user_name),
         escape_html(&callback.host),
         escape_html(&callback.os),
         escape_html(&callback.arch),
-        {
-            let (label, cls) = callback_status(callback.status);
-            format!("<span class=\"status-pill status-{cls}\">{}</span>", label)
-        }
     );
 
     let session_context = format!(
-        "<aside class=\"session-context panel\"><p class=\"eyebrow\">Session context</p><dl><div><dt>Host</dt><dd>{}</dd></div><div><dt>User</dt><dd>{}</dd></div><div><dt>Process</dt><dd>{}</dd></div><div><dt>Platform</dt><dd>{} / {}</dd></div><div><dt>Protocol</dt><dd>{}</dd></div><div><dt>Last check-in</dt><dd>{}</dd></div></dl><a href=\"/topology\">Locate in topology ↗</a></aside>",
+        "<aside class=\"session-context panel\"><p class=\"eyebrow\">Session context</p><dl><div><dt>Host</dt><dd>{}</dd></div><div><dt>Address</dt><dd>{}</dd></div><div><dt>User</dt><dd>{}</dd></div><div><dt>Process</dt><dd>{}</dd></div><div><dt>Platform</dt><dd>{} / {}</dd></div><div><dt>Protocol</dt><dd>{}</dd></div><div><dt>Last check-in</dt><dd>{}</dd></div></dl><a href=\"/topology\">Locate in topology ↗</a></aside>",
         escape_html(&callback.host),
+        callback
+            .local_addr
+            .as_deref()
+            .map(escape_html)
+            .unwrap_or_else(|| "—".into()),
         escape_html(&callback.user_name),
         escape_html(&callback.process),
         escape_html(&callback.os),
@@ -1192,29 +1193,48 @@ pub fn event_feed_page(user: &AuthenticatedUser, events: &[AuditEvent]) -> Strin
     app_page("Event Feed", user, "events", &format!("{}{}", chat, rows))
 }
 
-pub fn callbacks_page(user: &AuthenticatedUser, callbacks: &[Callback]) -> String {
-    let count = |status| callbacks.iter().filter(|c| c.status == status).count();
-    let active = count(CallbackStatus::Active);
-    let beacon = count(CallbackStatus::Beacon);
-    let dormant = count(CallbackStatus::Dormant);
-    let lost = count(CallbackStatus::Lost);
+pub fn callbacks_page(
+    user: &AuthenticatedUser,
+    callbacks: &[Callback],
+    csrf_token: &str,
+) -> String {
+    let now = time::OffsetDateTime::now_utc();
+    let active = callbacks.iter().filter(|c| c.is_online(now)).count();
+    let offline = callbacks.len() - active;
     let rows = callbacks
         .iter()
         .map(|c| {
-            let (status_label, status_class) = callback_status(c.status);
+            let online = c.is_online(now);
+            let (status_label, status_class) = if online {
+                ("Active", "success")
+            } else {
+                ("Offline", "neutral")
+            };
             let status = status_pill(status_label, status_class);
-            format!(
-                "<tr class=\"callback-row status-{status_class}\"><td><span class=\"callback-host\"><i aria-hidden=\"true\"></i><strong>{}</strong></span></td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/callbacks/{}\" class=\"btn btn-sm btn-ghost\">Interact &rarr;</a></td></tr>",
+            let address = c
+                .local_addr
+                .as_deref()
+                .map(escape_html)
+                .unwrap_or_else(|| "&mdash;".into());
+            let delete = format!(
+                "<form method=\"post\" action=\"/callbacks/{}/delete\" class=\"callback-delete\" onsubmit=\"return confirm('Delete callback and its full tasking history? This cannot be undone.');\"><input type=\"hidden\" name=\"csrf_token\" value=\"{}\"><button type=\"submit\" class=\"btn btn-sm btn-danger\">Delete</button></form>",
+                escape_html(&c.id),
+                escape_html(csrf_token),
+            );
+format!(
+                "<tr class=\"callback-row status-{status_class}\"><td><span class=\"callback-host\"><i aria-hidden=\"true\"></i><strong>{}</strong></span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/callbacks/{}\" class=\"btn btn-sm btn-ghost\">Interact &rarr;</a>{}</td></tr>",
                 escape_html(&c.host),
                 escape_html(&c.user_name),
                 escape_html(&c.process),
                 escape_html(&format!("{}/{}", c.os, c.arch)),
+                address,
                 escape_html(&c.protocol),
                 status,
                 escape_html(&c.last_seen),
                 c.operation_id.as_deref().map(|id| format!("<code>{}</code>", escape_html(&id[..id.len().min(8)]))).unwrap_or_else(|| "&mdash;".into()),
                 escape_html(&c.created_at),
                 escape_html(&c.id),
+                delete,
             )
         })
         .collect::<String>();
@@ -1222,17 +1242,18 @@ pub fn callbacks_page(user: &AuthenticatedUser, callbacks: &[Callback]) -> Strin
         "<section class=\"empty-state panel callback-empty\"><span class=\"empty-callback-icon\" aria-hidden=\"true\">ϟ</span><h2>No callbacks in view.</h2><p>Create a compatible native payload and run it on an authorized lab host to see sessions here.</p><a class=\"button\" href=\"/payloads\">Create payload ↗</a></section>".to_owned()
     } else {
         format!(
-            "<div class=\"callback-table-shell panel\"><div class=\"table-scroll\"><table class=\"data-table callbacks-table\"><caption>Active callbacks</caption><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">User</th><th scope=\"col\">Process</th><th scope=\"col\">OS / Arch</th><th scope=\"col\">Protocol</th><th scope=\"col\">State</th><th scope=\"col\">Last check-in</th><th scope=\"col\">Operation</th><th scope=\"col\">First seen</th><th scope=\"col\"><span class=\"sr-only\">Action</span></th></tr></thead><tbody>{rows}</tbody></table></div></div>"
+            "<div class=\"callback-table-shell panel\"><div class=\"table-scroll\"><table class=\"data-table callbacks-table\"><caption>Callbacks</caption><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">User</th><th scope=\"col\">Process</th><th scope=\"col\">OS / Arch</th><th scope=\"col\">Address</th><th scope=\"col\">Protocol</th><th scope=\"col\">State</th><th scope=\"col\">Last check-in</th><th scope=\"col\">Operation</th><th scope=\"col\">First seen</th><th scope=\"col\"><span class=\"sr-only\">Action</span></th></tr></thead><tbody>{rows}</tbody></table></div></div>"
         )
     };
     app_page(
-        "Active Callbacks",
+        "Callbacks",
         user,
         "callbacks",
         &format!(
-            "<section class=\"callback-workspace\" data-callback-workspace><header class=\"callback-workspace-head\"><div><p class=\"eyebrow\">SESSION BOARD / LIVE INVENTORY</p><h2>Every callback.<br><em>Ready to inspect.</em></h2><p>Registered sessions, their current state, and the operation context behind each connection.</p></div><div class=\"callback-workspace-actions\"><a class=\"btn btn-ghost\" href=\"/topology\">Open topology</a><a class=\"button\" href=\"/payloads\">Create payload <span aria-hidden=\"true\">↗</span></a></div></header><div class=\"callback-summary\" data-callback-summary><article><span>Total sessions</span><strong>{total:02}</strong><small>Registered callbacks</small></article><article class=\"summary-active\"><span>Active</span><strong>{active:02}</strong><small>Connected now</small></article><article><span>Beaconing</span><strong>{beacon:02}</strong><small>Periodic check-in</small></article><article><span>Dormant / lost</span><strong>{inactive:02}</strong><small>Needs attention</small></article></div>{table}</section>",
+            "<section class=\"callback-workspace\" data-callback-workspace><header class=\"callback-workspace-head\"><div><p class=\"eyebrow\">SESSION BOARD / LIVE INVENTORY</p><h2>Every callback.<br><em>Ready to inspect.</em></h2><p>Registered sessions, their current state, and the operation context behind each connection.</p></div><div class=\"callback-workspace-actions\"><a class=\"btn btn-ghost\" href=\"/topology\">Open topology</a><a class=\"button\" href=\"/payloads\">Create payload <span aria-hidden=\"true\">↗</span></a></div></header><div class=\"callback-summary\" data-callback-summary><article><span>Total sessions</span><strong>{total:02}</strong><small>Registered callbacks</small></article><article class=\"summary-active\"><span>Active</span><strong>{active:02}</strong><small>Checked in recently</small></article><article><span>Offline</span><strong>{offline:02}</strong><small>No recent check-in</small></article></div>{table}</section>",
             total = callbacks.len(),
-            inactive = dormant + lost,
+            active = active,
+            offline = offline,
         ),
     )
 }

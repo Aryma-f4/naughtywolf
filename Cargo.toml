@@ -86,6 +86,7 @@ reqwest = { workspace = true, features = ["rustls-tls", "multipart"] }
 [dev-dependencies]
 tempfile.workspace = true
 nw-implant = { path = "crates/implant" }
+time = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }

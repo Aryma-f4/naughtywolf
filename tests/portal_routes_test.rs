@@ -662,35 +662,66 @@ fn callbacks_page_presents_active_session_workspace() {
         username: "op-user".into(),
         role: Role::Operator,
     };
-    let callbacks = vec![Callback {
-        id: "callback-1".into(),
-        asset_id: Some("asset-1".into()),
-        operation_id: Some("operation-1".into()),
-        host: "LAB-WS-01".into(),
-        user_name: "analyst".into(),
-        process: "nw-implant".into(),
-        arch: "amd64".into(),
-        os: "linux".into(),
-        os_version: None,
-        executable_path: None,
-        local_addr: None,
-        implant_version: None,
-        interval_ms: None,
-        jitter_ms: None,
-        capabilities_json: None,
-        protocol: "http".into(),
-        status: CallbackStatus::Active,
-        last_seen: "2026-09-09T10:00:00Z".into(),
-        created_at: "2026-09-09T09:00:00Z".into(),
-    }];
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let callbacks = vec![
+        Callback {
+            id: "callback-1".into(),
+            asset_id: Some("asset-1".into()),
+            operation_id: Some("operation-1".into()),
+            host: "LAB-WS-01".into(),
+            user_name: "analyst".into(),
+            process: "nw-implant".into(),
+            arch: "amd64".into(),
+            os: "linux".into(),
+            os_version: None,
+            executable_path: None,
+            local_addr: Some("192.0.2.10".into()),
+            implant_version: None,
+            interval_ms: None,
+            jitter_ms: None,
+            capabilities_json: None,
+            protocol: "http".into(),
+            status: CallbackStatus::Active,
+            last_seen: now.clone(),
+            created_at: "2026-09-09T09:00:00Z".into(),
+        },
+        Callback {
+            id: "callback-2".into(),
+            asset_id: None,
+            operation_id: None,
+            host: "STALE-HOST".into(),
+            user_name: "analyst".into(),
+            process: "nw-implant".into(),
+            arch: "amd64".into(),
+            os: "linux".into(),
+            os_version: None,
+            executable_path: None,
+            local_addr: None,
+            implant_version: None,
+            interval_ms: None,
+            jitter_ms: None,
+            capabilities_json: None,
+            protocol: "http".into(),
+            status: CallbackStatus::Active,
+            last_seen: "2026-09-09T10:00:00Z".into(),
+            created_at: "2026-09-09T09:00:00Z".into(),
+        },
+    ];
 
-    let body = templates::callbacks_page(&user, &callbacks);
+    let body = templates::callbacks_page(&user, &callbacks, "csrf-token");
 
     assert!(body.contains("data-callback-workspace"));
     assert!(body.contains("data-callback-summary"));
     assert!(body.contains("class=\"callback-row"));
     assert!(body.contains("href=\"/payloads\""));
-    assert!(body.contains("Active Callbacks"));
+    assert!(body.contains("192.0.2.10"));
+    assert!(body.contains("class=\"status-pill status-success\""));
+    assert!(body.contains("class=\"status-pill status-neutral\""));
+    assert!(body.contains("action=\"/callbacks/callback-1/delete\""));
+    assert!(body.contains("action=\"/callbacks/callback-2/delete\""));
+    assert!(body.contains(">Callbacks<"));
 }
 
 #[test]
@@ -1025,6 +1056,99 @@ async fn payload_feature_routes_require_a_non_viewer_role() {
             "{path} not open to operator"
         );
     }
+}
+
+#[tokio::test]
+async fn operator_deletes_callback_in_their_operation_with_audit() {
+    let repository = test_repository().await;
+    let operator = create_user(&repository, "op", Role::Operator).await;
+    let op_id = "operation-1";
+    sqlx::query("INSERT INTO operations (id, name, purpose) VALUES (?, 'op-1', 'p')")
+        .bind(op_id)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO operation_members (operation_id, user_id) VALUES (?, ?)")
+        .bind(op_id)
+        .bind(&operator.id)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+    for (id, host, addr) in [
+        ("cb-mine", "HOST-1", "10.0.0.9"),
+        ("cb-other", "HOST-2", "10.0.0.10"),
+    ] {
+        sqlx::query("INSERT INTO callbacks (id, operation_id, host, user_name, os, arch, process, protocol, status, session_key, last_seen) VALUES (?, ?, ?, 'root', 'linux', 'x86_64', 'nw-implant', 'http', 'active', 'k', strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+            .bind(id)
+            .bind(if id == "cb-mine" { op_id } else { "other-operation" })
+            .bind(host)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO c2_sessions (id, hostname, username, os, arch, pid, addr, session_key, last_seen) VALUES (?, ?, 'root', 'linux', 'x86_64', 1, ?, X'00', strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+            .bind(id)
+            .bind(host)
+            .bind(addr)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO c2_tasks (id, session_id, command, args_json, timeout_ms, status) VALUES ('t-1','cb-mine','nw/echo','[]',30000,'pending')")
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+
+    let app = app_with_user_and_repository(repository.clone(), operator).await;
+    let list_page = app
+        .clone()
+        .oneshot(Request::get("/callbacks").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let list = body_string(list_page).await;
+    let token = csrf_token(&list);
+
+    // both render paths; non-member callbacks stay hidden
+    assert!(list.contains("action=\"/callbacks/cb-mine/delete\""));
+    assert!(!list.contains("cb-other"));
+
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/callbacks/cb-mine/delete",
+            format!("csrf_token={token}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/callbacks");
+
+    let foreign = app
+        .oneshot(post_form(
+            "/callbacks/cb-other/delete",
+            format!("csrf_token={token}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM callbacks WHERE id = 'cb-mine'")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    let remaining_tasks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM c2_tasks WHERE session_id = 'cb-mine'")
+            .fetch_one(&repository.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining_tasks, 0);
+    let action: String = sqlx::query_scalar(
+        "SELECT action FROM audit_events WHERE target_type = 'callback' AND target_id = 'cb-mine'",
+    )
+    .fetch_one(&repository.pool)
+    .await
+    .unwrap();
+    assert_eq!(action, "callback.deleted");
 }
 
 #[tokio::test]

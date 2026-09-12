@@ -139,6 +139,7 @@ pub fn authenticated_router_with_transfer_limit(max_transfer_bytes: u64) -> Rout
         .route("/payloads/edit/{file}", get(edit_payload))
         .route("/callbacks", get(callbacks))
         .route("/callbacks/{session_id}", get(callback_detail))
+        .route("/callbacks/{session_id}/delete", post(delete_callback))
         .route("/eventing", get(eventing).post(create_event_rule))
         .route("/events", get(events_feed))
         .route("/services", get(services))
@@ -690,12 +691,62 @@ fn content_disposition(
 async fn callbacks(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repository): State<Repository>,
+    session: Session,
 ) -> Result<Html<String>, AppError> {
     user.require(Role::Operator)?;
     let callbacks = repository
         .list_callbacks_visible_to(&user.id, user.role == Role::Admin)
         .await?;
-    Ok(Html(templates::callbacks_page(&user, &callbacks)))
+    let csrf_token = issue_csrf_token(&session).await?;
+    Ok(Html(templates::callbacks_page(
+        &user,
+        &callbacks,
+        &csrf_token,
+    )))
+}
+
+#[derive(Default, Deserialize)]
+struct CallbackDeleteForm {
+    #[serde(default)]
+    csrf_token: Option<String>,
+}
+
+/// Delete a callback and its workspace history. Authorized the same way the
+/// callback is visible: admins see all, operators must be members of the
+/// callback's operation.
+async fn delete_callback(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(session_id): Path<String>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let callback = repository
+        .find_callback_visible_to(&session_id, &user.id, user.role == Role::Admin)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let form = match Form::<CallbackDeleteForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return Err(AppError::Validation(
+                "delete request must carry a CSRF token".to_owned(),
+            ));
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await? {
+        return Err(AppError::Validation("The request is invalid.".to_owned()));
+    }
+    let correlation_id = Uuid::new_v4().to_string();
+    repository
+        .delete_callback_with_audit(
+            &session_id,
+            &user.id,
+            &correlation_id,
+            callback.operation_id.as_deref(),
+        )
+        .await?;
+    Ok(Redirect::to("/callbacks").into_response())
 }
 
 /// Mythic-style callback detail/interact page.

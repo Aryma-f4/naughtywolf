@@ -2322,6 +2322,46 @@ impl Repository {
             .map_err(|_| AppError::Internal)
     }
 
+    /// Delete a callback and its entire workspace history (tasking, results,
+    /// transfers, snapshots) via the session FK cascade. Audited.
+    pub async fn delete_callback_with_audit(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+        correlation_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query("DELETE FROM c2_sessions WHERE id = ?")
+            .bind(session_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        let deleted = sqlx::query("DELETE FROM callbacks WHERE id = ?")
+            .bind(session_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        if deleted.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "callback.deleted",
+            "callback",
+            session_id,
+            "success",
+            correlation_id,
+        );
+        let entry = match operation_id {
+            Some(operation_id) => entry.for_operation(operation_id),
+            None => entry,
+        };
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)
+    }
+
     pub async fn rename_operation_with_audit(
         &self,
         operation_id: &str,
