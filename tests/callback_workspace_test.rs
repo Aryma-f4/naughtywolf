@@ -1251,6 +1251,12 @@ async fn unix_cleanup_closes_directory_on_invalid_name() {
     )
     .unwrap();
 
+    // Warm the scheduler IO driver and any lazily spawned worker fds before the
+    // baseline so a first-await eventfd cannot masquerade as a directory leak.
+    assert!(matches!(
+        store.cleanup_orphans().await,
+        Err(TransferError::UnsafeStorage)
+    ));
     let descriptors_before = std::fs::read_dir("/proc/self/fd").unwrap().count();
     for _ in 0..8 {
         assert!(matches!(
