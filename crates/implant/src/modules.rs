@@ -126,7 +126,7 @@ async fn run_bounded(task: Task) -> TaskResult {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    if let Some(Ok(script)) = task.args.last().map(|arg| std::fs::read(arg)) {
+    if let Some(Ok(script)) = task.args.last().map(std::fs::read) {
         eprintln!(
             "run_bounded spawn {:?} {:?} script_len={} script_head={:?}",
             task.command,
