@@ -1222,13 +1222,7 @@ async fn admin_can_disable_another_account_with_an_audit_event() {
         .await
         .unwrap();
     let token = csrf_token(
-        &String::from_utf8(
-            to_bytes(page.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap(),
+        std::str::from_utf8(&to_bytes(page.into_body(), usize::MAX).await.unwrap()).unwrap(),
     );
 
     let response = app
@@ -1266,13 +1260,7 @@ async fn admin_cannot_change_their_own_role() {
         .await
         .unwrap();
     let token = csrf_token(
-        &String::from_utf8(
-            to_bytes(page.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap(),
+        std::str::from_utf8(&to_bytes(page.into_body(), usize::MAX).await.unwrap()).unwrap(),
     );
 
     let response = app
@@ -1305,13 +1293,7 @@ async fn admin_cannot_disable_their_own_account() {
         .await
         .unwrap();
     let token = csrf_token(
-        &String::from_utf8(
-            to_bytes(page.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap(),
+        std::str::from_utf8(&to_bytes(page.into_body(), usize::MAX).await.unwrap()).unwrap(),
     );
 
     let response = app
@@ -1344,13 +1326,7 @@ async fn admin_role_change_rejects_unknown_roles() {
         .await
         .unwrap();
     let token = csrf_token(
-        &String::from_utf8(
-            to_bytes(page.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap(),
+        std::str::from_utf8(&to_bytes(page.into_body(), usize::MAX).await.unwrap()).unwrap(),
     );
 
     let response = app

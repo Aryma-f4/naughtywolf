@@ -31,6 +31,7 @@ pub struct Upload {
         std::sync::Arc<std::sync::Barrier>,
     )>,
     #[cfg(test)]
+    #[allow(clippy::type_complexity)] // test-only hook plumbing
     validation_channels: Option<(
         std::sync::mpsc::Sender<()>,
         std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
@@ -250,10 +251,10 @@ impl Upload {
         {
             let _ = self.sidecar_guard.parent.sync_all();
         }
-        if let Some(parent) = std::path::Path::new(&self.dest).parent() {
-            if let Ok(directory) = std::fs::File::open(parent) {
-                let _ = directory.sync_all();
-            }
+        if let Some(parent) = std::path::Path::new(&self.dest).parent()
+            && let Ok(directory) = std::fs::File::open(parent)
+        {
+            let _ = directory.sync_all();
         }
         Ok(())
     }

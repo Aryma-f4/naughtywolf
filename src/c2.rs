@@ -289,7 +289,7 @@ fn poll_reply_envelope(
     reply: &PollReply,
 ) -> Result<Envelope, C2Error> {
     let plaintext = serde_json::to_vec(&reply).map_err(|_| C2Error::Internal)?;
-    let encrypted = crypto::encrypt(&key, reply_id, &plaintext).map_err(|_| C2Error::Internal)?;
+    let encrypted = crypto::encrypt(key, reply_id, &plaintext).map_err(|_| C2Error::Internal)?;
     Ok(Envelope::new(
         if reply.tasks.is_empty() {
             Kind::Heartbeat
@@ -1724,8 +1724,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(host, "laptop");
-        let metadata: (Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, String) =
-            sqlx::query_as(
+        type CallbackRow = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            String,
+        );
+        let metadata: CallbackRow = sqlx::query_as(
                 "SELECT os_version, executable_path, local_addr, implant_version, interval_ms, jitter_ms, capabilities_json \
                  FROM callbacks WHERE id = ?",
             )

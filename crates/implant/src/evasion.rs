@@ -115,22 +115,18 @@ fn env_info_unix(mut info: EnvInfo) -> EnvInfo {
         if let Ok(output) = std::process::Command::new("sysctl")
             .args(["-n", "hw.memsize"])
             .output()
+            && let Ok(s) = String::from_utf8(output.stdout)
+            && let Ok(bytes) = s.trim().parse::<u64>()
         {
-            if let Ok(s) = String::from_utf8(output.stdout) {
-                if let Ok(bytes) = s.trim().parse::<u64>() {
-                    info.mem_mb = bytes / (1024 * 1024);
-                }
-            }
+            info.mem_mb = bytes / (1024 * 1024);
         }
         if let Ok(output) = std::process::Command::new("sysctl")
             .args(["-n", "hw.logicalcpu"])
             .output()
+            && let Ok(s) = String::from_utf8(output.stdout)
+            && let Ok(cpus) = s.trim().parse::<usize>()
         {
-            if let Ok(s) = String::from_utf8(output.stdout) {
-                if let Ok(cpus) = s.trim().parse::<usize>() {
-                    info.cpu_count = cpus;
-                }
-            }
+            info.cpu_count = cpus;
         }
     }
 
@@ -384,6 +380,5 @@ mod tests {
     #[test]
     fn patch_amsi_is_noop_off_windows() {
         let _ = patch_amsi();
-        assert!(true);
     }
 }

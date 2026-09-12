@@ -101,13 +101,13 @@ impl UploadStore {
         let remaining = budget as u64;
         let offset = u.offset;
         let mut rd = file;
-        while remaining > 0 && offset < u.total {
+        if remaining > 0 && offset < u.total {
             let take = remaining.min(CHUNK).min(u.total - offset) as usize;
             let _ = rd.seek(SeekFrom::Start(offset)).ok();
             let mut buf = vec![0u8; take];
             let n = rd.read(&mut buf).unwrap_or(0);
             if n == 0 {
-                break;
+                return chunks;
             }
             buf.truncate(n);
             chunks.push(FileChunk {
@@ -118,7 +118,6 @@ impl UploadStore {
                 total: u.total,
                 data: buf,
             });
-            break;
         }
         chunks
     }

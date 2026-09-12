@@ -430,17 +430,16 @@ impl BeaconRuntime {
         if download
             .as_ref()
             .is_some_and(|active| active.task_id() == *task_id)
+            && download.as_ref().unwrap().phase == TransferPhase::Active
         {
-            if download.as_ref().unwrap().phase == TransferPhase::Active {
-                let mut active = download.take().unwrap();
-                self.task_states
-                    .lock()
-                    .unwrap()
-                    .insert(*task_id, ActiveTask::Completing);
-                active.transfer.take();
-                if let Some(completion) = active.completion.take() {
-                    let _ = completion.send(cancelled_result(*task_id));
-                }
+            let mut active = download.take().unwrap();
+            self.task_states
+                .lock()
+                .unwrap()
+                .insert(*task_id, ActiveTask::Completing);
+            active.transfer.take();
+            if let Some(completion) = active.completion.take() {
+                let _ = completion.send(cancelled_result(*task_id));
             }
         }
         true
@@ -630,16 +629,15 @@ impl BeaconRuntime {
                 });
             if download_matches && ack.done {
                 self.finalize_download(ack).await;
-            } else if download_matches {
-                if let Some(download) = self
+            } else if download_matches
+                && let Some(download) = self
                     .download
                     .write()
                     .unwrap()
                     .as_mut()
                     .and_then(|active| active.transfer.as_mut())
-                {
-                    download.resume_to(ack.received);
-                }
+            {
+                download.resume_to(ack.received);
             }
 
             let upload_matches = self.upload.read().unwrap().as_ref().is_some_and(|active| {
@@ -1175,10 +1173,10 @@ impl BeaconRuntime {
                 return;
             };
             if active.phase != TransferPhase::Active
-                || !active
+                || active
                     .transfer
                     .as_ref()
-                    .is_some_and(|upload| ack.transfer_id == Some(upload.transfer_id()))
+                    .is_none_or(|upload| ack.transfer_id != Some(upload.transfer_id()))
             {
                 return;
             }
@@ -1263,10 +1261,10 @@ impl BeaconRuntime {
                 return;
             };
             if active.phase != TransferPhase::Active
-                || !active
+                || active
                     .transfer
                     .as_ref()
-                    .is_some_and(|download| ack.transfer_id == Some(download.transfer_id()))
+                    .is_none_or(|download| ack.transfer_id != Some(download.transfer_id()))
             {
                 return;
             }
@@ -1672,6 +1670,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std Mutex over a completed runtime; tests only
     async fn kill_during_upload_finalize_yields_one_cancelled_result() {
         use sha2::{Digest, Sha256};
 
@@ -1810,6 +1809,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std Mutex over a completed runtime; tests only
     async fn kill_during_download_finalize_yields_one_cancelled_result() {
         let runtime = Arc::new(runtime());
         let directory = tempfile::tempdir().unwrap();
@@ -2069,6 +2069,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std Mutex over a completed runtime; tests only
     async fn cancellation_before_upload_slot_installation_leaves_no_orphan() {
         let runtime = Arc::new(runtime());
         let directory = tempfile::tempdir().unwrap();
@@ -2138,12 +2139,12 @@ mod tests {
         assert!(runtime.accept_task(next.id));
         let next_runner = tokio::spawn(Arc::clone(&runtime).execute(vec![next.clone()]));
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !runtime
+            while runtime
                 .upload
                 .read()
                 .unwrap()
                 .as_ref()
-                .is_some_and(|active| active.task_id() == next.id)
+                .is_none_or(|active| active.task_id() != next.id)
             {
                 tokio::task::yield_now().await;
             }

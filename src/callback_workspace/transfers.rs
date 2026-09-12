@@ -170,7 +170,7 @@ impl TransferOperationLock {
                 }
                 return Err(TransferError::Storage);
             }
-            return Ok(Self { file });
+            Ok(Self { file })
         }
         #[cfg(windows)]
         {
@@ -1391,13 +1391,13 @@ fn open_or_create_directory(path: &Path) -> Result<RootHandle, TransferError> {
     if absolute.starts_with("/var") {
         absolute = PathBuf::from("/private").join(absolute.strip_prefix("/").unwrap());
     }
-    let mut components = absolute.components();
+    let components = absolute.components();
     let mut current = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(Path::new("/"))
         .map_err(|_| TransferError::UnsafeStorage)?;
-    while let Some(component) = components.next() {
+    for component in components {
         let name = match component {
             std::path::Component::RootDir | std::path::Component::CurDir => continue,
             std::path::Component::Normal(name) => name,

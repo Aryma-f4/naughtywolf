@@ -925,6 +925,7 @@ async fn cross_store_lock_precedes_part_write() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(true)
         .mode(0o600)
         .open(lock_path)
         .unwrap();

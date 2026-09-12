@@ -50,16 +50,31 @@ async fn callback_workspace_migration_preserves_completed_task_results() {
     sqlx::query("INSERT INTO c2_tasks (id, session_id, command, args_json, timeout_ms, status, result_output, result_ok, result_exit_code) VALUES ('t', 's', 'x', '{}', 1, 'completed', 'out', 1, 0)").execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO c2_task_results (task_id, ok, stdout, stderr, exit_code, completed_at) VALUES ('t', 1, X'000102', X'0304', 0, 'done')").execute(&pool).await.unwrap();
     let callbacks_before: Vec<CallbackPreservationRow> = sqlx::query_as("SELECT id, asset_id, operation_id, host, user_name, process, arch, os, protocol, status, session_key, last_seen, created_at FROM callbacks ORDER BY id").fetch_all(&pool).await.unwrap();
-    let tasks_before: Vec<(String, String, String, String, i64, String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, String)> = sqlx::query_as("SELECT id, session_id, command, args_json, timeout_ms, status, processing_at, completed_at, result_output, result_ok, result_exit_code, created_at FROM c2_tasks ORDER BY id").fetch_all(&pool).await.unwrap();
-    let results_before: Vec<(String, i64, Vec<u8>, Vec<u8>, i64, String)> = sqlx::query_as("SELECT task_id, ok, stdout, stderr, exit_code, completed_at FROM c2_task_results ORDER BY task_id").fetch_all(&pool).await.unwrap();
+    type C2TaskRow = (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        String,
+    );
+    type C2TaskResultRow = (String, i64, Vec<u8>, Vec<u8>, i64, String);
+    let tasks_before: Vec<C2TaskRow> = sqlx::query_as("SELECT id, session_id, command, args_json, timeout_ms, status, processing_at, completed_at, result_output, result_ok, result_exit_code, created_at FROM c2_tasks ORDER BY id").fetch_all(&pool).await.unwrap();
+    let results_before: Vec<C2TaskResultRow> = sqlx::query_as("SELECT task_id, ok, stdout, stderr, exit_code, completed_at FROM c2_task_results ORDER BY task_id").fetch_all(&pool).await.unwrap();
     pool.close().await;
     let pool = naughtywolf::db::create_pool(&url).await.unwrap();
     naughtywolf::db::run_migrations(&pool).await.unwrap();
     let callbacks_after: Vec<CallbackPreservationRow> = sqlx::query_as("SELECT id, asset_id, operation_id, host, user_name, process, arch, os, protocol, status, session_key, last_seen, created_at FROM callbacks ORDER BY id").fetch_all(&pool).await.unwrap();
     assert_eq!(callbacks_before, callbacks_after);
-    let tasks_after: Vec<(String, String, String, String, i64, String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, String)> = sqlx::query_as("SELECT id, session_id, command, args_json, timeout_ms, status, processing_at, completed_at, result_output, result_ok, result_exit_code, created_at FROM c2_tasks ORDER BY id").fetch_all(&pool).await.unwrap();
+    let tasks_after: Vec<C2TaskRow> = sqlx::query_as("SELECT id, session_id, command, args_json, timeout_ms, status, processing_at, completed_at, result_output, result_ok, result_exit_code, created_at FROM c2_tasks ORDER BY id").fetch_all(&pool).await.unwrap();
     assert_eq!(tasks_before, tasks_after);
-    let results_after: Vec<(String, i64, Vec<u8>, Vec<u8>, i64, String)> = sqlx::query_as("SELECT task_id, ok, stdout, stderr, exit_code, completed_at FROM c2_task_results ORDER BY task_id").fetch_all(&pool).await.unwrap();
+    let results_after: Vec<C2TaskResultRow> = sqlx::query_as("SELECT task_id, ok, stdout, stderr, exit_code, completed_at FROM c2_task_results ORDER BY task_id").fetch_all(&pool).await.unwrap();
     assert_eq!(results_before, results_after);
     let fk_violations: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
         .fetch_all(&pool)

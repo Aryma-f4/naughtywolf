@@ -74,13 +74,13 @@ impl Download {
         }
         let mut chunks = Vec::new();
         let remaining = budget as u64;
-        while remaining > 0 && !self.done() {
+        if remaining > 0 && !self.done() {
             self.file.seek(SeekFrom::Start(self.offset)).ok();
             let take = remaining.min(CHUNK).min(self.size - self.offset) as usize;
             let mut buf = vec![0u8; take];
             let n = self.file.read(&mut buf).unwrap_or(0);
             if n == 0 {
-                break;
+                return chunks;
             }
             buf.truncate(n);
             chunks.push(FileChunk {
@@ -93,7 +93,6 @@ impl Download {
             });
             // Preserve room for task/result metadata and rotate fairly across
             // beacons instead of monopolizing a large transport budget.
-            break;
         }
         chunks
     }

@@ -43,7 +43,7 @@ fn failure(task: &Task, message: impl Into<String>) -> TaskResult {
 }
 
 pub(crate) fn decode_source(encoded: &str) -> Result<String, String> {
-    if encoded.len() > ((MAX_SOURCE_BYTES + 2) / 3) * 4 {
+    if encoded.len() > MAX_SOURCE_BYTES.div_ceil(3) * 4 {
         return Err("custom source exceeds the 24 KiB limit".into());
     }
     let decoded = base64::engine::general_purpose::STANDARD

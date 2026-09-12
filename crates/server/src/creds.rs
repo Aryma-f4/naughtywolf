@@ -17,7 +17,7 @@ pub struct Credential {
 /// the server runs without a database.
 #[derive(Default, Clone)]
 pub struct CredentialStore {
-    pool: Option<SqlitePool>,
+    _pool: Option<SqlitePool>,
     mem: Arc<Vec<Credential>>,
 }
 
@@ -25,7 +25,7 @@ impl CredentialStore {
     /// Create a store backed by the given SQLite pool.
     pub fn new(pool: SqlitePool) -> Self {
         CredentialStore {
-            pool: Some(pool),
+            _pool: Some(pool),
             mem: Arc::new(Vec::new()),
         }
     }

@@ -236,9 +236,8 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
-        let initial_token = csrf_token(
-            &String::from_utf8(to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap(),
-        );
+        let initial_token =
+            csrf_token(std::str::from_utf8(&to_bytes(body, usize::MAX).await.unwrap()).unwrap());
 
         let rejected = app
             .clone()
@@ -257,13 +256,8 @@ mod tests {
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
         let replacement_token = csrf_token(
-            &String::from_utf8(
-                to_bytes(rejected.into_body(), usize::MAX)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap(),
+            std::str::from_utf8(&to_bytes(rejected.into_body(), usize::MAX).await.unwrap())
+                .unwrap(),
         );
         assert!(!replacement_token.is_empty());
         assert_ne!(replacement_token, initial_token);

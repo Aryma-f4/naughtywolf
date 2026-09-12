@@ -112,13 +112,13 @@ impl Script {
             }
 
             // Top-level "script: <name>" directive.
-            if line.starts_with("script:") {
+            if let Some(script) = line.strip_prefix("script:") {
                 if current.is_some() {
                     // Flush any in-progress step.
                     let s = current.take().unwrap();
                     steps.push(s);
                 }
-                name = line["script:".len()..].trim().to_owned();
+                name = script.trim().to_owned();
                 continue;
             }
 

@@ -31,6 +31,7 @@ pub fn base32_encode(data: &[u8]) -> String {
     out
 }
 
+#[allow(clippy::result_unit_err)] // failure carries no diagnostic; decoded length is checked by the caller
 pub fn base32_decode(s: &str) -> Result<Vec<u8>, ()> {
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;

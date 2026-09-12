@@ -356,6 +356,7 @@ impl Repository {
             .map_err(|_| AppError::Internal)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_asset_with_audit(
         &self,
         operation_id: &str,
@@ -725,6 +726,7 @@ impl Repository {
     }
 
     /// Record or refresh a beacon identified by its assigned session id.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_callback(
         &self,
         session_id: &str,
@@ -748,6 +750,7 @@ impl Repository {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_callback_with_protocol(
         &self,
         session_id: &str,
@@ -1260,7 +1263,14 @@ impl Repository {
         use base64::Engine;
 
         let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
-        let row: Option<(String, Option<String>, String, serde_json::Value, Option<String>)> = sqlx::query_as(
+        type ClaimedTask = (
+            String,
+            Option<String>,
+            String,
+            serde_json::Value,
+            Option<String>,
+        );
+        let row: Option<ClaimedTask> = sqlx::query_as(
             "SELECT status, cancellation_requested_at, command, args_json, operator_id FROM c2_tasks WHERE id = ? AND session_id = ?",
         )
         .bind(task_id)
@@ -2012,6 +2022,7 @@ impl Repository {
         query.map_err(|_| AppError::Internal)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_operation(
         &self,
         operation_id: &str,

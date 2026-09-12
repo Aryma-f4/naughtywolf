@@ -91,10 +91,12 @@ async fn drop_partial_transfer_response(
     response
 }
 
+type SessionState = Option<(Uuid, [u8; crypto::KEY_LEN])>;
+
 #[derive(Clone)]
 struct AckTestServer {
     psk: Arc<Vec<u8>>,
-    session: Arc<Mutex<Option<(Uuid, [u8; crypto::KEY_LEN])>>>,
+    session: Arc<Mutex<SessionState>>,
     task: Task,
     polls: Arc<AtomicUsize>,
     result_deliveries: Arc<AtomicUsize>,

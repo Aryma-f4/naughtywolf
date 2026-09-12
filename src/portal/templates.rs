@@ -47,7 +47,9 @@ pub fn login_page(error: Option<&str>, csrf_token: &str) -> String {
 }
 
 pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &str) -> String {
-    let mut groups: Vec<(&str, Vec<(&str, &str, &str)>)> = vec![
+    type NavItem = (&'static str, &'static str, &'static str);
+    type NavGroup = (&'static str, Vec<NavItem>);
+    let mut groups: Vec<NavGroup> = vec![
         (
             "Command",
             vec![
@@ -118,9 +120,11 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
     .iter()
     .filter(|(name, _, _)| matches!(*name, "dashboard" | "guide") || can_operator)
     .map(|(name, href, label)| {
-        let current = (name == &active_nav)
-            .then_some(" aria-current=\"page\"")
-            .unwrap_or("");
+        let current = if name == &active_nav {
+            " aria-current=\"page\""
+        } else {
+            ""
+        };
         format!(
             "<a class=\"quick-link\" href=\"{href}\"{current}><span class=\"nav-icon\" aria-hidden=\"true\">{}</span><span>{label}</span></a>",
             nav_icon(name),
@@ -134,9 +138,11 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
             let links = items
                 .into_iter()
                 .map(|(name, href, label)| {
-                    let current = (name == active_nav)
-                        .then_some(" aria-current=\"page\"")
-                        .unwrap_or("");
+                    let current = if name == active_nav {
+                        " aria-current=\"page\""
+                    } else {
+                        ""
+                    };
                     let feature_class = if name == "payloads" {
                         " nav-link-featured"
                     } else {
@@ -263,26 +269,26 @@ cargo run -p naughtywolf -- serve</code></pre><div class="guide-note"><strong>Sc
 }
 
 pub fn operations_page(user: &AuthenticatedUser, operations: &[Operation]) -> String {
-    let create_link = (user.role == Role::Admin)
-        .then_some("<a class=\"button\" href=\"/operations/new\">Create operation</a>")
-        .unwrap_or_default();
+    let create_link = if user.role == Role::Admin {
+        "<a class=\"button\" href=\"/operations/new\">Create operation</a>"
+    } else {
+        ""
+    };
     let body = if operations.is_empty() {
-        format!("<section class=\"empty-state panel\"><p>No scoped operations yet</p></section>")
+        "<section class=\"empty-state panel\"><p>No scoped operations yet</p></section>".to_string()
     } else {
         let items = operations
             .iter()
             .map(|operation| {
                 let (status_label, status_class) = operation_status(operation.status);
-                let asset_link = user
-                    .role
-                    .allows(Role::Operator)
-                    .then(|| {
-                        format!(
-                            "<a href=\"/operations/{}/assets/new\">Add asset</a>",
-                            escape_html(&operation.id)
-                        )
-                    })
-                    .unwrap_or_default();
+                let asset_link = if user.role.allows(Role::Operator) {
+                    format!(
+                        "<a href=\"/operations/{}/assets/new\">Add asset</a>",
+                        escape_html(&operation.id)
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
                     "<li class=\"record-card\"><h2>{}</h2><p>{}</p>{}{asset_link}</li>",
                     escape_html(&operation.name),
@@ -423,7 +429,7 @@ pub fn admin_users_page(
                 let role_options = [Role::Admin, Role::Operator, Role::Viewer]
                     .into_iter()
                     .map(|role| {
-                        let selected = (role == account.role).then_some(" selected").unwrap_or("");
+                        let selected = if role == account.role { " selected" } else { "" };
                         format!(
                             "<option value=\"{}\"{selected}>{}</option>",
                             role,
@@ -473,9 +479,11 @@ pub fn operation_form_page(
     purpose: &str,
 ) -> String {
     let error = form_error(error, "operation-form-error");
-    let described_by = (!error.is_empty())
-        .then_some(" aria-describedby=\"operation-form-error\"")
-        .unwrap_or_default();
+    let described_by = if !error.is_empty() {
+        " aria-describedby=\"operation-form-error\""
+    } else {
+        ""
+    };
     app_page(
         "Create operation",
         user,
@@ -497,9 +505,11 @@ pub fn asset_form_page(
     values: [&str; 4],
 ) -> String {
     let error = form_error(error, "asset-form-error");
-    let described_by = (!error.is_empty())
-        .then_some(" aria-describedby=\"asset-form-error\"")
-        .unwrap_or_default();
+    let described_by = if !error.is_empty() {
+        " aria-describedby=\"asset-form-error\""
+    } else {
+        ""
+    };
     app_page(
         "Add asset",
         user,
