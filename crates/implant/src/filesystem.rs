@@ -174,14 +174,17 @@ fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     let destination = CString::new(destination.as_os_str().as_bytes())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: both C strings remain alive for this call and are NUL terminated.
+    // ponytail: raw syscall because `libc::renameat2` is not exposed on musl;
+    // SYS_renameat2 is present for every Linux libc.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             source.as_ptr(),
             libc::AT_FDCWD,
             destination.as_ptr(),
             libc::RENAME_NOREPLACE,
-        )
+        ) as std::os::raw::c_int
     };
     if result == 0 {
         Ok(())
