@@ -402,6 +402,11 @@ async fn serve(listener: tokio::net::TcpListener, app: Router<()>) -> tokio::tas
 
 #[tokio::test]
 async fn production_stack_restart_resumes_partial_download() {
+    // Scope: the first phase stages both directions through the authenticated
+    // portal routes, but the resume after rebind flows through /c2/checkin
+    // only — the in-memory session layer dies with app 1, so no authed portal
+    // call is made post-restart. Restart recovery of the C2 fabric is what
+    // this test pins; portal re-serving is artifact-assumed, not re-driven.
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .try_init();
@@ -548,6 +553,9 @@ async fn production_stack_restart_resumes_partial_download() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let transport = Transport::from_endpoint(&format!("http://{addr}")).unwrap();
+    // `server.abort()` drops the listener; fresh connections are refused,
+    // which proves the endpoint is severed. (The in-flight checkin exchange
+    // stays blocked on `release` and then receives its own 200.)
     match transport.exchange(&[0u8; 16]).await {
         Ok(_) => panic!("client must observe a real socket error against the severed endpoint"),
         Err(reason) => println!("socket error observed: {reason}"),
@@ -565,6 +573,26 @@ async fn production_stack_restart_resumes_partial_download() {
     let reopened_store =
         TransferStore::new(reopened.clone(), evidence_dir.clone(), MAX_TRANSFER_BYTES)
             .expect("reopened transfer store");
+    // Pin the durable resume before the reopened server serves anything: the
+    // severed download must still reopen at exactly its persisted offset with
+    // its server-side partial intact on disk.
+    let (download_a_status, download_a_received) = transfer_row(&reopened, &download_a).await;
+    assert_eq!(
+        download_a_status, "active",
+        "severed download must persist as active"
+    );
+    assert_eq!(
+        download_a_received, 1024,
+        "reopened server must resume the download from its durable offset"
+    );
+    let download_a_key = storage_key(&reopened, &download_a).await;
+    let download_a_part = transfer_root.join(format!("{download_a_key}.part"));
+    let download_a_part = std::fs::read(&download_a_part).unwrap_or_default();
+    assert_eq!(
+        download_a_part.len(),
+        1024,
+        "server-side partial must survive the restart byte-for-byte"
+    );
     let reopened_evidence = EvidenceStore::new(reopened.clone(), evidence_dir.clone());
     let restarted = RestartState::new(reopened.clone(), true);
     let app2 = test_app(
