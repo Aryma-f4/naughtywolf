@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createWorkspace } = require('../static/callback-workspace.js');
+const { createWorkspace, listingExport, defaultListingName } = require('../static/callback-workspace.js');
 
 class Element {
   constructor(tag = 'div') {
@@ -98,8 +98,8 @@ function skeleton() {
   const sortPid = new Element('button');
   sortPid.dataset.processSort = 'pid';
   root.append(sortName, sortPid);
-  for (const key of ['filePanel', 'filePathForm', 'filePath', 'fileBreadcrumbs', 'fileParent', 'fileTableBody', 'fileEmpty', 'fileSnapshotAge', 'fileMessage', 'fileRefresh', 'fileMkdirForm', 'fileMkdirName', 'fileUpload', 'fileDownload', 'fileUploadForm', 'fileUploadInput', 'fileUploadDestination', 'fileTransferList', 'fileTaskLink', 'fileConfirm', 'fileConfirmText', 'fileConfirmSubmit', 'fileConfirmCancel', 'fileMoveFields', 'fileMoveDestination', 'fileDeleteFields', 'fileDeleteRecursive']) {
-    const isButton = ['fileParent', 'fileRefresh', 'fileUpload', 'fileDownload', 'fileConfirmSubmit', 'fileConfirmCancel'].includes(key);
+  for (const key of ['filePanel', 'filePathForm', 'filePath', 'fileBreadcrumbs', 'fileParent', 'fileTableBody', 'fileEmpty', 'fileSnapshotAge', 'fileMessage', 'fileRefresh', 'fileSaveListing', 'fileMkdirForm', 'fileMkdirName', 'fileUpload', 'fileDownload', 'fileUploadForm', 'fileUploadInput', 'fileUploadDestination', 'fileTransferList', 'fileTaskLink', 'fileConfirm', 'fileConfirmText', 'fileConfirmSubmit', 'fileConfirmCancel', 'fileMoveFields', 'fileMoveDestination', 'fileDeleteFields', 'fileDeleteRecursive']) {
+    const isButton = ['fileParent', 'fileRefresh', 'fileUpload', 'fileDownload', 'fileConfirmSubmit', 'fileConfirmCancel', 'fileSaveListing'].includes(key);
     const isInput = ['filePath', 'fileMkdirName', 'fileMoveDestination', 'fileDeleteRecursive', 'fileUploadInput', 'fileUploadDestination'].includes(key);
     const isForm = ['filePathForm', 'fileMkdirForm', 'fileUploadForm'].includes(key);
     const element = new Element(isButton ? 'button' : isInput ? 'input' : isForm ? 'form' : 'div');
@@ -488,6 +488,7 @@ test('filesystem URL restores path, safe rows, stale time, breadcrumbs, parent, 
   assert.equal(root.querySelector('[data-file-parent]').dataset.filePath, '/srv');
   assert.match(root.querySelector('[data-file-breadcrumbs]').textContent, /\/.*srv.*lab/s);
   assert.match(root.querySelector('[data-file-snapshot-age]').textContent, /2h 30m old.*stale/i);
+  assert.equal(root.querySelector('[data-file-save-listing]').disabled, false, 'listing export enables once a snapshot loads');
   const unsafeRow = root.querySelectorAll('[data-file-row]').find(row => row.dataset.filePath.includes('<img'));
   assert.match(unsafeRow.textContent, /<img src=x onerror=alert\(1\)>.txt/);
   assert.equal(unsafeRow.querySelector('img'), null, 'remote names must remain text, never HTML');
@@ -757,4 +758,21 @@ test('Enter inside an open confirmation is not suppressed', async () => {
   assert.equal(confirm.hidden, false);
   const inside = root.dispatch('keydown', { key: 'Enter', target: confirm });
   assert.notEqual(inside.defaultPrevented, true);
+});
+
+test('listing export sanitizes the path into a file name and round-trips the snapshot', () => {
+  const snapshot = {
+    schema: 'nw.fs-list.v1',
+    captured_at: '2026-09-10T12:30:00.000Z',
+    path: '/srv/lab',
+    entries: [{ name: 'readme.md', path: '/srv/lab/readme.md', kind: 'file', size: 4 }],
+  };
+  assert.equal(defaultListingName('/srv/lab'), 'ls-srv_lab.json');
+  assert.equal(defaultListingName('/'), 'ls-listing.json');
+  assert.equal(defaultListingName("C:\\Users\\alice"), 'ls-C_Users_alice.json');
+  const exported = listingExport(snapshot, '/srv/lab');
+  assert.equal(exported.filename, 'ls-srv_lab.json');
+  assert.deepEqual(JSON.parse(exported.contents), snapshot);
+  assert.equal(listingExport(snapshot, '/').filename, 'ls-listing.json');
+  assert.equal(listingExport(snapshot).filename, 'ls-srv_lab.json', 'snapshot path is the fallback when no explicit path is given');
 });

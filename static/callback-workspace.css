@@ -17,7 +17,10 @@
 .offline-queue, .offline-task-note { margin: 0; padding: .7rem .85rem; background: #fff4d8; color: #725118; border-left: 3px solid #d8a83e; }
 .task-filters { display: grid; grid-template-columns: minmax(14rem, 1fr) repeat(2, minmax(9rem, auto)); gap: .75rem; }
 .task-filters label { display: grid; gap: .3rem; font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
-.task-filters input, .task-filters select { min-height: 2.5rem; }
+.task-filters input, .task-filters select, .select-icon-field select { min-height: 2.5rem; }
+.select-icon-field { position: relative; display: block; }
+.select-icon-field select { width: 100%; padding-left: 2rem; }
+.select-icon-field svg { position: absolute; left: .6rem; top: 50%; translate: 0 -50%; width: 1rem; height: 1rem; color: var(--muted, #6d7178); pointer-events: none; }
 .callback-tasking .callback-console-grid { align-items: start; }
 .session-context-wrap { position: sticky; top: 5rem; }
 .task-timeline { min-width: 0; }

@@ -1,6 +1,16 @@
 (() => {
   const terminalStates = new Set(["completed", "error", "cancelled"]);
 
+  const defaultListingName = path => {
+    const clean = String(path || "listing").replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+    return `ls-${clean || "listing"}.json`;
+  };
+
+  const listingExport = (snapshot, path) => ({
+    filename: defaultListingName(path || snapshot?.path),
+    contents: JSON.stringify(snapshot, null, 2),
+  });
+
   function createWorkspace(root, dependencies = {}) {
     const doc = dependencies.document || document;
     const request = dependencies.fetch || fetch;
@@ -53,6 +63,7 @@
     const fileSnapshotAge = root.querySelector("[data-file-snapshot-age]");
     const fileMessage = root.querySelector("[data-file-message]");
     const fileRefresh = root.querySelector("[data-file-refresh]");
+    const fileSaveListing = root.querySelector("[data-file-save-listing]");
     const fileMkdirForm = root.querySelector("[data-file-mkdir-form]");
     const fileMkdirName = root.querySelector("[data-file-mkdir-name]");
     const fileUpload = root.querySelector("[data-file-upload]");
@@ -77,6 +88,7 @@
     let fileSortKey = "name";
     let fileSortDirection = 1;
     let pendingFileAction = null;
+    let tableSnapshot = null;
     const transfers = new Map();
 
     const selectedTab = (() => {
@@ -360,7 +372,9 @@
       const snapshot = await response.json();
       const data = snapshot?.snapshot_json || snapshot;
       fileRows = Array.isArray(data?.entries) ? data.entries : [];
+      tableSnapshot = data;
       if (fileSnapshotAge) fileSnapshotAge.textContent = data?.captured_at ? processAge(data.captured_at) : "No filesystem snapshot yet";
+      if (fileSaveListing) fileSaveListing.disabled = !(Array.isArray(data?.entries) && data.entries.length);
       setFileTaskLink(snapshot);
       renderFiles();
     };
@@ -879,6 +893,23 @@
         fileRefresh.disabled = false;
       }
     });
+    fileSaveListing?.addEventListener("click", () => {
+      if (fileSaveListing.disabled || !tableSnapshot) return;
+      try {
+        const { filename, contents } = listingExport(tableSnapshot, currentFilePath);
+        const blob = new Blob([contents], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = element("a", "", filename);
+        link.setAttribute("href", url);
+        link.setAttribute("download", filename);
+        doc.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+      } catch (_) {
+        if (fileMessage) fileMessage.textContent = "Could not save the listing; export to a file is unavailable in this browser.";
+      }
+    });
     fileMkdirForm?.addEventListener("submit", event => {
       event.preventDefault();
       const path = joinRemotePath(currentFilePath, fileMkdirName?.value || "");
@@ -1003,6 +1034,7 @@
       }
       if (!capable) {
         if (fileRefresh) fileRefresh.disabled = true;
+        if (fileSaveListing) fileSaveListing.disabled = true;
         if (fileMessage) fileMessage.textContent = "This callback does not advertise filesystem control capability.";
       } else if (root.dataset.online === "false" && fileMessage) {
         fileMessage.textContent = "Callback is offline. Filesystem tasks remain queued until its next check-in.";
@@ -1049,6 +1081,6 @@
     },
   };
 
-  if (typeof module === "object" && module.exports) module.exports = { createWorkspace };
+  if (typeof module === "object" && module.exports) module.exports = { createWorkspace, listingExport, defaultListingName };
   if (typeof window !== "undefined") window.NWCallbackWorkspace = api;
 })();
