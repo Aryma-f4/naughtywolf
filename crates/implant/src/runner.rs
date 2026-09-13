@@ -15,8 +15,9 @@ pub async fn run(task: Task) -> TaskResult {
         task.timeout_ms
     };
 
-    let mut cmd = Command::new(&task.command);
-    cmd.args(&task.args);
+    let (program, shell_args) = shell_invocation(&task.command, &task.args);
+    let mut cmd = Command::new(program);
+    cmd.args(&shell_args);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -78,10 +79,53 @@ pub fn spawn_tracked(
     handle
 }
 
+/// Quote a single command-line token for the platform shell.
+#[cfg(not(windows))]
+fn quote_for_shell(token: &str) -> String {
+    if !token.contains([' ', '\'']) {
+        return token.to_owned();
+    }
+    format!("'{}'", token.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn quote_for_shell(token: &str) -> String {
+    if !token.contains([' ', '"']) {
+        return token.to_owned();
+    }
+    format!("\"{}\"", token.replace('"', "\"\""))
+}
+
+/// Rebuild a generic task as a platform shell invocation so operator-typed
+/// commands run with native shell syntax (pipelines, redirection, `dir`,
+/// `ipconfig`, …) instead of requiring an absolute binary path. Windows
+/// callbacks get `cmd.exe /C`, POSIX hosts get `/bin/sh -c`.
+///
+/// ponytail: `kill_on_drop` below terminates the shell process but not its
+/// already-spawned grandchildren; use `nw/process-kill` for process trees.
+pub(super) fn shell_invocation(command: &str, args: &[String]) -> (&'static str, Vec<String>) {
+    let mut line = String::new();
+    line.push_str(&quote_for_shell(command));
+    for arg in args {
+        line.push(' ');
+        line.push_str(&quote_for_shell(arg));
+    }
+    #[cfg(windows)]
+    let program = "cmd.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    #[cfg(windows)]
+    let program_args = vec!["/C".to_owned(), line];
+    #[cfg(not(windows))]
+    let program_args = vec!["-c".to_owned(), line];
+    (program, program_args)
+}
+
 /// Pure-std implementation used by lightweight tests (no tokio runtime).
 pub fn run_blocking(task: &Task) -> TaskResult {
-    let output = std::process::Command::new(&task.command)
-        .args(&task.args)
+    let (program, shell_args) = shell_invocation(&task.command, &task.args);
+    let output = std::process::Command::new(program)
+        .args(&shell_args)
         .stdin(std::process::Stdio::null())
         .output();
 
@@ -119,6 +163,33 @@ mod tests {
         let r = run_blocking(&t);
         assert!(r.ok, "stderr: {}", String::from_utf8_lossy(&r.stderr));
         assert_eq!(String::from_utf8_lossy(&r.stdout), "hello-c2");
+    }
+
+    #[test]
+    fn generic_commands_route_through_the_platform_shell() {
+        #[cfg(windows)]
+        let (program, args) = shell_invocation("ipconfig", &[]);
+        #[cfg(not(windows))]
+        let (program, args) =
+            shell_invocation("ls", &["-la".to_owned(), "dir with'space".to_owned()]);
+        #[cfg(windows)]
+        {
+            assert_eq!(program, "cmd.exe");
+            assert_eq!(args, vec!["/C".to_owned(), "ipconfig".to_owned()]);
+            let (p, a) = shell_invocation("C:\\Program Files\\app.exe", &["-v".into()]);
+            assert_eq!(p, "cmd.exe");
+            assert_eq!(a[1], "\"C:\\Program Files\\app.exe\" -v");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(program, "/bin/sh");
+            assert_eq!(
+                args,
+                vec!["-c".to_owned(), "ls -la 'dir with'\\''space'".to_owned(),]
+            );
+        }
+        // A whitespace-free command line stays unquoted.
+        assert_eq!(shell_invocation("whoami", &[]).1[1], "whoami");
     }
 
     #[test]
