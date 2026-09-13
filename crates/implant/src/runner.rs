@@ -101,9 +101,18 @@ fn quote_for_shell(token: &str) -> String {
 /// `ipconfig`, …) instead of requiring an absolute binary path. Windows
 /// callbacks get `cmd.exe /C`, POSIX hosts get `/bin/sh -c`.
 ///
-/// ponytail: `kill_on_drop` below terminates the shell process but not its
-/// already-spawned grandchildren; use `nw/process-kill` for process trees.
-pub(super) fn shell_invocation(command: &str, args: &[String]) -> (&'static str, Vec<String>) {
+/// Tasks that already *are* a shell (`sh -c …`, `cmd.exe /C …`, …) run
+/// directly: re-wrapping stacks shells and, worse, relocates the real child
+/// under the wrapper, so `kill_on_drop`/timeout would kill the wrapper and
+/// orphan the actual command.
+///
+/// ponytail: `kill_on_drop` still targets only the immediate child; wrapping
+/// a pipeline puts a shell in that slot, so grandchildren outlive a timeout.
+/// Use `nw/process-kill` for process trees.
+pub(super) fn shell_invocation(command: &str, args: &[String]) -> (String, Vec<String>) {
+    if is_shell_program(command) {
+        return (command.to_owned(), args.to_vec());
+    }
     let mut line = String::new();
     line.push_str(&quote_for_shell(command));
     for arg in args {
@@ -118,7 +127,26 @@ pub(super) fn shell_invocation(command: &str, args: &[String]) -> (&'static str,
     let program_args = vec!["/C".to_owned(), line];
     #[cfg(not(windows))]
     let program_args = vec!["-c".to_owned(), line];
-    (program, program_args)
+    (program.to_owned(), program_args)
+}
+
+/// The command itself is a shell, run it verbatim instead of re-wrapping.
+fn is_shell_program(command: &str) -> bool {
+    matches!(
+        command,
+        "sh" | "/bin/sh"
+            | "bash"
+            | "/bin/bash"
+            | "dash"
+            | "/bin/dash"
+            | "zsh"
+            | "/bin/zsh"
+            | "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "powershell.exe"
+            | "pwsh"
+    )
 }
 
 /// Pure-std implementation used by lightweight tests (no tokio runtime).
@@ -190,6 +218,20 @@ mod tests {
         }
         // A whitespace-free command line stays unquoted.
         assert_eq!(shell_invocation("whoami", &[]).1[1], "whoami");
+    }
+
+    #[test]
+    fn explicit_shell_tasks_skip_the_wrapper() {
+        let (program, args) = shell_invocation("sh", &["-c".to_owned(), "echo hi".to_owned()]);
+        assert_eq!(program, "sh");
+        assert_eq!(args, vec!["-c".to_owned(), "echo hi".to_owned()]);
+        let (program, args) = shell_invocation("cmd.exe", &["/C".to_owned(), "dir".to_owned()]);
+        assert_eq!(program, "cmd.exe");
+        assert_eq!(args, vec!["/C".to_owned(), "dir".to_owned()]);
+        assert!(
+            is_shell_program("powershell"),
+            "operator-chosen shells must not be double-wrapped"
+        );
     }
 
     #[test]
