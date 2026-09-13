@@ -649,7 +649,10 @@
         });
       }
       if ((options.fromEvent || previous) && previous?.status !== "completed" && task.status === "completed" && task.command === "nw/fs-list") {
-        void loadFiles().catch(() => {
+        const listedPath = Array.isArray(task.arguments) ? task.arguments[0] : null;
+        void (listedPath && normalizeRemotePath(listedPath) !== currentFilePath
+          ? navigateFiles(listedPath)
+          : loadFiles()).catch(() => {
           if (fileMessage) fileMessage.textContent = "Filesystem snapshot could not be refreshed; retry when the callback is available.";
         });
       }

@@ -776,3 +776,41 @@ test('listing export sanitizes the path into a file name and round-trips the sna
   assert.equal(listingExport(snapshot, '/').filename, 'ls-listing.json');
   assert.equal(listingExport(snapshot).filename, 'ls-srv_lab.json', 'snapshot path is the fallback when no explicit path is given');
 });
+
+test('completed dock nw/fs-list task navigates the Files browser to the listed path', async () => {
+  const root = skeleton();
+  const deps = urlDependencies('/');
+  deps.fetch = async url => {
+    if (url.endsWith('/processes')) return { ok: true, json: async () => null };
+    if (url.includes('/files?')) return { ok: true, json: async () => filesystemSnapshot() };
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  assert.equal(root.querySelector('[data-file-path]').value, '/');
+  deps.source.listeners.task({ data: JSON.stringify(task({ id: 'ls-lab', command: 'nw/fs-list', arguments: ['/srv/lab'], status: 'completed', state_label: 'Completed' })) });
+  await flush();
+  await flush();
+  assert.equal(root.querySelector('[data-file-path]').value, '/srv/lab', 'ls completion moves the browser to the listed path');
+  assert.match(root.querySelector('[data-file-breadcrumbs]').textContent, /lab/);
+  assert.match(deps.history.calls.at(-1), /path=%2Fsrv%2Flab/);
+});
+
+test('dock nw/fs-list completion for the current path refreshes in place without pushing history', async () => {
+  const root = skeleton();
+  const deps = urlDependencies('/srv/lab');
+  const filesCalls = [];
+  deps.fetch = async url => {
+    if (url.endsWith('/processes')) return { ok: true, json: async () => null };
+    if (url.includes('/files?')) { filesCalls.push(url); return { ok: true, json: async () => filesystemSnapshot() }; }
+    return { ok: true, json: async () => ({ tasks: [], next_before: null }) };
+  };
+  const workspace = createWorkspace(root, deps);
+  await workspace.ready;
+  const historyBefore = deps.history.calls.length;
+  workspace.upsert(task({ id: 'ls-same', command: 'nw/fs-list', arguments: ['/srv/lab'], status: 'completed', state_label: 'Completed' }));
+  await flush();
+  await flush();
+  assert.equal(deps.history.calls.length, historyBefore, 'no duplicate history push for the current path');
+  assert.ok(filesCalls.length >= 1, 'in-place refresh still reloads the snapshot');
+});

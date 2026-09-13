@@ -167,6 +167,87 @@ fn is_reserved_structured_command(command: &str) -> bool {
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LsResolution {
+    NotLs,
+    DefaultPath,
+    Path(String),
+}
+
+fn resolve_ls(command: &str, arguments: &[String]) -> Result<LsResolution, AppError> {
+    let mut words = command.split_whitespace();
+    if words.next() != Some("ls") {
+        return Ok(LsResolution::NotLs);
+    }
+    let mut pieces: Vec<String> = words.map(str::to_owned).collect();
+    pieces.extend(arguments.iter().cloned());
+    let mut pieces = pieces.iter();
+    let path = pieces.next();
+    if path.is_none() {
+        return Ok(LsResolution::DefaultPath);
+    }
+    if pieces.next().is_some() {
+        return Err(AppError::Validation(
+            "ls accepts a single remote path".to_owned(),
+        ));
+    }
+    let path = nw_profile::control::normalize_remote_path(path.unwrap())
+        .map_err(|_| AppError::Validation("ls path must be an absolute remote path".to_owned()))?;
+    Ok(LsResolution::Path(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ls(command: &str, arguments: &[&str]) -> Result<LsResolution, AppError> {
+        resolve_ls(
+            command,
+            &arguments.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn ls_alias_resolves_named_paths() {
+        assert_eq!(
+            ls("ls", &[]).unwrap(),
+            LsResolution::DefaultPath,
+            "bare ls defaults to the last listed path"
+        );
+        assert_eq!(
+            ls("ls", &["/srv/lab"]).unwrap(),
+            LsResolution::Path("/srv/lab".into())
+        );
+        assert_eq!(
+            ls("ls", &[]).map_err(|e| e.to_string()),
+            Ok(LsResolution::DefaultPath)
+        );
+        assert_eq!(
+            ls("ls /etc", &[]).unwrap(),
+            LsResolution::Path("/etc".into())
+        );
+        assert_eq!(
+            ls("ls", &["C:\\Users\\alice"]).unwrap(),
+            LsResolution::Path(r"C:\Users\alice".into())
+        );
+        assert!(
+            ls("ls", &["not-absolute"]).is_err(),
+            "relative ls targets are rejected"
+        );
+        assert_eq!(
+            format!("{}", ls("ls", &["/a", "/b"]).unwrap_err()),
+            "validation failed: ls accepts a single remote path"
+        );
+    }
+
+    #[test]
+    fn ls_alias_ignores_other_commands() {
+        assert_eq!(ls("latest", &[]).unwrap(), LsResolution::NotLs);
+        assert_eq!(ls("pwd", &[]).unwrap(), LsResolution::NotLs);
+        assert_eq!(ls("cat /etc/passwd", &[]).unwrap(), LsResolution::NotLs);
+    }
+}
+
 pub(super) async fn require_csrf(session: &Session, headers: &HeaderMap) -> Result<(), AppError> {
     let expected: Option<String> = session
         .get(CSRF_TOKEN_KEY)
@@ -220,17 +301,40 @@ pub async fn enqueue_task(
     if command.is_empty() || command.chars().count() > 256 {
         return Err(AppError::Validation("invalid command".to_owned()));
     }
-    if is_reserved_structured_command(command) {
-        return Err(AppError::Validation(
-            "structured controls must use their typed endpoints".to_owned(),
-        ));
-    }
+    let (command, arguments) = match resolve_ls(command, &request.arguments)? {
+        LsResolution::NotLs => {
+            if is_reserved_structured_command(command) {
+                return Err(AppError::Validation(
+                    "structured controls must use their typed endpoints".to_owned(),
+                ));
+            }
+            (command.to_owned(), request.arguments)
+        }
+        LsResolution::Path(path) => ("nw/fs-list".to_owned(), vec![path]),
+        LsResolution::DefaultPath => {
+            let path = match repository.latest_listed_path(&session_id).await? {
+                Some(path) => path,
+                None => {
+                    let callback = repository
+                        .find_callback_visible_to(&session_id, &user.id, user.role == Role::Admin)
+                        .await?;
+                    match callback {
+                        Some(callback) if callback.os.to_ascii_lowercase().contains("windows") => {
+                            r"C:\".to_owned()
+                        }
+                        _ => "/".to_owned(),
+                    }
+                }
+            };
+            ("nw/fs-list".to_owned(), vec![path])
+        }
+    };
     let timeout_ms = request.timeout_ms.unwrap_or(30_000).clamp(1, 600_000);
     let task_id = repository
         .enqueue_task_with_audit(
             &session_id,
-            command,
-            &serde_json::json!(request.arguments),
+            &command,
+            &serde_json::json!(arguments),
             timeout_ms,
             &user.id,
             &user.username,

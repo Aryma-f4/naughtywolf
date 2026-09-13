@@ -1704,6 +1704,17 @@ impl Repository {
         .map_err(|_| AppError::Internal)
     }
 
+    pub async fn latest_listed_path(&self, session_id: &str) -> Result<Option<String>, AppError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT path FROM c2_file_snapshots WHERE session_id = ? \
+             ORDER BY captured_at DESC, task_id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
     pub async fn latest_file_snapshot(
         &self,
         session_id: &str,

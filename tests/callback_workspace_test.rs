@@ -2376,6 +2376,112 @@ async fn filesystem_list_result_rejects_path_mismatch_without_any_result_write()
 }
 
 #[tokio::test]
+async fn enqueue_ls_aliases_to_fs_list_with_explicit_path_or_last_listed_default() {
+    let (_directory, repo, store, operator, session_id) = transfer_fixture(4096).await;
+    let listed = repo
+        .enqueue_task(
+            &session_id,
+            "nw/fs-list",
+            &serde_json::json!(["/srv/lab"]),
+            30_000,
+        )
+        .await
+        .unwrap();
+    repo.store_task_result_for_session(
+        &session_id,
+        &listed,
+        true,
+        &filesystem_snapshot_fixture("/srv/lab", "2026-09-10T12:30:00Z"),
+        &[],
+        0,
+    )
+    .await
+    .unwrap();
+    let app = authenticated_transfer_app(repo.clone(), operator, store).await;
+    let page = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/callbacks/{session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let csrf = csrf_token(&response_text(page).await);
+    let post = |body: &str| {
+        app.clone().oneshot(
+            Request::post(format!("/api/callbacks/{session_id}/tasks"))
+                .header("content-type", "application/json")
+                .header("x-csrf-token", csrf.clone())
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+    };
+
+    let default_ls = json(
+        post(r#"{"command":"ls","arguments":[],"timeout_ms":30000}"#)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        default_ls["command"], "nw/fs-list",
+        "bare ls targets the ledger, not a shell binary"
+    );
+    assert_eq!(
+        default_ls["arguments"],
+        serde_json::json!(["/srv/lab"]),
+        "bare ls defaults to the last listed path"
+    );
+
+    let explicit = json(
+        post(r#"{"command":"ls","arguments":["/etc/hosts"],"timeout_ms":30000}"#)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(explicit["command"], "nw/fs-list");
+    assert_eq!(explicit["arguments"], serde_json::json!(["/etc/hosts"]));
+
+    let positional = json(
+        post(r#"{"command":"ls /etc/hosts","arguments":[],"timeout_ms":30000}"#)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(positional["arguments"], serde_json::json!(["/etc/hosts"]));
+
+    let multi_path = post(r#"{"command":"ls","arguments":["/a","/b"],"timeout_ms":30000}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        multi_path.status(),
+        StatusCode::BAD_REQUEST,
+        "ls takes a single path"
+    );
+
+    let relative = post(r#"{"command":"ls","arguments":["relative"],"timeout_ms":30000}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        relative.status(),
+        StatusCode::BAD_REQUEST,
+        "ls targets must be absolute remote paths"
+    );
+
+    let shell_echo = json(
+        post(r#"{"command":"echo hi","arguments":[],"timeout_ms":30000}"#)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        shell_echo["command"], "echo hi",
+        "the alias must not touch non-ls commands"
+    );
+}
+
+#[tokio::test]
 async fn filesystem_list_result_rejects_nonchild_and_name_mismatch_entries_atomically() {
     let repo = test_repository().await;
     let operator = create_user(&repo, "filesystem-entry-invalid", Role::Operator).await;
