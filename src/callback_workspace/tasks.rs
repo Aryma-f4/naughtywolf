@@ -196,58 +196,6 @@ fn resolve_ls(command: &str, arguments: &[String]) -> Result<LsResolution, AppEr
     Ok(LsResolution::Path(path))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ls(command: &str, arguments: &[&str]) -> Result<LsResolution, AppError> {
-        resolve_ls(
-            command,
-            &arguments.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        )
-    }
-
-    #[test]
-    fn ls_alias_resolves_named_paths() {
-        assert_eq!(
-            ls("ls", &[]).unwrap(),
-            LsResolution::DefaultPath,
-            "bare ls defaults to the last listed path"
-        );
-        assert_eq!(
-            ls("ls", &["/srv/lab"]).unwrap(),
-            LsResolution::Path("/srv/lab".into())
-        );
-        assert_eq!(
-            ls("ls", &[]).map_err(|e| e.to_string()),
-            Ok(LsResolution::DefaultPath)
-        );
-        assert_eq!(
-            ls("ls /etc", &[]).unwrap(),
-            LsResolution::Path("/etc".into())
-        );
-        assert_eq!(
-            ls("ls", &["C:\\Users\\alice"]).unwrap(),
-            LsResolution::Path(r"C:\Users\alice".into())
-        );
-        assert!(
-            ls("ls", &["not-absolute"]).is_err(),
-            "relative ls targets are rejected"
-        );
-        assert_eq!(
-            format!("{}", ls("ls", &["/a", "/b"]).unwrap_err()),
-            "validation failed: ls accepts a single remote path"
-        );
-    }
-
-    #[test]
-    fn ls_alias_ignores_other_commands() {
-        assert_eq!(ls("latest", &[]).unwrap(), LsResolution::NotLs);
-        assert_eq!(ls("pwd", &[]).unwrap(), LsResolution::NotLs);
-        assert_eq!(ls("cat /etc/passwd", &[]).unwrap(), LsResolution::NotLs);
-    }
-}
-
 pub(super) async fn require_csrf(session: &Session, headers: &HeaderMap) -> Result<(), AppError> {
     let expected: Option<String> = session
         .get(CSRF_TOKEN_KEY)
@@ -469,4 +417,52 @@ pub async fn task_events(
             .interval(Duration::from_secs(15))
             .text("keepalive"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ls(command: &str, arguments: &[&str]) -> Result<LsResolution, AppError> {
+        resolve_ls(
+            command,
+            &arguments.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn ls_alias_resolves_named_paths() {
+        assert_eq!(
+            ls("ls", &[]).unwrap(),
+            LsResolution::DefaultPath,
+            "bare ls defaults to the last listed path"
+        );
+        assert_eq!(
+            ls("ls", &["/srv/lab"]).unwrap(),
+            LsResolution::Path("/srv/lab".into())
+        );
+        assert_eq!(
+            ls("ls /etc", &[]).unwrap(),
+            LsResolution::Path("/etc".into())
+        );
+        assert_eq!(
+            ls("ls", &["C:\\Users\\alice"]).unwrap(),
+            LsResolution::Path(r"C:\Users\alice".into())
+        );
+        assert!(
+            ls("ls", &["not-absolute"]).is_err(),
+            "relative ls targets are rejected"
+        );
+        assert_eq!(
+            format!("{}", ls("ls", &["/a", "/b"]).unwrap_err()),
+            "validation failed: ls accepts a single remote path"
+        );
+    }
+
+    #[test]
+    fn ls_alias_ignores_other_commands() {
+        assert_eq!(ls("latest", &[]).unwrap(), LsResolution::NotLs);
+        assert_eq!(ls("pwd", &[]).unwrap(), LsResolution::NotLs);
+        assert_eq!(ls("cat /etc/passwd", &[]).unwrap(), LsResolution::NotLs);
+    }
 }
