@@ -118,11 +118,14 @@ where
 }
 
 #[cfg(not(unix))]
-async fn drain_capped<R>(mut reader: R, limit: usize) -> Vec<u8>
+async fn drain_capped<S>(stream: Option<S>, limit: usize) -> Vec<u8>
 where
-    R: tokio::io::AsyncRead + Unpin,
+    S: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     use tokio::io::AsyncReadExt;
+    let Some(mut reader) = stream else {
+        return Vec::new();
+    };
     let mut kept = Vec::with_capacity(limit.min(64 * 1024));
     let mut chunk = [0_u8; 16 * 1024];
     loop {
