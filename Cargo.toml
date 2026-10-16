@@ -29,10 +29,11 @@ hex = "0.4"
 hkdf = "0.12"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2"] }
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 serde_urlencoded = "0.7"
 futures = "0.3"
+futures-util = "0.3"
 async-trait = "0.1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json"] }
 argon2 = "0.5"
@@ -40,6 +41,9 @@ chrono = { version = "0.4", features = ["serde"] }
 rpassword = "7"
 tempfile = "3"
 libc = "0.2"
+tonic = { version = "0.12", features = ["tls"] }
+tonic-build = "0.12"
+prost = "0.13"
 
 [package]
 name = "naughtywolf"
@@ -77,11 +81,13 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 sha2 = "0.10"
+rand = "0.8"
 libc.workspace = true
 hex.workspace = true
 base64 = { version = "0.22", features = ["std"] }
 nw-profile = { path = "crates/profile" }
 reqwest = { workspace = true, features = ["rustls-tls", "multipart"] }
+ldap3 = { version = "0.12.1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 tempfile.workspace = true

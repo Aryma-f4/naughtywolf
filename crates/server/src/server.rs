@@ -64,6 +64,15 @@ pub async fn serve(state: ServerState, config: &crate::config::ServerConfig) -> 
             let _ = axum::serve(smb_listener, smb_app).await;
         });
     }
+    // Spawn optional gRPC listener. It owns its own socket, so it cannot be
+    // folded into the axum router.
+    if let Some(grpc_bind) = &config.grpc_bind {
+        let addr: std::net::SocketAddr = grpc_bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("grpc_bind {grpc_bind:?} is not a socket address: {e}"))?;
+        crate::grpc::serve(state.clone(), addr).await?;
+        tracing::info!(grpc_bind, "c2 grpc listener up");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -146,6 +155,7 @@ mod tests {
             tcp_bind: None,
             dns_bind: None,
             smb_bind: None,
+            grpc_bind: None,
             callback_host: "http://127.0.0.1:0".into(),
             psk: "test-psk".into(),
             downloads_dir: dir.path().join("downloads").display().to_string(),

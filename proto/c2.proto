@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package nw;
+
+// The C2 protocol itself is unchanged: every check-in is a sealed (AEAD)
+// envelope blob. gRPC only supplies the carrier, so the wire message stays a
+// single opaque byte field rather than restating the JSON protocol. That keeps
+// one protocol implementation shared by HTTP, WebSocket, TCP, DNS and gRPC.
+service C2 {
+  rpc Checkin(Frame) returns (Frame);
+}
+
+message Frame {
+  bytes sealed = 1;
+}

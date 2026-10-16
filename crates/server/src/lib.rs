@@ -5,6 +5,7 @@ pub mod creds;
 pub mod dispatch;
 pub mod dns;
 pub mod filestore;
+pub mod grpc;
 pub mod operators;
 pub mod persist;
 pub mod queue;

@@ -3,6 +3,8 @@ pub struct ServerConfig {
     pub tcp_bind: Option<String>,
     pub dns_bind: Option<String>,
     pub smb_bind: Option<String>,
+    /// Optional gRPC listener address, e.g. `127.0.0.1:50051`.
+    pub grpc_bind: Option<String>,
     pub callback_host: String,
     pub psk: String,
     pub downloads_dir: String,
@@ -27,6 +29,7 @@ impl ServerConfig {
             tcp_bind: get("NW_TCP_BIND").filter(|s| !s.is_empty()),
             dns_bind: get("NW_DNS_BIND").filter(|s| !s.is_empty()),
             smb_bind: get("NW_SMB_BIND").filter(|s| !s.is_empty()),
+            grpc_bind: get("NW_GRPC_BIND").filter(|s| !s.is_empty()),
             callback_host: get("NW_CALLBACK_HOST")
                 .unwrap_or_else(|| "http://127.0.0.1:8081".into()),
             psk: get("NW_PSK").unwrap_or_else(|| "dev-psk-change-me".into()),
@@ -54,6 +57,7 @@ mod tests {
         assert_eq!(config.tcp_bind, None);
         assert_eq!(config.dns_bind, None);
         assert_eq!(config.smb_bind, None);
+        assert_eq!(config.grpc_bind, None);
         assert_eq!(config.callback_host, "http://127.0.0.1:8081");
         assert_eq!(config.psk, "dev-psk-change-me");
         assert_eq!(config.db_path, None);
@@ -76,6 +80,7 @@ mod tests {
         assert_eq!(config.psk, "test-psk");
         assert_eq!(config.db_path, Some(":memory:".to_string()));
         assert_eq!(config.smb_bind, None);
+        assert_eq!(config.grpc_bind, None);
         assert_eq!(
             config.admin_password,
             Some("correct-horse-battery-staple".to_string())

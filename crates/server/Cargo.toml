@@ -22,6 +22,11 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 chrono.workspace = true
 nw-modules = { path = "../modules" }
+tonic.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

