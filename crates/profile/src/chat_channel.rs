@@ -144,7 +144,7 @@ impl ChatChannel for DiscordChannel {
         let created: Created = self
             .client
             .post(format!("{}/channels/{}/messages", self.api, self.channel))
-            .bearer_auth(&self.token)
+            .header("Authorization", format!("Bot {}", self.token))
             .json(&serde_json::json!({ "content": body }))
             .send()
             .await
@@ -166,7 +166,7 @@ impl ChatChannel for DiscordChannel {
         let raw: Vec<Raw> = self
             .client
             .get(format!("{}/channels/{}/messages", self.api, self.channel))
-            .bearer_auth(&self.token)
+            .header("Authorization", format!("Bot {}", self.token))
             .send()
             .await
             .map_err(|e| format!("discord poll failed: {e}"))?
@@ -175,13 +175,20 @@ impl ChatChannel for DiscordChannel {
             .json()
             .await
             .map_err(|e| format!("discord poll decode failed: {e}"))?;
-        Ok(raw
+        let mut messages: Vec<ChatMessage> = raw
             .into_iter()
             .map(|m| ChatMessage {
                 id: m.id,
                 body: m.content,
             })
-            .collect())
+            .collect();
+        // Discord returns newest-first, but Cursor::accept is a high-water mark:
+        // it consumes in ascending order and drops anything at or below the mark.
+        // Handing it a descending list would let the newest id advance the mark
+        // past every older message still waiting in the batch, silently dropping
+        // tasks. Sorting ascending keeps the cursor's contract intact.
+        messages.sort_by_key(|m| m.id.parse::<u128>().unwrap_or(u128::MAX));
+        Ok(messages)
     }
 }
 
@@ -509,5 +516,60 @@ mod endpoint_tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod discord_tests {
+    use super::*;
+    use crate::chat::Cursor;
+
+    fn msg(id: &str, body: &str) -> ChatMessage {
+        ChatMessage {
+            id: id.to_owned(),
+            body: body.to_owned(),
+        }
+    }
+
+    /// Discord hands back newest-first. The high-water cursor would consume the
+    /// newest id first, advance the mark, and then drop every older message in
+    /// the same batch, losing the task entirely.
+    #[test]
+    fn discord_poll_order_is_oldest_first_for_the_high_water_cursor() {
+        let mut messages = vec![msg("100", "b"), msg("99", "a"), msg("98", "c")];
+        messages.sort_by_key(|m| m.id.parse::<u128>().unwrap_or(u128::MAX));
+        assert_eq!(
+            messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["98", "99", "100"],
+        );
+    }
+
+    #[test]
+    fn ascending_order_delivers_every_pending_message_to_the_cursor() {
+        let cursor = Cursor::new();
+        // Ascending: each id advances the mark and is accepted.
+        for id in ["1", "2", "3"] {
+            assert!(cursor.accept(id, "body").is_some(), "{id} dropped");
+        }
+        // Re-reading the same batch must not redeliver anything.
+        for id in ["1", "2", "3"] {
+            assert!(cursor.accept(id, "body").is_none(), "{id} replayed");
+        }
+    }
+
+    #[test]
+    fn descending_order_would_drop_pending_messages() {
+        // Documents the bug this ordering rule exists to prevent: processing
+        // newest-first loses the middle message.
+        let cursor = Cursor::new();
+        let seen: Vec<&str> = ["3", "2", "1"]
+            .into_iter()
+            .filter(|id| cursor.accept(id, "body").is_some())
+            .collect();
+        assert_eq!(
+            seen,
+            ["3"],
+            "only the newest survived; older ones were dropped"
+        );
     }
 }
