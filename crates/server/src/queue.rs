@@ -148,10 +148,20 @@ impl TaskQueue {
         Ok(task_id)
     }
 
+    /// Control commands that must preempt the normal FIFO order.
+    ///
+    /// A cancellation is enqueued as `nw/killtask`. If it waits behind
+    /// unrelated pending work, "stop" only takes effect once those tasks are
+    /// delivered, which is exactly the delay a kill must not have.
+    fn is_priority(command: &str) -> bool {
+        matches!(command, "nw/killtask")
+    }
+
     pub async fn drain(&self, session_id: &Uuid) -> Vec<Task> {
         match &self.backend {
             Backend::Memory(map) => Self::with_memory(map, session_id, |queue| {
-                let tasks = std::mem::take(&mut queue.pending);
+                let mut tasks = std::mem::take(&mut queue.pending);
+                tasks.sort_by_key(|task| !Self::is_priority(&task.command));
                 for task in &tasks {
                     queue
                         .statuses
@@ -163,9 +173,11 @@ impl TaskQueue {
                 let Ok(mut transaction) = pool.begin().await else {
                     return Vec::new();
                 };
+                // Priority commands first, each group still FIFO by creation.
                 let rows = match sqlx::query_as::<_, TaskRow>(
                     "SELECT id, command, args_json, timeout_ms FROM c2_tasks \
-                     WHERE session_id = ?1 AND status = 'pending' ORDER BY created_at, id",
+                     WHERE session_id = ?1 AND status = 'pending' \
+                     ORDER BY (command = 'nw/killtask') DESC, created_at, id",
                 )
                 .bind(session_id.to_string())
                 .fetch_all(&mut *transaction)
@@ -527,5 +539,53 @@ mod tests {
                 .stdout,
             b"root"
         );
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    fn task(id: Uuid, command: &str) -> Task {
+        Task {
+            id,
+            command: command.to_owned(),
+            args: vec![],
+            timeout_ms: 10_000,
+        }
+    }
+
+    /// Regression: a kill must not sit behind unrelated pending work.
+    #[test]
+    fn killtask_is_delivered_before_ordinary_pending_tasks() {
+        let kill = Uuid::new_v4();
+        let mut tasks = vec![
+            task(Uuid::new_v4(), "shell"),
+            task(kill, "nw/killtask"),
+            task(Uuid::new_v4(), "fs-list"),
+        ];
+        tasks.sort_by_key(|t| !TaskQueue::is_priority(&t.command));
+        assert_eq!(
+            tasks.iter().map(|t| t.command.as_str()).collect::<Vec<_>>(),
+            ["nw/killtask", "shell", "fs-list"]
+        );
+    }
+
+    #[test]
+    fn ordering_is_stable_within_each_priority_group() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut tasks = vec![task(first, "shell"), task(second, "shell")];
+        tasks.sort_by_key(|t| !TaskQueue::is_priority(&t.command));
+        assert_eq!(tasks[0].id, first, "FIFO preserved among normal tasks");
+        assert_eq!(tasks[1].id, second);
+    }
+
+    #[test]
+    fn only_killtask_is_treated_as_priority() {
+        assert!(TaskQueue::is_priority("nw/killtask"));
+        assert!(!TaskQueue::is_priority("shell"));
+        assert!(!TaskQueue::is_priority("nw/exec-code"));
+        assert!(!TaskQueue::is_priority("nw/process-kill"));
     }
 }
