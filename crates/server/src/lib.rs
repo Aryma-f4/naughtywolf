@@ -1,4 +1,6 @@
 pub mod audit_log;
+pub mod channel;
+pub use nw_profile::chat_channel as chat;
 pub mod channels;
 pub mod config;
 pub mod creds;

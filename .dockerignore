@@ -9,6 +9,11 @@
 !static/**
 !migrations/
 !migrations/**
+# Root build.rs drives tonic-build and proto/ holds the schema it compiles,
+# so both must reach the build context or every image build fails.
+!build.rs
+!proto/
+!proto/**
 # Exclude local artifacts and credentials, including inside allowed folders.
 **/target/
 **/.env

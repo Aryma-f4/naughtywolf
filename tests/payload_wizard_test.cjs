@@ -9,10 +9,12 @@ function interactiveElement() {
     hidden: false,
     disabled: false,
     attrs: {},
+    dataset: {},
     addEventListener(type, fn) { listeners[type] = fn; },
     setAttribute(name, value) { this.attrs[name] = String(value); },
     removeAttribute(name) { delete this.attrs[name]; },
     click() { listeners.click?.({ preventDefault() {} }); },
+    fire(type) { listeners[type]?.({ target: this }); },
   };
 }
 
@@ -38,6 +40,36 @@ function wizardHarness() {
     },
   };
   return { form, steps, tabs, back, next, build };
+}
+
+function chatHarness() {
+  const base = wizardHarness();
+  const lhost = Object.assign(interactiveElement(), { value: 'c2.lab.example', readOnly: false, attrs: { required: '' } });
+  const lport = Object.assign(interactiveElement(), { value: '8443', readOnly: false, attrs: { required: '' }, hasRequired: true });
+  const protocol = Object.assign(interactiveElement(), { value: 'https' });
+  const chatGroup = Object.assign(interactiveElement(), { hidden: true });
+  const chatInputs = [interactiveElement(), interactiveElement()];
+  chatGroup.querySelectorAll = () => chatInputs;
+  chatInputs[0].getAttribute = (n) => (n === 'required' ? '' : null);
+
+  const nodes = {
+    '#payload-lhost': lhost,
+    '#payload-lport': lport,
+    '#payload-proto': protocol,
+    '[data-chat-fields]': chatGroup,
+  };
+  const form = {
+    querySelectorAll(sel) { return base.form.querySelectorAll(sel); },
+    querySelector(sel) {
+      if (sel in nodes) return nodes[sel];
+      return base.form.querySelector(sel);
+    },
+  };
+  // `required` is toggled through set/removeAttribute in the source.
+  Object.defineProperty(lport, 'hasRequired', {
+    get() { return 'required' in this.attrs; },
+  });
+  return { ...base, form, lhost, lport, protocol, chatGroup, chatInputs };
 }
 
 test('payload wizard exposes one step at a time and keeps build for the final step', () => {
@@ -88,4 +120,40 @@ test('gsocket summary describes the local forward without exposing its secret', 
   });
   assert.deepEqual(summary[2], ['Callback', 'GSOCKET · local forward :4630']);
   assert.equal(JSON.stringify(summary).includes('never-render-me'), false);
+});
+
+test('chat protocol reveals token/address fields and pins host/port', () => {
+  const h = chatHarness();
+  createWizard(h.form);
+
+  h.protocol.value = 'discord';
+  h.protocol.fire('change');
+
+  assert.equal(h.chatGroup.hidden, false, 'chat fields must be visible');
+  h.chatInputs.forEach(input => {
+    assert.equal(input.disabled, false, 'chat inputs must be enabled');
+    assert.equal(input.required, true, 'chat inputs must be required');
+  });
+  assert.equal(h.lhost.readOnly, true, 'LHost is meaningless for chat');
+  assert.equal(h.lport.readOnly, true);
+  assert.equal(h.lhost.value, '—');
+  assert.equal(h.lport.hasRequired, false, 'a chat payload has no port');
+});
+
+test('switching away from a chat protocol restores host and port', () => {
+  const h = chatHarness();
+  createWizard(h.form);
+
+  h.protocol.value = 'discord';
+  h.protocol.fire('change');
+  h.protocol.value = 'https';
+  h.protocol.fire('change');
+
+  assert.equal(h.chatGroup.hidden, true);
+  h.chatInputs.forEach(input => assert.equal(input.disabled, true));
+  assert.equal(h.lhost.readOnly, false, 'LHost must be editable again');
+  assert.equal(h.lhost.value, 'c2.lab.example', 'previous host is restored');
+  assert.equal(h.lport.readOnly, false);
+  assert.equal(h.lport.value, '8443', 'previous port is restored');
+  assert.equal(h.lport.hasRequired, true, 'host protocols still need a port');
 });

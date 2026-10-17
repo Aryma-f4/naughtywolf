@@ -69,6 +69,22 @@ pub struct AssetRecordReviewInput {}
 pub enum CheckInput {
     AssetRecordReview(AssetRecordReviewInput),
     SurfaceRecon(super::recon::SurfaceReconInput),
+    DirectoryEnum(super::directory::DirectoryEnumInput),
+}
+
+impl CheckInput {
+    /// The shape persisted alongside the run. Bind passwords are stripped here
+    /// so no credential is ever written to `check_runs` or rendered later.
+    fn redacted(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        if let Some(fields) = value
+            .get_mut("input")
+            .and_then(|input| input.as_object_mut())
+        {
+            fields.remove("bind_password");
+        }
+        value
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,7 +251,7 @@ impl Runner {
                 definition.max_output_bytes as i64,
             )
             .await?;
-        let input_json = serde_json::to_value(&input).map_err(|_| AppError::Internal)?;
+        let input_json = input.redacted();
         let run = repository
             .create_run(
                 definition.id,
@@ -413,6 +429,7 @@ fn validate_input(definition: &CheckDefinition, input: &CheckInput) -> Result<()
     match (definition.id, input) {
         ("asset-record-review", CheckInput::AssetRecordReview(_)) => Ok(()),
         ("surface-recon", CheckInput::SurfaceRecon(_)) => Ok(()),
+        ("directory-enum", CheckInput::DirectoryEnum(_)) => Ok(()),
         _ => Err(AppError::Validation(
             "input does not match the selected check".to_owned(),
         )),
@@ -428,6 +445,9 @@ async fn run_check(
         ("asset-record-review", CheckInput::AssetRecordReview(_)) => review_asset_record(asset),
         ("surface-recon", CheckInput::SurfaceRecon(input)) => {
             super::recon::collect(&asset.address, input).await
+        }
+        ("directory-enum", CheckInput::DirectoryEnum(input)) => {
+            super::directory::enumerate(&asset.address, input).await
         }
         _ => Err("check implementation is unavailable"),
     }

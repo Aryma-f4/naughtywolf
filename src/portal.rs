@@ -19,7 +19,10 @@ use crate::{
         rbac::Role,
     },
     db::{
-        models::{Asset, AuditEvent, CheckRun, Operation, OperationStatus, RunState},
+        models::{
+            Asset, AssetStatus, AuditEvent, Callback, CallbackGroup, CheckRun, EventRule,
+            Operation, OperationStatus, RunState,
+        },
         repositories::Repository,
     },
     evidence::EvidenceStore,
@@ -124,24 +127,47 @@ pub fn authenticated_router_with_transfer_limit(max_transfer_bytes: u64) -> Rout
         .route("/topology/data", get(workspace::topology_data))
         .route("/recon", get(workspace::recon_page))
         .route("/recon/run", post(workspace::run_recon))
+        .route("/directory", get(workspace::directory_page))
+        .route("/directory/run", post(workspace::run_directory))
         .route("/operations", get(operations).post(create_operation))
         .route("/operations/new", get(new_operation))
         .route("/operations/{operation_id}/assets", post(create_asset))
         .route("/operations/{operation_id}/assets/new", get(new_asset))
         .route("/inventory", get(inventory))
+        .route(
+            "/assets/{asset_id}/edit",
+            get(edit_asset).post(update_asset),
+        )
         .route("/checks", get(checks))
         .route("/audit", get(audit))
+        .route("/credentials", get(credentials))
+        .route("/attack", get(attack_coverage))
         .route("/evidence", get(evidence))
         .route("/evidence/{evidence_id}/download", get(download_evidence))
         .route("/reports", get(reports))
         .route("/payloads", get(payloads))
         .route("/payloads/generate", post(generate_payload))
+        .route("/payloads/randomize", post(randomize_payloads))
         .route("/payloads/edit/{file}", get(edit_payload))
         .route("/payloads/delete/{file}", post(delete_payload))
         .route("/callbacks", get(callbacks))
         .route("/callbacks/{session_id}", get(callback_detail))
         .route("/callbacks/{session_id}/delete", post(delete_callback))
         .route("/eventing", get(eventing).post(create_event_rule))
+        .route("/eventing/dispatch", post(dispatch_to_group))
+        .route("/eventing/groups", post(create_callback_group))
+        .route(
+            "/eventing/groups/{group_id}/delete",
+            post(delete_callback_group),
+        )
+        .route(
+            "/eventing/groups/{group_id}/members",
+            post(add_group_member),
+        )
+        .route(
+            "/eventing/groups/{group_id}/members/remove",
+            post(remove_group_member),
+        )
         .route("/events", get(events_feed))
         .route("/services", get(services))
         .route("/search", get(search))
@@ -199,6 +225,14 @@ struct PayloadForm {
     gsocket_secret: Option<String>,
     #[serde(default)]
     gsocket_local_port: Option<u16>,
+    /// Beacon bot token for Discord/Telegram payloads. These channels are
+    /// `<token>@<address>` with no port, so they are not expressed as
+    /// LHost/LPort.
+    #[serde(default)]
+    chat_token: Option<String>,
+    /// Discord channel id or Telegram chat id for the beacon.
+    #[serde(default)]
+    chat_address: Option<String>,
     #[serde(default = "default_interval")]
     interval_ms: u64,
     #[serde(default = "default_jitter")]
@@ -210,6 +244,9 @@ struct PayloadForm {
     /// Rust target triple; empty = host build.
     #[serde(default)]
     target: String,
+    /// Opt out of build hardening to measure what it was hiding.
+    #[serde(default = "default_harden")]
+    harden: bool,
     csrf_token: Option<String>,
 }
 
@@ -233,7 +270,22 @@ struct AssetForm {
     owner: String,
     #[serde(default)]
     address: String,
+    #[serde(default)]
+    status: String,
     csrf_token: Option<String>,
+}
+
+fn asset_form_fields<'a>(
+    form: &'a AssetForm,
+    status: AssetStatus,
+) -> templates::AssetFormFields<'a> {
+    templates::AssetFormFields {
+        name: &form.name,
+        kind: &form.kind,
+        owner: &form.owner,
+        address: &form.address,
+        status,
+    }
 }
 
 async fn new_operation(
@@ -290,12 +342,15 @@ async fn new_asset(
 ) -> Result<Html<String>, AppError> {
     authorize_operation(&repository, &user, &operation_id, Role::Operator).await?;
     let csrf_token = issue_csrf_token(&session).await?;
+    let form = AssetForm::default();
     Ok(Html(templates::asset_form_page(
         &user,
-        &operation_id,
         &csrf_token,
         None,
-        ["", "", "", ""],
+        &asset_form_fields(&form, AssetStatus::Active),
+        "Add asset",
+        &format!("/operations/{operation_id}/assets"),
+        "Add asset",
     )))
 }
 
@@ -313,8 +368,11 @@ async fn create_asset(
             return invalid_asset_form_response(
                 &user,
                 &session,
-                &operation_id,
+                &format!("/operations/{operation_id}/assets"),
+                AssetStatus::Active,
                 &AssetForm::default(),
+                "Add asset",
+                "Add asset",
             )
             .await;
         }
@@ -322,7 +380,16 @@ async fn create_asset(
     if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
         || !valid_form_values(&[&form.name, &form.kind, &form.owner, &form.address])
     {
-        return invalid_asset_form_response(&user, &session, &operation_id, &form).await;
+        return invalid_asset_form_response(
+            &user,
+            &session,
+            &format!("/operations/{operation_id}/assets"),
+            AssetStatus::Active,
+            &form,
+            "Add asset",
+            "Add asset",
+        )
+        .await;
     }
 
     repository
@@ -336,7 +403,7 @@ async fn create_asset(
             &Uuid::new_v4().to_string(),
         )
         .await?;
-    Ok(Redirect::to("/operations").into_response())
+    Ok(Redirect::to("/inventory").into_response())
 }
 
 async fn invalid_operation_form_response(
@@ -361,18 +428,23 @@ async fn invalid_operation_form_response(
 async fn invalid_asset_form_response(
     user: &AuthenticatedUser,
     session: &Session,
-    operation_id: &str,
+    action: &str,
+    status: AssetStatus,
     form: &AssetForm,
+    title: &str,
+    submit_label: &str,
 ) -> Result<Response, AppError> {
     let csrf_token = issue_csrf_token(session).await?;
     Ok((
         StatusCode::BAD_REQUEST,
         Html(templates::asset_form_page(
             user,
-            operation_id,
             &csrf_token,
             Some("The request is invalid."),
-            [&form.name, &form.kind, &form.owner, &form.address],
+            &asset_form_fields(form, status),
+            title,
+            action,
+            submit_label,
         )),
     )
         .into_response())
@@ -402,13 +474,126 @@ async fn csrf_token_matches(session: &Session, submitted: Option<&str>) -> Resul
     Ok(expected.as_deref() == submitted && submitted.is_some())
 }
 
-async fn inventory(AuthenticatedUserGuard(user): AuthenticatedUserGuard) -> Html<String> {
-    Html(templates::empty_page(
-        "Inventory",
+async fn inventory(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    let is_admin = user.role == Role::Admin;
+    let (assets, operations) = tokio::try_join!(
+        repository.list_assets_visible_to(&user.id, is_admin),
+        repository.list_operations_visible_to(&user.id, is_admin),
+    )?;
+    let operation_names = operations
+        .iter()
+        .map(|operation| (operation.id.as_str(), operation.name.as_str()))
+        .collect();
+    Ok(Html(templates::inventory_page(
         &user,
-        "inventory",
-        "No scoped inventory yet",
-    ))
+        &assets,
+        &operation_names,
+    )))
+}
+
+async fn edit_asset(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(asset_id): Path<String>,
+    session: Session,
+) -> Result<Html<String>, AppError> {
+    let asset = repository
+        .find_asset(&asset_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    authorize_operation(&repository, &user, &asset.operation_id, Role::Operator).await?;
+    let csrf_token = issue_csrf_token(&session).await?;
+    Ok(Html(templates::asset_form_page(
+        &user,
+        &csrf_token,
+        None,
+        &templates::AssetFormFields {
+            name: &asset.name,
+            kind: &asset.kind,
+            owner: &asset.owner,
+            address: &asset.address,
+            status: asset.status,
+        },
+        "Edit asset",
+        &format!("/assets/{asset_id}/edit"),
+        "Save asset",
+    )))
+}
+
+async fn update_asset(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Path(asset_id): Path<String>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    let asset = repository
+        .find_asset(&asset_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    authorize_operation(&repository, &user, &asset.operation_id, Role::Operator).await?;
+    let form = match Form::<AssetForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return invalid_asset_form_response(
+                &user,
+                &session,
+                &format!("/assets/{asset_id}/edit"),
+                asset.status,
+                &AssetForm::default(),
+                "Edit asset",
+                "Save asset",
+            )
+            .await;
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || !valid_form_values(&[&form.name, &form.kind, &form.owner, &form.address])
+    {
+        return invalid_asset_form_response(
+            &user,
+            &session,
+            &format!("/assets/{asset_id}/edit"),
+            asset.status,
+            &form,
+            "Edit asset",
+            "Save asset",
+        )
+        .await;
+    }
+
+    let status = match form.status.as_str() {
+        "" | "active" => AssetStatus::Active,
+        "retired" => AssetStatus::Retired,
+        _ => {
+            return invalid_asset_form_response(
+                &user,
+                &session,
+                &format!("/assets/{asset_id}/edit"),
+                asset.status,
+                &form,
+                "Edit asset",
+                "Save asset",
+            )
+            .await;
+        }
+    };
+    repository
+        .update_asset_with_audit(
+            &asset_id,
+            form.name.trim(),
+            form.kind.trim(),
+            form.owner.trim(),
+            form.address.trim(),
+            status,
+            &user.id,
+            &Uuid::new_v4().to_string(),
+        )
+        .await?;
+    Ok(Redirect::to("/inventory").into_response())
 }
 
 async fn checks(
@@ -419,6 +604,24 @@ async fn checks(
         .list_check_runs_visible_to(&user.id, user.role == Role::Admin)
         .await?;
     Ok(Html(templates::checks_page(&user, &runs)))
+}
+
+async fn attack_coverage(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+) -> Result<Html<String>, AppError> {
+    Ok(Html(templates::attack_coverage_page(&user)))
+}
+
+async fn credentials(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+) -> Result<Html<String>, AppError> {
+    // Operator-gated: these rows carry recovered secret material.
+    user.require(Role::Operator)?;
+    let creds = repository
+        .list_credentials_visible_to(&user.id, user.role == Role::Admin)
+        .await?;
+    Ok(Html(templates::credentials_page(&user, &creds)))
 }
 
 async fn audit(
@@ -535,7 +738,17 @@ async fn generate_payload(
     };
     let supported_protocol = matches!(
         form.protocol.as_str(),
-        "http" | "https" | "tcp" | "gs" | "dns"
+        "http"
+            | "https"
+            | "tcp"
+            | "gs"
+            | "dns"
+            | "ws"
+            | "wss"
+            | "grpc"
+            | "grpcs"
+            | "discord"
+            | "telegram"
     );
     let valid_gsocket = form.protocol != "gs"
         || (form
@@ -543,12 +756,25 @@ async fn generate_payload(
             .as_deref()
             .is_some_and(|secret| !secret.trim().is_empty())
             && form.gsocket_local_port.is_some_and(|port| port > 0));
+    // Chat channels are `<token>@<address>` with no port, so LHost/LPort are
+    // meaningless for them and the token/address are required instead.
+    let is_chat_channel = matches!(form.protocol.as_str(), "discord" | "telegram");
+    let valid_chat_channel = !is_chat_channel
+        || (form
+            .chat_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+            && form
+                .chat_address
+                .as_deref()
+                .is_some_and(|address| !address.trim().is_empty()));
+    let valid_host_port = is_chat_channel || (!form.lhost.trim().is_empty() && form.lport > 0);
     if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
-        || form.lhost.trim().is_empty()
         || form.name.trim().is_empty()
-        || form.lport == 0
+        || !valid_host_port
         || !supported_protocol
         || !valid_gsocket
+        || !valid_chat_channel
     {
         let csrf_token = issue_csrf_token(&session).await?;
         return Ok((
@@ -557,7 +783,7 @@ async fn generate_payload(
                 &user,
                 &crate::payload::list().unwrap_or_default(),
                 &csrf_token,
-                Some("Provide a valid name, callback, protocol, and GSocket secret when selected."),
+                Some("Provide a valid name, callback, protocol, and the channel details for the selected transport."),
                 None,
                 &crate::payload::building_jobs(),
                 &crate::payload::recent_errors(),
@@ -572,12 +798,15 @@ async fn generate_payload(
         lport: form.lport,
         protocol: form.protocol,
         gsocket_secret: form.gsocket_secret,
+        chat_token: form.chat_token.clone(),
+        chat_address: form.chat_address.clone(),
         gsocket_local_port: form.gsocket_local_port,
         os: form.os,
         arch: form.arch,
         interval_ms: form.interval_ms,
         jitter_ms: form.jitter_ms,
         target: form.target,
+        harden: form.harden,
     };
     tokio::spawn(async move {
         let file = crate::payload::predict_file(&req);
@@ -590,6 +819,109 @@ async fn generate_payload(
         }
     });
     Ok(Redirect::to("/payloads").into_response())
+}
+
+async fn randomize_payloads(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    Extension(c2_psk): Extension<std::sync::Arc<Vec<u8>>>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let form = match Form::<RandomizeForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return Err(AppError::Validation("Invalid form".into()));
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await? {
+        return Err(AppError::Validation("The request is invalid.".into()));
+    }
+    let count = form
+        .count
+        .clamp(1, crate::payload::MAX_RANDOM_VARIANTS as u64);
+    let base = crate::payload::BuildRequest {
+        name: form.name,
+        lhost: form.lhost,
+        lport: form.lport,
+        protocol: form.protocol,
+        gsocket_secret: form.gsocket_secret,
+        chat_token: form.chat_token.clone(),
+        chat_address: form.chat_address.clone(),
+        gsocket_local_port: form.gsocket_local_port,
+        os: form.os,
+        arch: form.arch,
+        interval_ms: form.interval_ms,
+        jitter_ms: form.jitter_ms,
+        target: form.target,
+        harden: form.harden,
+    };
+    if base.lhost.trim().is_empty() || base.lport == 0 {
+        return Err(AppError::Validation(
+            "Provide a callback address and port".into(),
+        ));
+    }
+
+    let variants = crate::payload::randomize(&base, count as usize, None);
+    tracing::info!(
+        operator = %user.id,
+        variants = variants.len(),
+        "queued randomized payload builds"
+    );
+    for variant in variants {
+        let c2_psk = c2_psk.clone();
+        tokio::spawn(async move {
+            let file = crate::payload::predict_file(&variant);
+            if let Err(error) = crate::payload::build(&variant, c2_psk.as_slice()).await {
+                crate::payload::record_build_error(&file, &error.to_string());
+                tracing::error!(error = %error, "randomized implant build failed");
+            }
+        });
+    }
+    Ok(Redirect::to("/payloads").into_response())
+}
+
+#[derive(Deserialize)]
+struct RandomizeForm {
+    #[serde(default)]
+    name: String,
+    lhost: String,
+    #[serde(default)]
+    lport: u16,
+    protocol: String,
+    #[serde(default)]
+    gsocket_secret: Option<String>,
+    #[serde(default)]
+    gsocket_local_port: Option<u16>,
+    /// Chat-channel credentials, carried into each variant because a variant
+    /// keeps the operator's endpoint.
+    #[serde(default)]
+    chat_token: Option<String>,
+    #[serde(default)]
+    chat_address: Option<String>,
+    os: String,
+    arch: String,
+    #[serde(default)]
+    interval_ms: u64,
+    #[serde(default)]
+    jitter_ms: u64,
+    #[serde(default)]
+    target: String,
+    #[serde(default = "default_variant_count")]
+    count: u64,
+    #[serde(default = "default_harden")]
+    harden: bool,
+    csrf_token: Option<String>,
+}
+
+const fn default_variant_count() -> u64 {
+    3
+}
+
+/// Hardening is on unless the operator explicitly opts out.
+const fn default_harden() -> bool {
+    true
 }
 
 async fn edit_payload(
@@ -647,6 +979,12 @@ async fn public_download_payload(Path(token): Path<String>) -> Result<Response, 
         .map_err(|_| AppError::Internal)?;
     if served.status() == StatusCode::NOT_FOUND {
         return Err(AppError::NotFound);
+    }
+    // The token resolved to a real artifact and the bytes are going out, so
+    // this is the moment the operator's "has any callback fetched this yet?"
+    // question gets its answer. Recorded only on a real serve.
+    if let Err(error) = crate::payload::record_retrieval(&filename) {
+        tracing::warn!(payload = %filename, error = %error, "could not record payload retrieval");
     }
     let (parts, body) = served.into_parts();
     let mut response = Response::from_parts(parts, axum::body::Body::new(body));
@@ -809,20 +1147,119 @@ async fn events_feed(
     Ok(Html(templates::event_feed_page(&user, &events)))
 }
 
+/// Hard ceiling on how many callbacks one group dispatch may reach. A cap that
+/// rejects loudly is safer than a silent truncation, which would quietly send a
+/// task to a subset the operator did not choose.
+const MAX_GROUP_DISPATCH_TARGETS: usize = 50;
+
+pub struct EventingView {
+    pub rules: Vec<EventRule>,
+    pub groups: Vec<CallbackGroup>,
+    pub operations: Vec<Operation>,
+    pub callbacks: Vec<Callback>,
+    pub members: std::collections::HashMap<String, Vec<Callback>>,
+    pub group_sizes: std::collections::HashMap<String, usize>,
+}
+
+async fn load_eventing(
+    repository: &Repository,
+    user: &AuthenticatedUser,
+) -> Result<EventingView, AppError> {
+    let is_admin = user.role == Role::Admin;
+    let (rules, groups, operations, callbacks) = tokio::try_join!(
+        repository.list_event_rules_visible_to(&user.id, is_admin),
+        repository.list_callback_groups_visible_to(&user.id, is_admin),
+        repository.list_operations_visible_to(&user.id, is_admin),
+        repository.list_callbacks_visible_to(&user.id, is_admin),
+    )?;
+
+    let mut members = std::collections::HashMap::new();
+    let mut group_sizes = std::collections::HashMap::new();
+    for group in &groups {
+        let resolved = repository
+            .resolve_group_targets(&group.id, &user.id, is_admin)
+            .await?;
+        group_sizes.insert(group.id.clone(), resolved.len());
+        members.insert(group.id.clone(), resolved);
+    }
+
+    Ok(EventingView {
+        rules,
+        groups,
+        operations,
+        callbacks,
+        members,
+        group_sizes,
+    })
+}
+
 async fn eventing(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repository): State<Repository>,
     session: Session,
+    Query(query): Query<EventingQuery>,
 ) -> Result<Html<String>, AppError> {
     user.require(Role::Operator)?;
     let csrf_token = issue_csrf_token(&session).await?;
-    let rules = repository.list_event_rules().await?;
+    let view = load_eventing(&repository, &user).await?;
+    // A preview names the exact targets a dispatch would reach, so the operator
+    // sees the blast radius before choosing to send anything.
+    let preview = match query.preview.as_deref().filter(|id| !id.is_empty()) {
+        Some(group_id) => repository
+            .find_callback_group_visible_to(group_id, &user.id, user.role == Role::Admin)
+            .await?
+            .map(|group| (group, view.group_sizes.get(group_id).copied().unwrap_or(0))),
+        None => None,
+    };
     Ok(Html(templates::eventing_page(
         &user,
-        &rules,
+        &view,
         &csrf_token,
+        preview.as_ref(),
         None,
     )))
+}
+
+#[derive(Deserialize)]
+struct EventingQuery {
+    preview: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct EventRuleForm {
+    #[serde(default)]
+    operation_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    trigger: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    target: String,
+    csrf_token: Option<String>,
+}
+
+async fn eventing_error(
+    user: &AuthenticatedUser,
+    repository: &Repository,
+    session: &Session,
+    message: &str,
+    status: StatusCode,
+) -> Result<Response, AppError> {
+    let csrf_token = issue_csrf_token(session).await?;
+    let view = load_eventing(repository, user).await?;
+    Ok((
+        status,
+        Html(templates::eventing_page(
+            user,
+            &view,
+            &csrf_token,
+            None,
+            Some(message),
+        )),
+    )
+        .into_response())
 }
 
 async fn create_event_rule(
@@ -835,38 +1272,34 @@ async fn create_event_rule(
     let form = match Form::<EventRuleForm>::from_request(request, &repository).await {
         Ok(Form(form)) => form,
         Err(_) => {
-            let csrf_token = issue_csrf_token(&session).await?;
-            let rules = repository.list_event_rules().await?;
-            return Ok((
+            return eventing_error(
+                &user,
+                &repository,
+                &session,
+                "The request is invalid.",
                 StatusCode::BAD_REQUEST,
-                Html(templates::eventing_page(
-                    &user,
-                    &rules,
-                    &csrf_token,
-                    Some("The request is invalid."),
-                )),
             )
-                .into_response());
+            .await;
         }
     };
     if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
         || !valid_form_values(&[&form.name, &form.trigger, &form.command])
+        || form.operation_id.trim().is_empty()
     {
-        let csrf_token = issue_csrf_token(&session).await?;
-        let rules = repository.list_event_rules().await?;
-        return Ok((
+        return eventing_error(
+            &user,
+            &repository,
+            &session,
+            "Provide an operation, rule name, trigger, and command.",
             StatusCode::BAD_REQUEST,
-            Html(templates::eventing_page(
-                &user,
-                &rules,
-                &csrf_token,
-                Some("Provide a rule name, trigger, and command."),
-            )),
         )
-            .into_response());
+        .await;
     }
+    authorize_operation(&repository, &user, form.operation_id.trim(), Role::Operator).await?;
+
     repository
         .create_event_rule(
+            form.operation_id.trim(),
             form.name.trim(),
             form.trigger.trim(),
             form.command.trim(),
@@ -880,6 +1313,426 @@ async fn create_event_rule(
         )
         .await?;
     Ok(Redirect::to("/eventing").into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct CallbackGroupForm {
+    #[serde(default)]
+    operation_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+    csrf_token: Option<String>,
+}
+
+async fn create_callback_group(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let form = match Form::<CallbackGroupForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return eventing_error(
+                &user,
+                &repository,
+                &session,
+                "The request is invalid.",
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || !valid_form_values(&[&form.name])
+        || form.operation_id.trim().is_empty()
+    {
+        return eventing_error(
+            &user,
+            &repository,
+            &session,
+            "Provide an operation and a group name.",
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    authorize_operation(&repository, &user, form.operation_id.trim(), Role::Operator).await?;
+    repository
+        .create_callback_group(
+            form.operation_id.trim(),
+            form.name.trim(),
+            form.description.trim(),
+            &user.id,
+            &Uuid::new_v4().to_string(),
+        )
+        .await?;
+    Ok(Redirect::to("/eventing").into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct GroupMemberForm {
+    #[serde(default)]
+    callback_id: String,
+    csrf_token: Option<String>,
+}
+
+async fn add_group_member(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    session: Session,
+    Path(group_id): Path<String>,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let form = match Form::<GroupMemberForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return eventing_error(
+                &user,
+                &repository,
+                &session,
+                "The request is invalid.",
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || form.callback_id.trim().is_empty()
+    {
+        return eventing_error(
+            &user,
+            &repository,
+            &session,
+            "The request is invalid.",
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    let group = repository
+        .find_callback_group_visible_to(&group_id, &user.id, user.role == Role::Admin)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    authorize_operation(&repository, &user, &group.operation_id, Role::Operator).await?;
+    // Visibility of the callback itself is checked before it can join a group,
+    // so membership can never launder an out-of-scope callback into reach.
+    if repository
+        .find_callback_visible_to(form.callback_id.trim(), &user.id, user.role == Role::Admin)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound);
+    }
+
+    repository
+        .add_callback_to_group(
+            &group_id,
+            form.callback_id.trim(),
+            &user.id,
+            &Uuid::new_v4().to_string(),
+        )
+        .await?;
+    Ok(Redirect::to("/eventing").into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct RemoveMemberForm {
+    #[serde(default)]
+    callback_id: String,
+    csrf_token: Option<String>,
+}
+
+async fn remove_group_member(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    session: Session,
+    Path(group_id): Path<String>,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let form = match Form::<RemoveMemberForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return eventing_error(
+                &user,
+                &repository,
+                &session,
+                "The request is invalid.",
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || form.callback_id.trim().is_empty()
+    {
+        return eventing_error(
+            &user,
+            &repository,
+            &session,
+            "The request is invalid.",
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    let group = repository
+        .find_callback_group_visible_to(&group_id, &user.id, user.role == Role::Admin)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    authorize_operation(&repository, &user, &group.operation_id, Role::Operator).await?;
+
+    repository
+        .remove_callback_from_group(
+            &group_id,
+            form.callback_id.trim(),
+            &user.id,
+            &Uuid::new_v4().to_string(),
+        )
+        .await?;
+    Ok(Redirect::to("/eventing").into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct DeleteGroupForm {
+    #[serde(default)]
+    csrf_token: Option<String>,
+}
+
+async fn delete_callback_group(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    session: Session,
+    Path(group_id): Path<String>,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let form = match Form::<DeleteGroupForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return eventing_error(
+                &user,
+                &repository,
+                &session,
+                "The request is invalid.",
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await? {
+        return eventing_error(
+            &user,
+            &repository,
+            &session,
+            "The request is invalid.",
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    let group = repository
+        .find_callback_group_visible_to(&group_id, &user.id, user.role == Role::Admin)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    authorize_operation(&repository, &user, &group.operation_id, Role::Operator).await?;
+    repository.delete_callback_group(&group_id).await?;
+    Ok(Redirect::to("/eventing").into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct DispatchForm {
+    #[serde(default)]
+    group_id: String,
+    #[serde(default)]
+    command: String,
+    /// The target count the operator was shown in the preview. Re-validated at
+    /// dispatch so a membership change between preview and submit cannot widen
+    /// the blast radius silently.
+    #[serde(default)]
+    confirmed_count: String,
+    #[serde(default)]
+    timeout_ms: String,
+    csrf_token: Option<String>,
+}
+
+async fn dispatch_to_group(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repository): State<Repository>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let form = match Form::<DispatchForm>::from_request(request, &repository).await {
+        Ok(Form(form)) => form,
+        Err(_) => {
+            return eventing_error(
+                &user,
+                &repository,
+                &session,
+                "The request is invalid.",
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await?
+        || !valid_form_values(&[&form.command])
+        || form.group_id.trim().is_empty()
+    {
+        return eventing_error(
+            &user,
+            &repository,
+            &session,
+            "Provide a group and a command.",
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    let group_id = form.group_id.trim().to_owned();
+    let group = repository
+        .find_callback_group_visible_to(&group_id, &user.id, user.role == Role::Admin)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    authorize_operation(&repository, &user, &group.operation_id, Role::Operator).await?;
+
+    let targets = repository
+        .resolve_group_targets(&group_id, &user.id, user.role == Role::Admin)
+        .await?;
+
+    if targets.is_empty() {
+        return eventing_error(
+            &user,
+            &repository,
+            &session,
+            "That group has no callbacks. Add a member before dispatching.",
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    if targets.len() > MAX_GROUP_DISPATCH_TARGETS {
+        return eventing_error(
+            &user,
+            &repository,
+            &session,
+            &format!(
+                "Refusing to dispatch to {} callbacks. The ceiling for one dispatch is {}.",
+                targets.len(),
+                MAX_GROUP_DISPATCH_TARGETS
+            ),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    // The confirmation count must match the set that would actually be reached.
+    match form.confirmed_count.trim().parse::<usize>() {
+        Ok(shown) if shown == targets.len() => {}
+        _ => {
+            return eventing_error(
+                &user,
+                &repository,
+                &session,
+                &format!(
+                    "Group membership changed. Preview the {} target(s) again before dispatching.",
+                    targets.len()
+                ),
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
+    }
+
+    let timeout_ms = form
+        .timeout_ms
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(30_000)
+        .clamp(1_000, 600_000);
+    let correlation = Uuid::new_v4().to_string();
+    let command = form.command.trim().to_owned();
+
+    let mut dispatched = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for target in &targets {
+        match repository
+            .enqueue_task_with_audit(
+                &target.id,
+                &command,
+                &serde_json::json!([]),
+                timeout_ms,
+                &user.id,
+                &user.username,
+                None,
+                "group_dispatch_enqueued",
+            )
+            .await
+        {
+            Ok(_) => dispatched += 1,
+            Err(_) => failed.push(target.host.clone()),
+        }
+    }
+
+    // One summary audit for the dispatch itself; each task already wrote its
+    // own c2_audit row, so this records intent rather than repeating the fan-out.
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_id, operation_id, action, target_type, target_id, outcome, \
+          parameter_summary, correlation_id) \
+         VALUES (?, ?, ?, ?, 'callback_group', ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&user.id)
+    .bind(&group.operation_id)
+    .bind("eventing.dispatched")
+    .bind(&group_id)
+    .bind(if failed.is_empty() {
+        "success"
+    } else {
+        "failure"
+    })
+    .bind(format!(
+        "group={}; requested={}; dispatched={}; failed={}",
+        group.name,
+        targets.len(),
+        dispatched,
+        failed.len()
+    ))
+    .bind(&correlation)
+    .execute(&repository.pool)
+    .await
+    .map_err(|_| AppError::Internal)?;
+
+    if !failed.is_empty() {
+        tracing::warn!(
+            group = %group.name,
+            requested = targets.len(),
+            dispatched,
+            failed = failed.len(),
+            "group dispatch completed with per-callback failures"
+        );
+    }
+    // Never report success when nothing actually went out. A silent no-op here
+    // would look identical to a completed fan-out in the operator's log.
+    if dispatched == 0 && !failed.is_empty() {
+        return eventing_error(
+            &user,
+            &repository,
+            &session,
+            &format!(
+                "No command was sent: all {} target(s) failed. Check that each callback has a live session.",
+                failed.len()
+            ),
+            StatusCode::BAD_GATEWAY,
+        )
+        .await;
+    }
+    Ok(Redirect::to(&format!(
+        "/eventing?sent={dispatched}&requested={}&failed={}",
+        targets.len(),
+        failed.len()
+    ))
+    .into_response())
 }
 
 async fn services(
@@ -999,19 +1852,6 @@ async fn update_operation(
         )
         .await?;
     Ok(Redirect::to("/operations").into_response())
-}
-
-#[derive(Default, Deserialize)]
-struct EventRuleForm {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    trigger: String,
-    #[serde(default)]
-    command: String,
-    #[serde(default)]
-    target: String,
-    csrf_token: Option<String>,
 }
 
 #[derive(Default, Deserialize)]

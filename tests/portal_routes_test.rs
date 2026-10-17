@@ -7,14 +7,16 @@ use axum::{
     routing::post,
 };
 use naughtywolf::{
+    AppError,
     auth::{AuthenticatedUser, middleware::AuthSession, rbac::Role},
     db::{
         self,
-        models::{C2TaskWithResult, Callback, CallbackStatus, EventRule, RunState},
+        models::{AssetStatus, C2TaskWithResult, Callback, CallbackStatus, EventRule, RunState},
         repositories::Repository,
     },
     evidence::EvidenceStore,
     payload::PayloadMeta,
+    policy,
     portal::{DashboardSummary, dashboard_summary, public_router, templates, visible_operations},
 };
 use tower::ServiceExt;
@@ -577,13 +579,23 @@ fn eventing_page_renders_rule_form() {
         target: "all".into(),
         enabled: true,
         requested_by: None,
+        operation_id: Some("op-1".into()),
         created_at: "2026-08-30T00:00:00Z".into(),
     }];
-    let body = templates::eventing_page(&user, &rules, "csrf-token", None);
+    let view = naughtywolf::portal::EventingView {
+        rules,
+        groups: vec![],
+        operations: vec![],
+        callbacks: vec![],
+        members: std::collections::HashMap::new(),
+        group_sizes: std::collections::HashMap::new(),
+    };
+    let body = templates::eventing_page(&user, &view, "csrf-token", None, None);
 
     assert!(body.contains("action=\"/eventing\""));
     assert!(body.contains("quarantine"));
     assert!(body.contains("Enabled"));
+    assert!(body.contains("action=\"/eventing/groups\""));
 }
 
 #[test]
@@ -607,6 +619,10 @@ fn payloads_page_renders_build_form_and_built_rows() {
         public_id: "550e8400-e29b-41d4-a716-446655440000".into(),
         size: 42,
         built_at: "2026-08-30T00:00:00Z".into(),
+        retrievals: 0,
+        first_retrieved_at: None,
+        last_retrieved_at: None,
+        fingerprint: None,
     }];
     let body = templates::payloads_page(&user, &metas, "csrf-token", None, None, &[], &[]);
 
@@ -715,6 +731,10 @@ fn callbacks_page_presents_active_session_workspace() {
     assert!(body.contains("data-callback-workspace"));
     assert!(body.contains("data-callback-summary"));
     assert!(body.contains("class=\"callback-row"));
+    assert!(body.contains("LAB-WS-01"));
+    assert!(body.contains("STALE-HOST"));
+    assert!(body.contains("href=\"/callbacks/callback-1\""));
+    assert!(body.contains("href=\"/callbacks/callback-2\""));
     assert!(body.contains("href=\"/payloads\""));
     assert!(body.contains("192.0.2.10"));
     assert!(body.contains("class=\"status-pill status-success\""));
@@ -884,7 +904,7 @@ async fn callback_detail_renders_persisted_task_history_after_reload() {
 // ── Task 3: Component contracts ───────────────────────────────────────────────
 
 #[test]
-fn dashboard_renders_five_real_metric_cards() {
+fn dashboard_keeps_real_metrics_without_promoting_assets() {
     let user = AuthenticatedUser {
         id: "viewer-id".into(),
         username: "viewer-user".into(),
@@ -899,11 +919,26 @@ fn dashboard_renders_five_real_metric_cards() {
     };
     let body = templates::dashboard_page(&user, &summary);
 
-    assert_eq!(body.matches("class=\"metric-card\"").count(), 5);
-    for value in ["1", "2", "3", "4", "5"] {
+    assert_eq!(body.matches("class=\"metric-card\"").count(), 4);
+    for value in ["1", "3", "4", "5"] {
         assert!(body.contains(&format!(">{value}</strong>")));
     }
+    assert!(!body.contains("href=\"/inventory\""));
+    assert!(body.contains("href=\"/checks\""));
     assert!(!body.contains("chart"));
+}
+
+#[test]
+fn primary_navigation_keeps_callbacks_and_hides_assets() {
+    let user = AuthenticatedUser {
+        id: "op-id".into(),
+        username: "op-user".into(),
+        role: Role::Operator,
+    };
+    let body = templates::app_page("Dashboard", &user, "dashboard", "");
+
+    assert!(body.contains("data-nav-item=\"callbacks\" href=\"/callbacks\""));
+    assert!(!body.contains("data-nav-item=\"inventory\""));
 }
 
 // ── Task 4: Accessibility contract ───────────────────────────────────────────
@@ -1234,6 +1269,15 @@ async fn operator_deletes_a_payload_artifact_with_csrf() {
 async fn operator_can_create_an_event_rule_with_audit() {
     let repository = test_repository().await;
     let operator = create_user(&repository, "op", Role::Operator).await;
+    // Event rules store a command, so they are scoped to an operation.
+    let operation = repository
+        .create_operation("Lab", "Event rules")
+        .await
+        .unwrap();
+    repository
+        .add_member(&operation.id, &operator.id)
+        .await
+        .unwrap();
     let app = app_with_user_and_repository(repository.clone(), operator).await;
     let page = app
         .clone()
@@ -1246,7 +1290,8 @@ async fn operator_can_create_an_event_rule_with_audit() {
         .oneshot(post_form(
             "/eventing",
             format!(
-                "name=quarantine&trigger=new+callback&command=collect+state&target=all&csrf_token={token}"
+                "operation_id={}&name=quarantine&trigger=new+callback&command=collect+state&target=all&csrf_token={token}",
+                operation.id
             ),
         ))
         .await
@@ -1965,7 +2010,7 @@ async fn authorized_operator_can_submit_the_labeled_asset_form() {
         .await
         .unwrap();
     assert_eq!(submit.status(), StatusCode::SEE_OTHER);
-    assert_eq!(submit.headers().get("location").unwrap(), "/operations");
+    assert_eq!(submit.headers().get("location").unwrap(), "/inventory");
     let assets = repository.list_assets(&operation.id).await.unwrap();
     assert_eq!(assets.len(), 1);
     assert_eq!(assets[0].name, "web-01");
@@ -1973,6 +2018,147 @@ async fn authorized_operator_can_submit_the_labeled_asset_form() {
     assert_eq!(assets[0].owner, "Lab");
     assert_eq!(assets[0].address, "127.0.0.1");
     assert_eq!(repository.count_audit_events().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn operator_can_correct_and_retire_an_asset_then_see_it_in_inventory() {
+    let repository = test_repository().await;
+    let operation = repository
+        .create_operation("Lab", "Practice")
+        .await
+        .unwrap();
+    let operator = create_user(&repository, "operator", Role::Operator).await;
+    repository
+        .add_member(&operation.id, &operator.id)
+        .await
+        .unwrap();
+    let asset = repository
+        .create_asset(&operation.id, "web-01", "web", "Lab", "127.0.0.1")
+        .await
+        .unwrap();
+    let app = app_with_user_and_repository(repository.clone(), operator).await;
+
+    let form_response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/assets/{}/edit", asset.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(form_response.status(), StatusCode::OK);
+    let form_body = body_string(form_response).await;
+    let token = csrf_token(&form_body);
+    assert!(form_body.contains("value=\"127.0.0.1\""));
+
+    let submit = app
+        .clone()
+        .oneshot(post_form(
+            &format!("/assets/{}/edit", asset.id),
+            format!(
+                "name=web-01&kind=web&owner=Contractor&address=127.0.0.2&status=retired&csrf_token={token}"
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::SEE_OTHER);
+    let updated = repository.find_asset(&asset.id).await.unwrap().unwrap();
+    assert_eq!(updated.owner, "Contractor");
+    assert_eq!(updated.address, "127.0.0.2");
+    assert_eq!(updated.status, AssetStatus::Retired);
+    assert_eq!(repository.count_audit_events().await.unwrap(), 1);
+
+    let inventory = app
+        .oneshot(Request::get("/inventory").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(inventory.status(), StatusCode::OK);
+    let body = body_string(inventory).await;
+    assert!(body.contains("web-01"));
+    assert!(body.contains("127.0.0.2"));
+    assert!(body.contains("Retired"));
+    assert!(body.contains(&format!("/assets/{}/edit", asset.id)));
+    assert!(body.contains("Lab"), "operation name shown with asset");
+}
+
+#[tokio::test]
+async fn invalid_asset_edit_keeps_edit_form_labels() {
+    let repository = test_repository().await;
+    let operation = repository
+        .create_operation("Lab", "Practice")
+        .await
+        .unwrap();
+    let operator = create_user(&repository, "operator", Role::Operator).await;
+    repository
+        .add_member(&operation.id, &operator.id)
+        .await
+        .unwrap();
+    let asset = repository
+        .create_asset(&operation.id, "web-01", "web", "Lab", "127.0.0.1")
+        .await
+        .unwrap();
+    let app = app_with_user_and_repository(repository.clone(), operator).await;
+    let form = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/assets/{}/edit", asset.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let token = csrf_token(&body_string(form).await);
+
+    let response = app
+        .oneshot(post_form(
+            &format!("/assets/{}/edit", asset.id),
+            format!(
+                "name=&kind=web&owner=Contractor&address=127.0.0.1&status=active&csrf_token={token}"
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(response).await;
+    assert!(body.contains("<button type=\"submit\">Save asset</button>"));
+    assert!(body.contains(&format!("action=\"/assets/{}/edit\"", asset.id)));
+    assert!(body.contains("value=\"Contractor\""));
+    assert_eq!(repository.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn retired_assets_cannot_start_new_runs() {
+    let repository = test_repository().await;
+    let operation = repository
+        .create_operation("Lab", "Practice")
+        .await
+        .unwrap();
+    let operator = create_user(&repository, "operator", Role::Operator).await;
+    repository
+        .add_member(&operation.id, &operator.id)
+        .await
+        .unwrap();
+    let asset = repository
+        .create_asset(&operation.id, "web-01", "web", "Lab", "127.0.0.1")
+        .await
+        .unwrap();
+    repository
+        .update_asset_with_audit(
+            &asset.id,
+            "web-01",
+            "web",
+            "Lab",
+            "127.0.0.1",
+            AssetStatus::Retired,
+            &operator.id,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+        .unwrap();
+
+    let result = policy::authorize_asset_run(&repository, &operator, &asset.id).await;
+    assert!(matches!(result, Err(AppError::Conflict(_))));
 }
 
 #[tokio::test]
@@ -2285,6 +2471,11 @@ async fn graph_and_recon_pages_render_without_javascript() {
         let body = body_string(response).await;
         assert!(body.contains("/static/workspace.js"));
         assert!(body.contains("No assets"));
+        if path == "/topology" {
+            assert!(!body.contains("data-graph-demo"));
+            assert!(!body.contains("data-sample-banner"));
+            assert!(body.contains("data-graph-canvas"));
+        }
     }
 }
 
@@ -2431,4 +2622,85 @@ async fn recon_rejects_out_of_scope_and_inactive_assets_before_creating_runs() {
             .is_empty()
     );
     assert_eq!(repo.count_audit_events().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn directory_page_requires_operator_and_never_echoes_a_submitted_password() {
+    let repository = test_repository().await;
+    let operation = repository
+        .create_operation("Lab", "Directory enumeration")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE operations SET status = 'active' WHERE id = ?")
+        .bind(&operation.id)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+    let asset = repository
+        .create_asset(
+            &operation.id,
+            "dc1",
+            "domain-controller",
+            "Lab",
+            "127.0.0.1",
+        )
+        .await
+        .unwrap();
+    let operator = create_user(&repository, "operator", Role::Operator).await;
+    repository
+        .add_member(&operation.id, &operator.id)
+        .await
+        .unwrap();
+
+    let app = app_with_user_and_repository(repository.clone(), operator.clone()).await;
+    let response = app
+        .clone()
+        .oneshot(Request::get("/directory").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("/directory/run"));
+    assert!(body.contains(&asset.id));
+
+    // A viewer sees the page but cannot start a run.
+    let viewer = create_user(&repository, "viewer", Role::Viewer).await;
+    repository
+        .add_member(&operation.id, &viewer.id)
+        .await
+        .unwrap();
+    let viewer_app = app_with_user_and_repository(repository.clone(), viewer).await;
+    let response = viewer_app
+        .clone()
+        .oneshot(post_form(
+            "/directory/run",
+            format!(
+                "asset_id={}&object_class=user&limit=10&csrf_token=stale",
+                asset.id
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // An operator with a stale CSRF token is rejected before anything runs.
+    let response = app
+        .oneshot(post_form(
+            "/directory/run",
+            format!(
+                "asset_id={}&object_class=user&limit=10&bind_password=CorrectHorseBatteryStaple&csrf_token=stale",
+                asset.id
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        repository
+            .list_check_runs_visible_to(&operator.id, false)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected form must not create a run"
+    );
 }

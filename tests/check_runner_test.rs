@@ -4,8 +4,8 @@ use naughtywolf::{
     AppError,
     auth::{AuthenticatedUser, rbac::Role},
     checks::{
-        AssetRecordReviewInput, CheckFinding, CheckInput, CheckResult, ExecutionKind, RunState,
-        Runner, catalog,
+        AssetRecordReviewInput, CheckFinding, CheckInput, CheckResult, DirectoryEnumInput,
+        ExecutionKind, ObjectClass, RunState, Runner, catalog, directory::is_safe_attribute,
     },
     db::{self, models::CheckRun, repositories::Repository},
 };
@@ -59,12 +59,40 @@ fn asset_record_input() -> CheckInput {
 fn catalog_has_only_builtin_non_destructive_checks() {
     let checks = catalog();
 
-    assert_eq!(checks.len(), 2);
+    assert_eq!(checks.len(), 3);
     assert!(
         checks
             .iter()
             .all(|check| check.builtin && !check.mutates_target)
     );
+    // Every catalog entry must have an input variant the runner accepts, and a
+    // concrete implementation, or an operator can select a dead check.
+    for id in ["asset-record-review", "surface-recon", "directory-enum"] {
+        let definition = checks.iter().find(|check| check.id == id);
+        assert!(definition.is_some(), "{id} missing from catalog");
+        assert!(
+            definition
+                .expect("checked above")
+                .required_role
+                .allows(Role::Operator),
+            "{id} must be operator-visible"
+        );
+    }
+}
+
+#[test]
+fn catalog_entries_all_reject_credential_bearing_attributes() {
+    // A directory enumeration that ever requests a credential attribute would
+    // push secrets into a persisted, rendered result. Guard the whole surface.
+    for definition in catalog() {
+        assert!(
+            !definition.mutates_target,
+            "{} must stay read-only",
+            definition.id
+        );
+        assert!(definition.timeout.as_secs() >= 5, "{}", definition.id);
+    }
+    assert!(!is_safe_attribute("unicodePwd"));
 }
 
 #[tokio::test]
@@ -348,4 +376,63 @@ async fn asset_values_cannot_make_persisted_output_exceed_the_catalog_limit() {
 
     let output = serde_json::to_vec(&result).unwrap();
     assert!(output.len() <= catalog()[0].max_output_bytes);
+}
+
+#[tokio::test]
+async fn directory_enum_persists_its_input_without_the_bind_password() {
+    let fixture = runner_fixture(Role::Operator).await;
+    // Point the asset at a loopback port nothing is listening on so the check
+    // fails fast; this test is about what lands in the database, not the reply.
+    let asset = naughtywolf::db::models::Asset {
+        address: "127.0.0.1:1".to_owned(),
+        ..fixture.asset.clone()
+    };
+    Runner::new(fixture.repo.clone(), fixture.user)
+        .start(
+            asset,
+            "directory-enum",
+            CheckInput::DirectoryEnum(DirectoryEnumInput {
+                base_dn: "DC=corp,DC=example".to_owned(),
+                bind_dn: "corp\\svc-recon".to_owned(),
+                bind_password: "CorrectHorseBatteryStaple".to_owned(),
+                object_class: ObjectClass::User,
+                limit: 25,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT input_json FROM check_runs WHERE check_id = 'directory-enum'")
+            .fetch_all(&fixture.repo.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.len(), 1);
+    let persisted = &stored[0];
+    assert!(
+        !persisted.contains("CorrectHorseBatteryStaple"),
+        "bind password must never be written to check_runs: {persisted}"
+    );
+    // Non-secret fields are still persisted so the run stays reproducible.
+    assert!(persisted.contains("corp\\\\svc-recon"));
+    assert!(persisted.contains("DC=corp,DC=example"));
+}
+
+#[tokio::test]
+async fn directory_enum_requires_an_operator_role() {
+    let fixture = runner_fixture(Role::Viewer).await;
+    let result = Runner::new(fixture.repo, fixture.user)
+        .start(
+            fixture.asset,
+            "directory-enum",
+            CheckInput::DirectoryEnum(DirectoryEnumInput {
+                base_dn: String::new(),
+                bind_dn: String::new(),
+                bind_password: String::new(),
+                object_class: ObjectClass::All,
+                limit: 10,
+            }),
+        )
+        .await;
+    assert!(matches!(result, Err(AppError::Forbidden)));
 }

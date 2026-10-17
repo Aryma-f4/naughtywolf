@@ -125,6 +125,21 @@ pub enum CallbackStatus {
     Lost,
 }
 
+/// A credential harvested by the implant, read back for operator review.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct HarvestedCredential {
+    pub id: String,
+    pub session_id: String,
+    pub source: String,
+    pub cred_type: String,
+    pub identifier: String,
+    pub secret: String,
+    pub created_at: String,
+    /// Callback host, resolved for display so the operator does not have to
+    /// cross-reference the session id by hand.
+    pub callback_host: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
 pub struct Callback {
     pub id: String,
@@ -321,7 +336,27 @@ pub struct EventRule {
     pub target: String,
     pub enabled: bool,
     pub requested_by: Option<String>,
+    pub operation_id: Option<String>,
     pub created_at: String,
+}
+
+/// A named set of callbacks inside one operation. Group membership is always
+/// constrained to callbacks of the same operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct CallbackGroup {
+    pub id: String,
+    pub operation_id: String,
+    pub name: String,
+    pub description: String,
+    pub created_by: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct CallbackGroupMember {
+    pub group_id: String,
+    pub callback_id: String,
+    pub added_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]

@@ -2,8 +2,9 @@ use crate::{
     auth::{AuthenticatedUser, rbac::Role},
     db::{
         models::{
-            Asset, AuditEvent, C2TaskWithResult, Callback, CallbackStatus, CheckRun, EventRule,
-            Evidence, InstalledService, Operation, OperationStatus, RunState,
+            Asset, AssetStatus, AuditEvent, C2TaskWithResult, Callback, CallbackGroup,
+            CallbackStatus, CheckRun, Evidence, HarvestedCredential, InstalledService, Operation,
+            OperationStatus, RunState,
         },
         repositories::PortalUser,
     },
@@ -11,6 +12,7 @@ use crate::{
     portal::{DashboardSummary, OperationReportSummary},
 };
 use base64::Engine;
+use std::collections::HashMap;
 
 pub fn public_landing() -> String {
     page_shell(
@@ -56,9 +58,9 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
                 ("dashboard", "/dashboard", "Dashboard"),
                 ("topology", "/topology", "Topology"),
                 ("recon", "/recon", "Recon"),
+                ("directory", "/directory", "Directory"),
                 ("callbacks", "/callbacks", "Active Callbacks"),
                 ("operations", "/operations", "Operations"),
-                ("inventory", "/inventory", "Assets"),
                 ("checks", "/checks", "Checks"),
                 ("services", "/services", "Services"),
             ],
@@ -67,6 +69,8 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
             "Collection",
             vec![
                 ("evidence", "/evidence", "Evidence"),
+                ("credentials", "/credentials", "Credentials"),
+                ("attack", "/attack", "ATT&CK"),
                 ("reports", "/reports", "Reports"),
                 ("audit", "/audit", "Audit"),
             ],
@@ -199,7 +203,6 @@ pub fn app_page(title: &str, user: &AuthenticatedUser, active_nav: &str, body: &
 pub fn dashboard_page(user: &AuthenticatedUser, summary: &DashboardSummary) -> String {
     let metrics = [
         ("Operations", summary.operation_count, "Authorized lab operations", "/operations", "operations"),
-        ("Assets", summary.asset_count, "Scoped targets", "/inventory", "inventory"),
         ("Check runs", summary.run_count, "Executed checks", "/checks", "checks"),
         ("Evidence", summary.evidence_count, "Stored artifacts", "/evidence", "evidence"),
         ("Audit records", summary.audit_count, "Append-only events", "/audit", "audit"),
@@ -224,10 +227,10 @@ pub fn dashboard_page(user: &AuthenticatedUser, summary: &DashboardSummary) -> S
         &format!(
             r#"<section class="overview-hero" aria-labelledby="overview-title"><div class="hero-copy"><p class="eyebrow"><span class="status-dot"></span> YOUR WORKSPACE, IN FOCUS</p><h2 id="overview-title">See the whole picture.<br><em>Follow every detail.</em></h2><p>{scope_note}</p><div class="hero-actions">{first_action}<a class="text-action" href="/reports">Open reports <span aria-hidden="true">↗</span></a></div></div><div class="scope-orbit" aria-hidden="true"><div class="orbit-ring orbit-ring-outer"></div><div class="orbit-ring orbit-ring-middle"></div><div class="orbit-ring orbit-ring-inner"></div><div class="orbit-cross orbit-cross-h"></div><div class="orbit-cross orbit-cross-v"></div><div class="orbit-core">{wolf}</div><span class="orbit-point point-one"></span><span class="orbit-point point-two"></span><span class="orbit-label orbit-label-top">01 / SCOPE</span><span class="orbit-label orbit-label-bottom">02 / EVIDENCE</span><span class="orbit-coordinate">NW · ALL DETAILS CONNECTED</span></div></section>
         <div class="section-heading"><h2>By the numbers<span class="muted"> /</span></h2><span>RECORDS VISIBLE TO YOU</span></div><section class="metric-grid" aria-label="Scoped summary">{metrics}</section>
-        <div class="overview-bottom"><section class="field-map panel" aria-labelledby="field-map-title"><div class="section-heading"><h2 id="field-map-title">A connected workflow</h2><span>01 → 03</span></div><p class="section-intro">From a defined scope to a record you can stand behind.</p><div class="workflow-steps"><a href="/operations"><span class="step-index">01 / DEFINE</span><span class="step-symbol" aria-hidden="true">{scope_icon}</span><h3>Set the scope.</h3><p>Give each operation a clear purpose and boundary.</p><span class="step-link">View operations ↗</span></a><a href="/inventory"><span class="step-index">02 / OBSERVE</span><span class="step-symbol" aria-hidden="true">{asset_icon}</span><h3>Know the details.</h3><p>Keep your assets and check history in context.</p><span class="step-link">Explore assets ↗</span></a><a href="/evidence"><span class="step-index">03 / DOCUMENT</span><span class="step-symbol" aria-hidden="true">{evidence_icon}</span><h3>Leave a record.</h3><p>Bring the evidence together for your next report.</p><span class="step-link">Review evidence ↗</span></a></div></section><aside class="field-note"><span class="eyebrow">THE FIELD NOTE / 001</span><span class="note-asterisk" aria-hidden="true">✳</span><h2>Good work.<br>Clear evidence.</h2><p>The strongest finding is the one you can trace. Keep your scope intentional and your records complete.</p><a href="/audit">Follow the audit trail <span aria-hidden="true">↗</span></a><span class="note-bottom">STAY CURIOUS. STAY IN SCOPE.</span></aside></div>"#,
+        <div class="overview-bottom"><section class="field-map panel" aria-labelledby="field-map-title"><div class="section-heading"><h2 id="field-map-title">A connected workflow</h2><span>01 → 03</span></div><p class="section-intro">From a defined scope to a record you can stand behind.</p><div class="workflow-steps"><a href="/operations"><span class="step-index">01 / DEFINE</span><span class="step-symbol" aria-hidden="true">{scope_icon}</span><h3>Set the scope.</h3><p>Give each operation a clear purpose and boundary.</p><span class="step-link">View operations ↗</span></a><a href="/checks"><span class="step-index">02 / OBSERVE</span><span class="step-symbol" aria-hidden="true">{checks_icon}</span><h3>Review the results.</h3><p>Keep check history in context.</p><span class="step-link">Explore checks ↗</span></a><a href="/evidence"><span class="step-index">03 / DOCUMENT</span><span class="step-symbol" aria-hidden="true">{evidence_icon}</span><h3>Leave a record.</h3><p>Bring the evidence together for your next report.</p><span class="step-link">Review evidence ↗</span></a></div></section><aside class="field-note"><span class="eyebrow">THE FIELD NOTE / 001</span><span class="note-asterisk" aria-hidden="true">✳</span><h2>Good work.<br>Clear evidence.</h2><p>The strongest finding is the one you can trace. Keep your scope intentional and your records complete.</p><a href="/audit">Follow the audit trail <span aria-hidden="true">↗</span></a><span class="note-bottom">STAY CURIOUS. STAY IN SCOPE.</span></aside></div>"#,
             wolf = wolf_mark(),
             scope_icon = nav_icon("operations"),
-            asset_icon = nav_icon("inventory"),
+            checks_icon = nav_icon("checks"),
             evidence_icon = nav_icon("evidence"),
         ),
     )
@@ -358,6 +361,50 @@ pub fn audit_page(user: &AuthenticatedUser, events: &[AuditEvent]) -> String {
         )
     };
     app_page("Audit", user, "audit", &body)
+}
+
+pub fn attack_coverage_page(user: &AuthenticatedUser) -> String {
+    let rows = crate::attack::catalogue()
+        .into_iter()
+        .map(|(id, name, tactic)| {
+            format!(
+                "<tr><td><a href=\"https://attack.mitre.org/techniques/{id}/\" rel=\"noreferrer noopener\" target=\"_blank\"><code>{id}</code></a></td><td>{}</td><td>{}</td></tr>",
+                escape_html(name),
+                escape_html(tactic)
+            )
+        })
+        .collect::<String>();
+    let body = format!(
+        "<div class=\"table-scroll\"><table class=\"data-table attack-table\"><caption>MITRE ATT&amp;CK techniques reachable from tasking</caption><thead><tr><th scope=\"col\">Technique</th><th scope=\"col\">Name</th><th scope=\"col\">Tactic</th></tr></thead><tbody>{rows}</tbody></table></div>"
+    );
+    app_page("ATT&CK coverage", user, "attack", &body)
+}
+
+pub fn credentials_page(user: &AuthenticatedUser, creds: &[HarvestedCredential]) -> String {
+    let body = if creds.is_empty() {
+        "<section class=\"empty-state panel\"><p>No scoped credentials harvested yet</p></section>"
+            .to_owned()
+    } else {
+        let rows = creds
+            .iter()
+            .map(|cred| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                    escape_html(cred.cred_type.as_str()),
+                    escape_html(&cred.source),
+                    escape_html(cred.callback_host.as_deref().unwrap_or("—")),
+                    escape_html(&cred.identifier),
+                    escape_html(&cred.secret),
+                    escape_html(&cred.session_id),
+                    escape_html(&cred.created_at),
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<div class=\"table-scroll\"><table class=\"data-table credentials-table\"><caption>Credentials harvested from scoped callbacks</caption><thead><tr><th scope=\"col\">Type</th><th scope=\"col\">Source</th><th scope=\"col\">Callback</th><th scope=\"col\">Identifier</th><th scope=\"col\">Secret</th><th scope=\"col\">Session</th><th scope=\"col\">Collected</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    };
+    app_page("Credentials", user, "credentials", &body)
 }
 
 pub fn evidence_page(user: &AuthenticatedUser, records: &[Evidence]) -> String {
@@ -497,12 +544,22 @@ pub fn operation_form_page(
     )
 }
 
+pub struct AssetFormFields<'a> {
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub owner: &'a str,
+    pub address: &'a str,
+    pub status: AssetStatus,
+}
+
 pub fn asset_form_page(
     user: &AuthenticatedUser,
-    operation_id: &str,
     csrf_token: &str,
     error: Option<&str>,
-    values: [&str; 4],
+    fields: &AssetFormFields<'_>,
+    title: &str,
+    action: &str,
+    submit_label: &str,
 ) -> String {
     let error = form_error(error, "asset-form-error");
     let described_by = if !error.is_empty() {
@@ -511,19 +568,70 @@ pub fn asset_form_page(
         ""
     };
     app_page(
-        "Add asset",
+        title,
         user,
         "inventory",
         &format!(
-            "<form class=\"form-panel panel\" method=\"post\" action=\"/operations/{}/assets\">{error}<input type=\"hidden\" name=\"csrf_token\" value=\"{}\"><div class=\"form-field\"><label for=\"asset-name\">Name</label><input id=\"asset-name\" name=\"name\" value=\"{}\" maxlength=\"160\" required{described_by}></div><div class=\"form-field\"><label for=\"asset-kind\">Kind</label><input id=\"asset-kind\" name=\"kind\" value=\"{}\" maxlength=\"160\" required{described_by}></div><div class=\"form-field\"><label for=\"asset-owner\">Owner</label><input id=\"asset-owner\" name=\"owner\" value=\"{}\" maxlength=\"160\" required{described_by}></div><div class=\"form-field\"><label for=\"asset-address\">Address</label><input id=\"asset-address\" name=\"address\" value=\"{}\" maxlength=\"160\" required{described_by}></div><button type=\"submit\">Add asset</button></form>",
-            escape_html(operation_id),
+            "<form class=\"form-panel panel\" method=\"post\" action=\"{}\">{error}<input type=\"hidden\" name=\"csrf_token\" value=\"{}\"><div class=\"form-field\"><label for=\"asset-name\">Name</label><input id=\"asset-name\" name=\"name\" value=\"{}\" maxlength=\"160\" required{described_by}></div><div class=\"form-field\"><label for=\"asset-kind\">Kind</label><input id=\"asset-kind\" name=\"kind\" value=\"{}\" maxlength=\"160\" required{described_by}></div><div class=\"form-field\"><label for=\"asset-owner\">Owner</label><input id=\"asset-owner\" name=\"owner\" value=\"{}\" maxlength=\"160\" required{described_by}></div><div class=\"form-field\"><label for=\"asset-address\">Address</label><input id=\"asset-address\" name=\"address\" value=\"{}\" maxlength=\"160\" required{described_by}></div><div class=\"form-field\"><label for=\"asset-status\">Status</label><select id=\"asset-status\" name=\"status\"{described_by}><option value=\"active\"{}>Active</option><option value=\"retired\"{}>Retired</option></select><p class=\"field-hint\">A retired asset stays in the record but cannot start new runs.</p></div><button type=\"submit\">{}</button></form>",
+            escape_html(action),
             escape_html(csrf_token),
-            escape_html(values[0]),
-            escape_html(values[1]),
-            escape_html(values[2]),
-            escape_html(values[3]),
+            escape_html(fields.name),
+            escape_html(fields.kind),
+            escape_html(fields.owner),
+            escape_html(fields.address),
+            asset_status_option(AssetStatus::Active, fields.status),
+            asset_status_option(AssetStatus::Retired, fields.status),
+            escape_html(submit_label),
         ),
     )
+}
+
+fn asset_status_option(option: AssetStatus, selected: AssetStatus) -> &'static str {
+    if option == selected { " selected" } else { "" }
+}
+
+pub fn inventory_page(
+    user: &AuthenticatedUser,
+    assets: &[Asset],
+    operation_names: &HashMap<&str, &str>,
+) -> String {
+    let body = if assets.is_empty() {
+        "<section class=\"empty-state panel\"><p>No assets in your field of view. \
+         Add one from an operation to start your inventory.</p></section>"
+            .to_string()
+    } else {
+        let items = assets
+            .iter()
+            .map(|asset| {
+                let (status_label, status_class) = asset_status(asset.status);
+                let operation_name = operation_names
+                    .get(asset.operation_id.as_str())
+                    .copied()
+                    .unwrap_or("Operation");
+                let edit_link = if user.role.allows(Role::Operator) {
+                    format!(
+                        "<a href=\"/assets/{}/edit\">Edit</a>",
+                        escape_html(&asset.id)
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "<li class=\"record-card\"><h2>{name}</h2><p>{kind} · {owner} · <code>{address}</code></p><p>{operation} — {status}</p><p class=\"asset-links\"><a href=\"/recon?asset={id}\">Recon</a> {edit}</p></li>",
+                    name = escape_html(&asset.name),
+                    kind = escape_html(&asset.kind),
+                    owner = escape_html(&asset.owner),
+                    address = escape_html(&asset.address),
+                    operation = escape_html(operation_name),
+                    status = status_pill(status_label, status_class),
+                    id = escape_html(&asset.id),
+                    edit = edit_link,
+                )
+            })
+            .collect::<String>();
+        format!("<ul class=\"record-grid\">{items}</ul>")
+    };
+    app_page("Inventory", user, "inventory", &body)
 }
 
 fn current_os() -> String {
@@ -539,7 +647,11 @@ fn current_arch_label() -> String {
 }
 
 /// (target-triple, label, os, arch). Empty triple = host-native build.
-const PLATFORMS: &[(&str, &str, &str, &str)] = &[
+pub(crate) const PLATFORMS: &[(&str, &str, &str, &str)] = &[
+    // Every entry must be buildable by the portal container. macOS targets are
+    // deliberately absent: they need an Apple SDK cross toolchain (osxcross)
+    // that the image does not ship, so offering them only produced artifacts
+    // that failed to link. Re-add them once such a toolchain is wired in.
     ("", "This computer (native)", "current", "current"),
     (
         "x86_64-unknown-linux-musl",
@@ -553,9 +665,13 @@ const PLATFORMS: &[(&str, &str, &str, &str)] = &[
         "linux",
         "amd64",
     ),
+    // ARM64 cross-builds use the glibc target: the image ships
+    // aarch64-linux-gnu-gcc, and there is no aarch64 musl cross-compiler in
+    // Debian. Offering the musl triple here produced artifacts that could not
+    // link at build time.
     (
-        "aarch64-unknown-linux-musl",
-        "Linux ARM64 (musl)",
+        "aarch64-unknown-linux-gnu",
+        "Linux ARM64 (glibc)",
         "linux",
         "arm64",
     ),
@@ -565,14 +681,56 @@ const PLATFORMS: &[(&str, &str, &str, &str)] = &[
         "windows",
         "amd64",
     ),
-    (
-        "aarch64-apple-darwin",
-        "macOS Apple Silicon",
-        "macos",
-        "arm64",
-    ),
-    ("x86_64-apple-darwin", "macOS Intel", "macos", "amd64"),
 ];
+
+/// "Never retrieved" is the answer operators actually need: a built artifact no
+/// one has ever fetched. Retrieval counts every successful token fetch, which
+/// includes the operator's own Download click, so it is a reachability signal
+/// rather than proof of a callback running the binary.
+fn retrieval_cell(meta: &PayloadMeta) -> String {
+    if !meta.was_retrieved() {
+        return status_pill("Never retrieved", "warning");
+    }
+    let last = meta.last_retrieved_at.as_deref().unwrap_or("unknown");
+    format!(
+        "{} · last {}",
+        status_pill(&format!("{} fetch(es)", meta.retrievals), "success"),
+        escape_html(last)
+    )
+}
+
+/// Reports what the post-build scan found, so a build that leaked its own
+/// paths is visible in the library rather than discovered later on a host.
+fn fingerprint_cell(meta: &PayloadMeta) -> String {
+    let Some(report) = meta.fingerprint.as_ref() else {
+        return status_pill("Not scanned", "neutral");
+    };
+    if report.is_clean() {
+        return status_pill("Clean", "success");
+    }
+    let detail = format!(
+        "{} path · {} project · {} symbol",
+        report.build_paths.len(),
+        report.project_strings.len(),
+        report.dependency_symbols.len()
+    );
+    format!(
+        "<span title=\"{}\">{}</span>",
+        escape_html(&detail),
+        status_pill("Leaks", "warning")
+    )
+}
+
+fn cadence_label(meta: &PayloadMeta) -> String {
+    if meta.interval_ms == 0 {
+        return "—".to_owned();
+    }
+    escape_html(&format!(
+        "{interval}ms ±{jitter}ms",
+        interval = meta.interval_ms,
+        jitter = meta.jitter_ms
+    ))
+}
 
 pub fn payloads_page(
     user: &AuthenticatedUser,
@@ -601,14 +759,17 @@ pub fn payloads_page(
         .iter()
         .map(|b| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}/{}</td><td>{}</td><td>{} bytes</td><td>{}</td><td><a class=\"btn btn-sm\" href=\"/payloads/download/{}\">Download</a> <a class=\"btn btn-sm\" href=\"/payloads/edit/{file}\">Edit</a> <form method=\"post\" action=\"/payloads/delete/{file}\" class=\"callback-delete\" onsubmit=\"return confirm('Delete this payload artifact? This cannot be undone.');\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><button type=\"submit\" class=\"btn btn-sm btn-danger\">Delete</button></form></td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}/{}</td><td>{}</td><td>{}</td><td>{} bytes</td><td>{}</td><td>{}</td><td>{}</td><td><a class=\"btn btn-sm\" href=\"/payloads/download/{}\">Download</a> <a class=\"btn btn-sm\" href=\"/payloads/edit/{file}\">Edit</a> <form method=\"post\" action=\"/payloads/delete/{file}\" class=\"callback-delete\" onsubmit=\"return confirm('Delete this payload artifact? This cannot be undone.');\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><button type=\"submit\" class=\"btn btn-sm btn-danger\">Delete</button></form></td></tr>",
                 escape_html(&b.name),
                 escape_html(&b.protocol),
                 escape_html(&b.os),
                 escape_html(&b.arch),
                 escape_html(&format!("{}:{}", b.lhost, b.lport)),
+                cadence_label(b),
                 b.size,
                 escape_html(&b.built_at),
+                retrieval_cell(b),
+                fingerprint_cell(b),
                 url_encode(&b.public_id),
                 file = url_encode(&b.file),
                 csrf = csrf_token,
@@ -619,7 +780,7 @@ pub fn payloads_page(
         "<section class=\"empty-state panel\"><p>No payloads built yet — generate one below.</p></section>".to_owned()
     } else {
         format!(
-            "<div class=\"table-scroll\"><table class=\"data-table payloads-table\"><caption>Built payloads</caption><thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Protocol</th><th scope=\"col\">OS/Arch</th><th scope=\"col\">Endpoint</th><th scope=\"col\">Size</th><th scope=\"col\">Built</th><th scope=\"col\">Actions</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<div class=\"table-scroll\"><table class=\"data-table payloads-table\"><caption>Built payloads</caption><thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Protocol</th><th scope=\"col\">OS/Arch</th><th scope=\"col\">Endpoint</th><th scope=\"col\">Cadence</th><th scope=\"col\">Size</th><th scope=\"col\">Built</th><th scope=\"col\">Retrieval</th><th scope=\"col\">Fingerprint</th><th scope=\"col\">Actions</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
 
@@ -708,6 +869,12 @@ pub fn payloads_page(
         ("tcp", "TCP (raw)"),
         ("gs", "gsocket tunnel"),
         ("dns", "DNS"),
+        ("ws", "WebSocket"),
+        ("wss", "WebSocket (TLS)"),
+        ("grpc", "gRPC"),
+        ("grpcs", "gRPC (TLS)"),
+        ("discord", "Discord channel"),
+        ("telegram", "Telegram channel"),
     ]
     .iter()
     .map(|(v, label)| {
@@ -751,6 +918,11 @@ pub fn payloads_page(
           <div class="form-field"><label for="payload-gsocket-port">Local forward port</label><input id="payload-gsocket-port" name="gsocket_local_port" type="number" value="4630" min="1" max="65535" placeholder="4630" disabled><p class="muted field-hint"><strong>Example:</strong> <code>4630</code>. Choose an unused loopback port; it does not need to be publicly exposed.</p></div>
           <p class="muted payload-field-full">The callback host is pinned to loopback because gs-netcat owns the relay connection. Install gs-netcat on the authorized lab host or set NW_GS_NETCAT to its path.</p>
         </div>
+        <div class="payload-chat-fields payload-field-full" data-chat-fields hidden>
+          <div class="form-field"><label for="payload-chat-token">Beacon bot token</label><input id="payload-chat-token" name="chat_token" autocomplete="off" spellcheck="false" placeholder="bot token issued by the channel" disabled><p class="muted field-hint"><strong>Only the beacon token belongs here.</strong> The server needs its own separate bot identity in the same channel; chat platforms do not let two bots address each other directly.</p></div>
+          <div class="form-field"><label for="payload-chat-address">Channel or chat ID</label><input id="payload-chat-address" name="chat_address" autocomplete="off" spellcheck="false" placeholder="Discord channel id or Telegram chat id" disabled><p class="muted field-hint"><strong>Accepted:</strong> the numeric channel or chat identifier copied from the platform with developer mode enabled. No port is used for chat channels.</p></div>
+          <p class="muted payload-field-full">Discord and Telegram payloads carry their endpoint as <code>discord://&lt;token&gt;@&lt;channel&gt;</code>, so the callback host and port above are not used.</p>
+        </div>
       </div>
     </div>
     <div class="payload-step" data-payload-step="2">
@@ -758,6 +930,7 @@ pub fn payloads_page(
       <div class="payload-fields payload-fields-grid">
         <div class="form-field"><label for="payload-interval">Beacon interval (ms)</label><input id="payload-interval" name="interval_ms" type="number" value="{f_interval}" min="10" placeholder="5000" required><p class="muted field-hint"><strong>Example:</strong> <code>5000</code> means a five-second base interval. Shorter values give faster feedback and generate more traffic.</p></div>
         <div class="form-field"><label for="payload-jitter">Jitter (ms)</label><input id="payload-jitter" name="jitter_ms" type="number" value="{f_jitter}" min="0" placeholder="1000" required><p class="muted field-hint"><strong>Example:</strong> <code>1000</code> adds up to ±1 second. Keep jitter below the base interval for predictable lab behavior.</p></div>
+        <div class="form-field payload-field-full"><label for="payload-harden">Build hardening</label><select id="payload-harden" name="harden"><option value="true">On — strip symbols, remap build paths, abort panics, LTO</option><option value="false">Off — stock release profile</option></select><p class="muted field-hint"><strong>On is the default.</strong> Hardening removes the symbol table, replaces absolute build paths with a per-build fake prefix, and switches to <code>panic=abort</code>. Turning it off is for measuring what it was hiding — an unhardened build leaks your build paths and every dependency symbol name.</p></div>
         <aside class="timing-note payload-field-full"><span class="status-dot"></span><div><strong>Runtime note</strong><p>TCP and gsocket profiles require the corresponding native listener. Build output does not create an automatic portal-to-native bridge.</p></div></aside>
       </div>
     </div>
@@ -773,6 +946,26 @@ pub fn payloads_page(
     <footer class="payload-wizard-actions"><button type="button" class="btn btn-ghost" data-wizard-back>Back</button><span>Need examples? Read the <a href="/guide#guide-payload">payload field guide</a>. Only build for systems you are authorized to test.</span><button type="button" data-wizard-next>Continue <span aria-hidden="true">→</span></button><button type="submit" data-wizard-build>{btn_label} <span aria-hidden="true">↗</span></button></footer>
   </form>
 </section>
+<details class="panel" data-randomizer>
+  <summary><span class="eyebrow">BUILD RANDOMIZER</span><h2>Vary a batch instead of one build.</h2><p>Builds several artifacts that share your endpoint but differ in artifact name, beacon interval, and jitter, so a fleet is not trivially correlatable by filename, size, or a single timing value. Endpoint and protocol are never randomized.</p></summary>
+  <form method="post" action="/payloads/randomize">
+    <input type="hidden" name="csrf_token" value="{token}">
+    <div class="payload-fields">
+      <div class="form-field"><label for="rand-name">Name prefix</label><input id="rand-name" name="name" maxlength="80" placeholder="finance-lab-linux" required><p class="muted field-hint">Each variant gets this prefix plus a short random suffix.</p></div>
+      <div class="form-field"><label for="rand-count">Variants</label><input id="rand-count" name="count" type="number" min="1" max="{max_variants}" value="3" required><p class="muted field-hint">One cargo build per variant, so this is capped at {max_variants}.</p></div>
+      <div class="form-field"><label for="rand-lhost">Callback host</label><input id="rand-lhost" name="lhost" placeholder="192.0.2.10" required></div>
+      <div class="form-field"><label for="rand-lport">Callback port</label><input id="rand-lport" name="lport" type="number" min="1" max="65535" placeholder="8080" required></div>
+      <div class="form-field"><label for="rand-protocol">Protocol</label><select id="rand-protocol" name="protocol">{protocol_options}</select></div>
+      <div class="form-field"><label for="rand-os">OS</label><input id="rand-os" name="os" value="{f_os}" required></div>
+      <div class="form-field"><label for="rand-arch">Arch</label><input id="rand-arch" name="arch" value="{f_arch}" required></div>
+      <div class="form-field"><label for="rand-target">Target triple</label><input id="rand-target" name="target" value="{f_target}" placeholder="leave empty to build for this host"></div>
+      <div class="form-field"><label for="rand-interval">Base interval (ms)</label><input id="rand-interval" name="interval_ms" type="number" min="1" value="{f_interval}" required><p class="muted field-hint">Each variant lands somewhere in [base, 2×base].</p></div>
+      <div class="form-field"><label for="rand-jitter">Base jitter (ms)</label><input id="rand-jitter" name="jitter_ms" type="number" min="0" value="{f_jitter}" required><p class="muted field-hint">Jitter is clamped to the interval, never above it.</p></div>
+      <div class="form-field"><label for="rand-harden">Build hardening</label><select id="rand-harden" name="harden"><option value="true">On — default</option><option value="false">Off — stock profile</option></select><p class="muted field-hint">Each variant gets its own random path prefix and crate metadata hash, so no two builds are byte-identical.</p></div>
+    </div>
+    <button type="submit">Build randomized batch</button>
+  </form>
+</details>
 <section class="payload-library" aria-labelledby="payload-library-title"><div class="section-heading"><div><p class="eyebrow">ARTIFACT LIBRARY</p><h2 id="payload-library-title">Built payloads</h2></div><span>{build_count:02} FILES</span></div>{list}</section>"#,
         token = escape_html(csrf_token),
         f_name = escape_html(&f_name),
@@ -792,6 +985,7 @@ pub fn payloads_page(
         review_protocol = escape_html(&f_protocol.to_uppercase()),
         payload_icon = nav_icon("payloads"),
         build_count = builds.len(),
+        max_variants = crate::payload::MAX_RANDOM_VARIANTS,
     );
     app_page("Payloads", user, "payloads", &body)
 }
@@ -825,8 +1019,18 @@ pub fn callback_detail_page(
             } else {
                 "<span class=\"muted\">—</span>".to_owned()
             };
+            let technique_cell = match crate::attack::lookup(&t.command) {
+                Some(technique) => format!(
+                    "<td><a class=\"technique\" href=\"https://attack.mitre.org/techniques/{}/\" rel=\"noreferrer noopener\" target=\"_blank\" title=\"{} ({})\">{}</a></td>",
+                    escape_html(technique.id),
+                    escape_html(technique.name),
+                    escape_html(technique.tactic),
+                    escape_html(technique.id),
+                ),
+                None => "<td><span class=\"muted\">—</span></td>".to_owned(),
+            };
             out.push_str(&format!(
-                "<tr data-task-id=\"{}\" data-task-command=\"{}\"><td><code>{}</code></td><td>{}</td><td data-task-state>{}</td><td>{}</td><td data-task-output>{}</td></tr>",
+                "<tr data-task-id=\"{}\" data-task-command=\"{}\"><td><code>{}</code></td><td>{}</td><td data-task-state>{}</td>{technique_cell}<td>{}</td><td data-task-output>{}</td></tr>",
                 escape_html(&t.id),
                 escape_html(&t.command),
                 escape_html(&t.id[..t.id.len().min(8)]),
@@ -837,7 +1041,7 @@ pub fn callback_detail_page(
             ));
         }
         format!(
-            "<div class=\"table-scroll\"><table class=\"data-table task-history\"><caption>Task history</caption><thead><tr><th scope=\"col\">Task ID</th><th scope=\"col\">Command</th><th scope=\"col\">State</th><th scope=\"col\">Submitted</th><th scope=\"col\">Output</th></tr></thead><tbody>{out}</tbody></table></div>"
+            "<div class=\"table-scroll\"><table class=\"data-table task-history\"><caption>Task history</caption><thead><tr><th scope=\"col\">Task ID</th><th scope=\"col\">Command</th><th scope=\"col\">State</th><th scope=\"col\">ATT&CK</th><th scope=\"col\">Submitted</th><th scope=\"col\">Output</th></tr></thead><tbody>{out}</tbody></table></div>"
         )
     };
 
@@ -1259,42 +1463,180 @@ format!(
     )
 }
 
+/// One group with its resolved members and its dispatch controls. The preview
+/// lists every callback a dispatch would reach, so the count is never a guess.
+pub struct EventingGroupView<'a> {
+    pub group: &'a CallbackGroup,
+    pub members: &'a [Callback],
+    pub operation_name: &'a str,
+}
+
 pub fn eventing_page(
     user: &AuthenticatedUser,
-    rules: &[EventRule],
+    view: &super::EventingView,
     csrf_token: &str,
+    preview: Option<&(CallbackGroup, usize)>,
     error: Option<&str>,
 ) -> String {
     let error_html = form_error(error, "eventing-form-error");
-    let rows = rules
+    let token = escape_html(csrf_token);
+
+    let operation_options = view
+        .operations
         .iter()
-        .map(|r| {
-            let enabled = if r.enabled {
-                status_pill("Enabled", "success")
-            } else {
-                status_pill("Disabled", "neutral")
-            };
+        .map(|operation| {
             format!(
-                "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape_html(&r.name),
-                escape_html(&r.trigger),
-                escape_html(&r.command),
-                escape_html(&r.target),
-                enabled,
-                escape_html(&r.created_at),
+                r#"<option value="{}">{}</option>"#,
+                escape_html(&operation.id),
+                escape_html(&operation.name)
             )
         })
         .collect::<String>();
-    let list = if rules.is_empty() {
-        "<section class=\"empty-state panel\"><p>No automation rules yet. Define a rule to push a command to all active targets automatically.</p></section>".to_owned()
+
+    let rules = if view.rules.is_empty() {
+        "<section class=\"empty-state panel\"><p>No automation rules yet.</p></section>".to_owned()
     } else {
+        let rows = view
+            .rules
+            .iter()
+            .map(|r| {
+                let enabled = if r.enabled {
+                    status_pill("Enabled", "success")
+                } else {
+                    status_pill("Disabled", "neutral")
+                };
+                format!(
+                    "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape_html(&r.name),
+                    escape_html(&r.trigger),
+                    escape_html(&r.command),
+                    escape_html(&r.target),
+                    enabled,
+                    escape_html(&r.created_at),
+                )
+            })
+            .collect::<String>();
         format!(
             "<div class=\"table-scroll\"><table class=\"data-table event-rules-table\"><caption>Automation rules</caption><thead><tr><th scope=\"col\">Name</th><th scope=\"col\">Trigger</th><th scope=\"col\">Command</th><th scope=\"col\">Target</th><th scope=\"col\">State</th><th scope=\"col\">Created</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
     };
+
+    let operation_names: std::collections::HashMap<&str, &str> = view
+        .operations
+        .iter()
+        .map(|operation| (operation.id.as_str(), operation.name.as_str()))
+        .collect();
+
+    let groups = if view.groups.is_empty() {
+        "<section class=\"empty-state panel\"><p>No callback groups yet. Create a group, add callbacks, then dispatch.</p></section>".to_owned()
+    } else {
+        view.groups
+            .iter()
+            .map(|group| {
+                let members = view.members.get(&group.id).map(Vec::as_slice).unwrap_or_default();
+                let size = members.len();
+                let operation_name = operation_names
+                    .get(group.operation_id.as_str())
+                    .copied()
+                    .unwrap_or("Operation");
+                let is_preview = preview.is_some_and(|(p, _)| p.id == group.id);
+
+                let member_rows = if members.is_empty() {
+                    "<tr><td colspan=\"3\">No callbacks in this group.</td></tr>".to_owned()
+                } else {
+                    members
+                        .iter()
+                        .map(|callback| {
+                            let (status_label, status_class) = callback_status(callback.status);
+                            let status = status_pill(status_label, status_class);
+                            format!(
+                                "<tr><td>{}</td><td>{}</td><td>{}<form method=\"post\" action=\"/eventing/groups/{}/members/remove\"><input type=\"hidden\" name=\"csrf_token\" value=\"{}\"><input type=\"hidden\" name=\"callback_id\" value=\"{}\"><button type=\"submit\" class=\"btn btn-ghost\">Remove</button></form></td></tr>",
+                                escape_html(&callback.host),
+                                escape_html(&callback.user_name),
+                                status,
+                                escape_html(&group.id),
+                                token,
+                                escape_html(&callback.id),
+                            )
+                        })
+                        .collect::<String>()
+                };
+
+                // Callback picker only offers callbacks from this group's
+                // operation, so the form cannot offer a cross-operation add.
+                let candidates = view
+                    .callbacks
+                    .iter()
+                    .filter(|c| c.operation_id.as_deref() == Some(group.operation_id.as_str()))
+                    .filter(|c| !members.iter().any(|m| m.id == c.id))
+                    .map(|callback| {
+                        format!(
+                            r#"<option value="{}">{} · {}</option>"#,
+                            escape_html(&callback.id),
+                            escape_html(&callback.host),
+                            escape_html(&callback.user_name)
+                        )
+                    })
+                    .collect::<String>();
+
+                let preview_html = if is_preview {
+                    let (preview_group, count) = preview.expect("checked above");
+                    let group_id = preview_group.id.as_str();
+                    let rows = members
+                        .iter()
+                        .map(|callback| {
+                            let (label, _) = callback_status(callback.status);
+                            format!(
+                                "<li><b>{}</b> — {} · {}</li>",
+                                escape_html(&callback.host),
+                                escape_html(&callback.user_name),
+                                escape_html(label)
+                            )
+                        })
+                        .collect::<String>();
+                    format!(
+                        r#"<div class="panel" data-dispatch-preview><span class="eyebrow">DISPATCH PREVIEW</span><h3>{}</h3><p>This command reaches exactly these {count} callback(s) in {op_name}. Nothing is sent until you confirm.</p><ul class="report-list">{rows}</ul><form method="post" action="/eventing/dispatch"><input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="group_id" value="{group_id}"><input type="hidden" name="confirmed_count" value="{count}"><div class="form-field"><label for="dispatch-command-{group_id}">Command</label><input id="dispatch-command-{group_id}" name="command" maxlength="200" required placeholder="nw/process-list"></div><div class="form-field"><label for="dispatch-timeout-{group_id}">Timeout (ms)</label><input id="dispatch-timeout-{group_id}" name="timeout_ms" type="number" min="1000" max="600000" value="30000"></div><button type="submit" class="primary-action">Send to {count} callback(s)</button><p class="recon-scope-note">Every send is recorded individually in the task audit.</p></form></div>"#,
+                        escape_html(&preview_group.name),
+                        rows = rows,
+                        op_name = escape_html(operation_name),
+                        token = token,
+                        group_id = escape_html(group_id),
+                        count = count,
+                    )
+                } else {
+                    format!(
+                        r#"<a class="btn btn-ghost" href="/eventing?preview={}">Preview dispatch ↗</a>"#,
+                        escape_html(&group.id)
+                    )
+                };
+
+                format!(
+                    r#"<section class="panel" data-group="{group_id}"><div class="section-heading"><h3>{name}</h3><span>{size} callback(s)</span></div><p>{description}</p><p class="recon-scope-note">Operation: {op_name}</p><div class="table-scroll"><table class="data-table"><caption>Members</caption><thead><tr><th scope="col">Host</th><th scope="col">User</th><th scope="col">State</th></tr></thead><tbody>{member_rows}</tbody></table></div><form method="post" action="/eventing/groups/{group_id}/members"><input type="hidden" name="csrf_token" value="{token}"><div class="form-field"><label for="add-{group_id}">Add callback</label><select id="add-{group_id}" name="callback_id" required><option value="">Choose a callback</option>{candidates}</select></div><button type="submit" class="btn">Add to group</button></form>{preview_html}<form method="post" action="/eventing/groups/{group_id}/delete"><input type="hidden" name="csrf_token" value="{token}"><button type="submit" class="btn btn-ghost">Delete group</button></form></section>"#,
+                    group_id = escape_html(&group.id),
+                    name = escape_html(&group.name),
+                    size = size,
+                    description = if group.description.trim().is_empty() {
+                        String::new()
+                    } else {
+                        escape_html(&group.description)
+                    },
+                    op_name = escape_html(operation_name),
+                    member_rows = member_rows,
+                    candidates = candidates,
+                    preview_html = preview_html,
+                    token = token,
+                )
+            })
+            .collect::<String>()
+    };
+
     let body = format!(
-        "{error_html}<form class=\"form-panel panel\" method=\"post\" action=\"/eventing\"><input type=\"hidden\" name=\"csrf_token\" value=\"{token}\"><div class=\"form-field\"><label for=\"event-name\">Rule name</label><input id=\"event-name\" name=\"name\" placeholder=\"quarantine-on-beacon\" maxlength=\"80\" required></div><div class=\"form-field\"><label for=\"event-trigger\">Trigger</label><input id=\"event-trigger\" name=\"trigger\" placeholder=\"new callback\" maxlength=\"120\" required></div><div class=\"form-field\"><label for=\"event-command\">Command to run on all targets</label><input id=\"event-command\" name=\"command\" placeholder=\"collect system state\" maxlength=\"200\" required></div><div class=\"form-field\"><label for=\"event-target\">Target scope</label><select id=\"event-target\" name=\"target\"><option value=\"all\">All targets</option><option value=\"all_active\">All active only</option></select></div><button type=\"submit\">Create rule</button></form><h2>Automation rules</h2>{list}",
-        token = escape_html(csrf_token),
+        r#"<h2>Callback groups</h2><p class="section-intro">Group callbacks inside one operation, then send a command to exactly the members you previewed.</p>{error_html}<div class="panel"><span class="eyebrow">NEW GROUP</span><form method="post" action="/eventing/groups"><input type="hidden" name="csrf_token" value="{token}"><div class="form-field"><label for="group-operation">Operation</label><select id="group-operation" name="operation_id" required><option value="">Choose an operation</option>{operation_options}</select></div><div class="form-field"><label for="group-name">Group name</label><input id="group-name" name="name" maxlength="80" required placeholder="finance-workstations"></div><div class="form-field"><label for="group-description">Description</label><input id="group-description" name="description" maxlength="160"></div><button type="submit">Create group</button></form></div>{groups}<h2>Automation rules</h2><div class="panel"><form class="form-panel" method="post" action="/eventing"><input type="hidden" name="csrf_token" value="{token}"><div class="form-field"><label for="event-operation">Operation</label><select id="event-operation" name="operation_id" required><option value="">Choose an operation</option>{operation_options}</select></div><div class="form-field"><label for="event-name">Rule name</label><input id="event-name" name="name" placeholder="quarantine-on-beacon" maxlength="80" required></div><div class="form-field"><label for="event-trigger">Trigger</label><input id="event-trigger" name="trigger" placeholder="new callback" maxlength="120" required></div><div class="form-field"><label for="event-command">Command</label><input id="event-command" name="command" maxlength="200" required></div><div class="form-field"><label for="event-target">Target scope</label><select id="event-target" name="target"><option value="all">All targets</option><option value="all_active">All active only</option></select></div><button type="submit">Create rule</button></form></div>{rules}"#,
+        token = token,
+        operation_options = operation_options,
+        groups = groups,
+        rules = rules,
+        error_html = error_html,
     );
     app_page("Eventing", user, "eventing", &body)
 }
@@ -1465,6 +1807,7 @@ fn page_description(name: &str) -> &'static str {
     match name {
         "topology" => "Every asset. Every callback. One connected field of view.",
         "recon" => "Turn scoped observations into a clearer picture.",
+        "directory" => "Enumerate the directory, and see how it can be turned against you.",
         "dashboard" => "A little perspective. Every operation, in one place.",
         "operations" => "Clear scope. Deliberate work. A place for every operation.",
         "inventory" => "The assets that make up your field of view.",
@@ -1491,6 +1834,9 @@ fn nav_icon(name: &str) -> String {
             r#"<circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="m10 8-4 8m8-8 4 8M8 19h8"/>"#
         }
         "recon" => r#"<circle cx="11" cy="11" r="8"/><path d="m17 17 4 4M11 7v8M7 11h8"/>"#,
+        "directory" => {
+            r#"<path d="M3 7V4h6l2 2h10v14H3ZM3 10h18M12 12v5m0-2.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z"/>"#
+        }
         "operations" => r#"<circle cx="12" cy="12" r="9"/><path d="m16 8-2.5 5.5L8 16l2.5-5.5Z"/>"#,
         "callbacks" => r#"<path d="m13 2-9 12h7l-1 8 10-13h-7Z"/>"#,
         "services" => {
@@ -1529,6 +1875,13 @@ fn operation_status(status: OperationStatus) -> (&'static str, &'static str) {
         OperationStatus::Planned => ("Planned", "warning"),
         OperationStatus::Active => ("Active", "success"),
         OperationStatus::Closed => ("Closed", "neutral"),
+    }
+}
+
+fn asset_status(status: AssetStatus) -> (&'static str, &'static str) {
+    match status {
+        AssetStatus::Active => ("Active", "success"),
+        AssetStatus::Retired => ("Retired", "neutral"),
     }
 }
 

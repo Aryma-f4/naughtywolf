@@ -5,7 +5,7 @@ use super::{
 use crate::{
     AppError,
     auth::{AuthenticatedUser, middleware::AuthenticatedUserGuard, rbac::Role},
-    checks::{CheckInput, Runner, SurfaceReconInput},
+    checks::{CheckInput, DirectoryEnumInput, ObjectClass, Runner, SurfaceReconInput},
     db::{
         models::{Asset, Callback, CheckRun, Operation},
         repositories::Repository,
@@ -252,7 +252,7 @@ pub async fn topology_page(
 ) -> Result<Html<String>, AppError> {
     let (_, assets, _) = records(&repo, &user).await?;
     let fallback = if assets.is_empty() {
-        "<p>No assets yet. Add an asset to an operation, or explore the labelled sample graph.</p>"
+        "<p>No assets yet. Recorded operation and callback relationships appear in the live graph.</p>"
             .into()
     } else {
         format!(
@@ -268,8 +268,7 @@ pub async fn topology_page(
         r#"<section class="topology-workspace" data-topology>
 <div class="topology-toolbar"><div class="view-switch" aria-label="Visualization view"><button type="button" data-view="graph" aria-pressed="true">Graph</button><button type="button" data-view="list" aria-pressed="false">List</button></div><label class="sr-only" for="graph-search">Search nodes</label><input id="graph-search" type="search" placeholder="Find a host, address, or operation…" data-graph-search><label class="sr-only" for="graph-operation">Operation</label><select id="graph-operation" data-graph-operation><option value="">All operations</option></select><label class="sr-only" for="graph-status">Node status</label><select id="graph-status" data-graph-status><option value="">All statuses</option><option value="active">Active</option><option value="beacon">Beacon</option><option value="dormant">Dormant</option><option value="lost">Lost</option><option value="observed">Observed</option></select><button type="button" class="btn btn-ghost" data-graph-refresh>Refresh</button></div>
 <div class="graph-summary"><span><i class="legend-dot operation-dot"></i><b data-count="operation">0</b> operations</span><span><i class="legend-dot asset-dot"></i><b data-count="asset">0</b> assets</span><span><i class="legend-dot callback-dot"></i><b data-count="callback">0</b> callbacks</span><span><i class="legend-dot address-dot"></i><b data-count="address">0</b> addresses</span><span class="graph-snapshot" data-graph-snapshot>Loading snapshot…</span></div>
-<div class="graph-sample-banner" data-sample-banner hidden>Sample data · illustrative relationships only <button type="button" data-graph-live>Return to workspace</button></div>
-<div class="graph-layout"><div class="graph-canvas-wrap"><div class="graph-canvas" data-graph-canvas tabindex="0" aria-label="Relationship graph. Drag to pan; use the zoom buttons or arrow keys. Select a node for details."><svg data-graph-svg viewBox="0 0 1000 680" aria-label="Operation, asset and callback relationships"><g data-graph-layer></g></svg></div><div class="graph-list" data-graph-list hidden></div><div class="graph-empty" data-graph-empty hidden><span class="empty-orbit" aria-hidden="true">◎</span><h2>Your field of view starts here.</h2><p>Add scoped assets to build your map, or explore a sample with multiple callbacks.</p><button type="button" data-graph-demo>Explore sample graph</button><a href="/operations">Open operations ↗</a></div><div class="graph-controls"><button type="button" data-zoom="in" aria-label="Zoom in">+</button><button type="button" data-zoom="out" aria-label="Zoom out">−</button><button type="button" data-zoom="fit">Fit</button><span data-graph-visible role="status" aria-live="polite"></span></div></div><aside class="node-inspector" data-node-inspector aria-label="Selected node details"><p class="eyebrow">NODE INSPECTOR</p><div data-node-detail><span class="inspector-symbol" aria-hidden="true">⌖</span><h2>Every connection<br>has context.</h2><p>Select a node to see its identity, status, and recorded relationships.</p></div><div class="inspector-footnote">Lines represent saved associations and DNS observations. They do not imply a network route or pivot.</div></aside></div>
+<div class="graph-layout"><div class="graph-canvas-wrap"><div class="graph-canvas" data-graph-canvas tabindex="0" aria-label="Relationship graph. Drag to pan; use the zoom buttons or arrow keys. Select a node for details."><svg data-graph-svg viewBox="0 0 1000 680" aria-label="Operation, asset and callback relationships"><g data-graph-layer></g></svg></div><div class="graph-list" data-graph-list hidden></div><div class="graph-empty" data-graph-empty hidden><span class="empty-orbit" aria-hidden="true">◎</span><h2>Your field of view starts here.</h2><p>Recorded operations and callbacks will appear here when available.</p><a href="/operations">Open operations ↗</a></div><div class="graph-controls"><button type="button" data-zoom="in" aria-label="Zoom in">+</button><button type="button" data-zoom="out" aria-label="Zoom out">−</button><button type="button" data-zoom="fit">Fit</button><span data-graph-visible role="status" aria-live="polite"></span></div></div><aside class="node-inspector" data-node-inspector aria-label="Selected node details"><p class="eyebrow">NODE INSPECTOR</p><div data-node-detail><span class="inspector-symbol" aria-hidden="true">⌖</span><h2>Every connection<br>has context.</h2><p>Select a node to see its identity, status, and recorded relationships.</p></div><div class="inspector-footnote">Lines represent saved associations and DNS observations. They do not imply a network route or pivot.</div></aside></div>
 <div class="graph-bottom"><span>Drag to pan · + / − to zoom · 0 to fit</span><a href="/recon">Open recon workspace ↗</a></div><details class="graph-fallback"><summary>Asset inventory without visualization</summary>{fallback}</details><noscript><p>Enable JavaScript for the interactive graph. The asset inventory above remains available.</p></noscript></section>"#
     );
     Ok(Html(templates::app_page(
@@ -392,6 +391,7 @@ struct ReconForm {
     csrf_token: Option<String>,
 }
 static RECON_SLOTS: OnceLock<Semaphore> = OnceLock::new();
+static DIRECTORY_SLOTS: OnceLock<Semaphore> = OnceLock::new();
 
 pub async fn run_recon(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
@@ -481,4 +481,264 @@ async fn audit(
     sqlx::query("INSERT INTO audit_events (id, actor_id, operation_id, action, target_type, target_id, outcome, parameter_summary, correlation_id) VALUES (?, ?, ?, ?, 'asset', ?, ?, ?, ?)")
         .bind(uuid::Uuid::new_v4().to_string()).bind(&user.id).bind(operation).bind(action).bind(asset).bind(outcome.0).bind(outcome.1).bind(correlation).execute(&repo.pool).await.map_err(|_| AppError::Internal)?;
     Ok(())
+}
+
+// ── Directory enumeration ────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct DirectoryPageQuery {
+    asset: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DirectoryForm {
+    asset_id: String,
+    base_dn: String,
+    bind_dn: String,
+    bind_password: String,
+    object_class: String,
+    limit: String,
+    csrf_token: Option<String>,
+}
+
+fn object_class_from(value: &str) -> Option<ObjectClass> {
+    match value {
+        "user" => Some(ObjectClass::User),
+        "group" => Some(ObjectClass::Group),
+        "computer" => Some(ObjectClass::Computer),
+        "all" => Some(ObjectClass::All),
+        _ => None,
+    }
+}
+
+pub async fn directory_page(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repo): State<Repository>,
+    session: Session,
+    Query(query): Query<DirectoryPageQuery>,
+) -> Result<Html<String>, AppError> {
+    directory_html(&repo, &user, &session, query.asset.as_deref(), None)
+        .await
+        .map(Html)
+}
+
+async fn directory_html(
+    repo: &Repository,
+    user: &AuthenticatedUser,
+    session: &Session,
+    selected: Option<&str>,
+    error: Option<&str>,
+) -> Result<String, AppError> {
+    let (_ops, assets, runs) = records(repo, user).await?;
+    let selected = selected.filter(|id| !id.is_empty());
+    if selected.is_some_and(|id| !assets.iter().any(|a| a.id == id)) {
+        return Err(AppError::NotFound);
+    }
+    let selected = selected.unwrap_or("");
+    let can_run = user.role.allows(Role::Operator);
+    let csrf = issue_csrf_token(session).await?;
+    let options = assets
+        .iter()
+        .map(|a| {
+            format!(
+                r#"<option value="{}"{}>{} · {}</option>"#,
+                esc(&a.id),
+                if a.id == selected { " selected" } else { "" },
+                esc(&a.name),
+                esc(&a.address)
+            )
+        })
+        .collect::<String>();
+
+    let history: Vec<_> = runs
+        .iter()
+        .filter(|run| {
+            run.check_id == "directory-enum" && (selected.is_empty() || run.asset_id == selected)
+        })
+        .collect();
+
+    // Posture findings first: those are the lines that tell you whether
+    // credential-theft tooling would succeed here.
+    let mut posture: Vec<(String, String)> = Vec::new();
+    let mut counts: Vec<(String, String)> = Vec::new();
+    let mut listed = 0usize;
+    for run in history.iter().rev() {
+        let Some(result) = run.result_json.as_ref() else {
+            continue;
+        };
+        let Some(findings) = result.get("findings").and_then(|f| f.as_array()) else {
+            continue;
+        };
+        for finding in findings {
+            let (Some(code), Some(message)) = (
+                finding.get("code").and_then(|c| c.as_str()),
+                finding.get("message").and_then(|m| m.as_str()),
+            ) else {
+                continue;
+            };
+            if code.starts_with("posture.") {
+                posture.push((code.to_owned(), message.to_owned()));
+            } else if code.starts_with("directory.count.") {
+                counts.push((
+                    code.trim_start_matches("directory.count.").to_owned(),
+                    message.to_owned(),
+                ));
+            } else if code.starts_with("directory.") && listed < 60 {
+                listed += 1;
+            }
+        }
+    }
+
+    let error_html = error
+        .map(|message| format!(r#"<p class="form-error" role="alert">{}</p>"#, esc(message)))
+        .unwrap_or_default();
+    let disabled = if !can_run || assets.is_empty() {
+        " disabled"
+    } else {
+        ""
+    };
+    let posture_html = if posture.is_empty() {
+        r#"<p class="recon-scope-note">No posture findings in the recorded runs.</p>"#.to_owned()
+    } else {
+        format!(
+            r#"<ul class="report-list">{}</ul>"#,
+            posture
+                .iter()
+                .map(|(code, message)| {
+                    format!(
+                        r#"<li><b>{}</b><br><span>{}</span></li>"#,
+                        esc(code),
+                        esc(message)
+                    )
+                })
+                .collect::<String>()
+        )
+    };
+    let counts_html = if counts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="recon-stats">{}</div>"#,
+            counts
+                .iter()
+                .map(|(label, value)| format!("<span><b>{}</b> {}</span>", esc(value), esc(label)))
+                .collect::<String>()
+        )
+    };
+
+    let body = format!(
+        r#"<section class="recon-workspace" data-recon><div class="recon-heading"><div><p class="eyebrow">DIRECTORY / ENUMERATE</p><h2>Map the domain<br><em>before anyone else does.</em></h2><p>Enumerate users, groups, and computers over LDAP, and surface the posture conditions that make credential-theft tooling succeed.</p></div><a class="button" href="/inventory">Open inventory ↗</a></div><div class="recon-columns"><section class="recon-launch panel"><span class="eyebrow">NEW ENUMERATION</span><h2>Point at a domain controller.</h2>{error_html}<form method="post" action="/directory/run" data-recon-form><input type="hidden" name="csrf_token" value="{csrf}"><div class="form-field"><label for="directory-asset">Scoped asset</label><select id="directory-asset" name="asset_id" required{disabled}><option value="">Choose an asset</option>{options}</select></div><div class="form-field"><label for="directory-base">Base DN</label><input id="directory-base" name="base_dn" placeholder="DC=corp,DC=example" maxlength="256"{disabled}><p class="field-hint">Leave blank to read the naming context from the rootDSE.</p></div><div class="form-field"><label for="directory-object">Object class</label><select id="directory-object" name="object_class"{disabled}><option value="user">Users</option><option value="group">Groups</option><option value="computer">Computers</option><option value="all">Everything</option></select></div><div class="form-field"><label for="directory-bind">Bind DN</label><input id="directory-bind" name="bind_dn" placeholder="corp\svc-recon" maxlength="256" autocomplete="off"{disabled}><p class="field-hint">Leave blank for an anonymous bind. Anonymous read access is itself a finding.</p></div><div class="form-field"><label for="directory-password">Bind password</label><input id="directory-password" name="bind_password" type="password" maxlength="256" autocomplete="new-password"{disabled}><p class="field-hint">Never stored: the password is stripped from the run before it is persisted, and a password forces ldaps.</p></div><div class="form-field"><label for="directory-limit">Entry limit</label><input id="directory-limit" name="limit" type="number" min="1" max="200" value="100"{disabled}></div><button type="submit" class="primary-action"{disabled}>Enumerate directory <span aria-hidden="true">↗</span></button><p class="recon-scope-note">{permission}</p></form></section><section class="recon-history"><div class="section-heading"><h2>Posture</h2><span>{history_count} runs</span></div>{counts_html}{posture_html}<p class="inspector-footnote">This check never requests passwords, hashes, or ticket material. It reports posture only.</p></section></div></section>"#,
+        csrf = esc(&csrf),
+        disabled = disabled,
+        options = options,
+        error_html = error_html,
+        permission = if can_run {
+            ""
+        } else {
+            "Your role cannot start directory runs."
+        },
+        posture_html = posture_html,
+        counts_html = counts_html,
+        history_count = history.len(),
+    );
+    Ok(templates::app_page("Directory", user, "directory", &body))
+}
+
+pub async fn run_directory(
+    AuthenticatedUserGuard(user): AuthenticatedUserGuard,
+    State(repo): State<Repository>,
+    session: Session,
+    request: Request,
+) -> Result<Response, AppError> {
+    user.require(Role::Operator)?;
+    let Form(form) = Form::<DirectoryForm>::from_request(request, &repo)
+        .await
+        .map_err(|_| AppError::Validation("Invalid form".into()))?;
+    let Some(object_class) = object_class_from(&form.object_class) else {
+        return Err(AppError::Validation("Invalid object class".into()));
+    };
+    if !csrf_token_matches(&session, form.csrf_token.as_deref()).await? {
+        return Err(AppError::Validation("Invalid request".into()));
+    }
+    let limit = form
+        .limit
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(100)
+        .clamp(1, 200);
+    for value in [&form.base_dn, &form.bind_dn] {
+        if value.len() > 256 {
+            return Err(AppError::Validation("Field is too long".into()));
+        }
+    }
+
+    authorize_asset_run(&repo, &user, &form.asset_id).await?;
+    let asset = repo
+        .find_asset(&form.asset_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let operation = asset.operation_id.clone();
+    let correlation = uuid::Uuid::new_v4().to_string();
+    audit(
+        &repo,
+        &user,
+        &operation,
+        &asset.id,
+        "directory.requested",
+        ("success", format!("object_class={}", form.object_class)),
+        &correlation,
+    )
+    .await?;
+
+    if let Err(error) =
+        crate::checks::directory::endpoint(&asset.address, !form.bind_password.is_empty())
+    {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Html(directory_html(&repo, &user, &session, Some(&asset.id), Some(error)).await?),
+        )
+            .into_response());
+    }
+
+    let _permit = DIRECTORY_SLOTS
+        .get_or_init(|| Semaphore::new(2))
+        .try_acquire()
+        .map_err(|_| AppError::Conflict("Directory capacity reached".into()))?;
+
+    let asset_id = asset.id.clone();
+    let result = Runner::new(repo.clone(), user.clone())
+        .start(
+            asset,
+            "directory-enum",
+            CheckInput::DirectoryEnum(DirectoryEnumInput {
+                base_dn: form.base_dn.trim().to_owned(),
+                bind_dn: form.bind_dn.trim().to_owned(),
+                bind_password: form.bind_password,
+                object_class,
+                limit,
+            }),
+        )
+        .await?;
+    audit(
+        &repo,
+        &user,
+        &operation,
+        &asset_id,
+        "directory.finished",
+        (
+            if result.state == crate::db::models::RunState::Succeeded {
+                "success"
+            } else {
+                "failure"
+            },
+            format!(
+                "run_id={}; state={}",
+                result.run_id.as_deref().unwrap_or("unavailable"),
+                status(result.state)
+            ),
+        ),
+        &correlation,
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/directory?asset={}", form.asset_id)).into_response())
 }

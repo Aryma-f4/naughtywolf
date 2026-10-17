@@ -52,11 +52,14 @@ async fn built_payloads_connect_and_register_a_callback() {
                 protocol: protocol.into(),
                 gsocket_secret: None,
                 gsocket_local_port: None,
+                chat_token: None,
+                chat_address: None,
                 os: "linux".into(),
                 arch: "amd64".into(),
                 interval_ms: 1000,
                 jitter_ms: 0,
                 target: String::new(),
+                harden: true,
             },
             psk,
         )
@@ -113,11 +116,14 @@ async fn built_payloads_connect_and_register_a_callback() {
                 protocol: protocol.into(),
                 gsocket_secret,
                 gsocket_local_port,
+                chat_token: None,
+                chat_address: None,
                 os: "linux".into(),
                 arch: "amd64".into(),
                 interval_ms: 1000,
                 jitter_ms: 0,
                 target: String::new(),
+                harden: true,
             },
             psk,
         )
@@ -130,4 +136,93 @@ async fn built_payloads_connect_and_register_a_callback() {
     }
 
     http_server.abort();
+}
+
+/// The portal's payload wizard offers `grpc://`, so a beacon built from the
+/// portal must be able to register against the portal's own gRPC C2. This
+/// builds a real gRPC payload, runs the produced binary, and asserts the
+/// callback lands in the database through the gRPC path specifically.
+#[tokio::test]
+#[ignore = "spawns a real toolchain build and a child implant; run on demand"]
+async fn built_grpc_payload_registers_against_the_portal_grpc_c2() {
+    let pool = db::create_pool("sqlite::memory:").await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    let repository = Repository { pool };
+    let psk = b"smoke-grpc-psk";
+
+    // Pick a free port the same way the production listener is given one.
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let grpc_repository = repository.clone();
+    let grpc_psk: Arc<Vec<u8>> = Arc::new(psk.to_vec());
+    let grpc_server = tokio::spawn(async move {
+        naughtywolf::c2_grpc::serve(
+            grpc_repository,
+            grpc_psk,
+            "grpc".to_owned(),
+            format!("127.0.0.1:{port}").parse().unwrap(),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let meta = payload::build(
+        &BuildRequest {
+            name: "smoke-grpc".into(),
+            lhost: "127.0.0.1".into(),
+            lport: port,
+            protocol: "grpc".into(),
+            gsocket_secret: None,
+            gsocket_local_port: None,
+            chat_token: None,
+            chat_address: None,
+            os: "linux".into(),
+            arch: "amd64".into(),
+            interval_ms: 1000,
+            jitter_ms: 0,
+            target: String::new(),
+            harden: true,
+        },
+        psk,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("build grpc payload failed: {e}"));
+
+    let binary = std::path::Path::new("payloads").join(&meta.file);
+    let state_directory = std::env::temp_dir().join(format!("nw-smoke-grpc-{}", meta.file));
+    let mut child = tokio::process::Command::new(&binary)
+        .env("NW_STATE_DIR", &state_directory)
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn built grpc implant failed: {e}"));
+
+    let count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM callbacks")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = std::fs::remove_dir_all(&state_directory);
+    let _ = std::fs::remove_file(&binary);
+    let _ = std::fs::remove_file(format!("{}.json", binary.display()));
+
+    let count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM callbacks")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert!(
+        count_after > count_before,
+        "grpc payload ran but no callback registered over gRPC"
+    );
+
+    // The session must be attributed to gRPC, not HTTP.
+    let protocol: String = sqlx::query_scalar("SELECT protocol FROM callbacks LIMIT 1")
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+    assert_eq!(protocol, "grpc", "callback must record the gRPC transport");
+
+    grpc_server.abort();
 }

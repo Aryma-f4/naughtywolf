@@ -386,7 +386,7 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
 /* ── Dashboard metric grid ───────────────────────────────────────────── */
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 1rem;
 }
 
@@ -414,8 +414,7 @@ button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity:
   font: 700 clamp(2rem, 4vw, 3rem)/1 var(--font-mono);
 }
 
-@media (max-width: 1100px) { .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 640px) { .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric-card:last-child { grid-column: 1 / -1; } }
+@media (max-width: 640px) { .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric-card:last-child:nth-child(odd) { grid-column: 1 / -1; } }
 
 /* ── Panel & record grids ────────────────────────────────────────────── */
 .panel,
@@ -872,7 +871,7 @@ label { font-weight: 500; color: #ddc7cc; }
   .quick-link { padding-inline: .5rem; font-size: .66rem; }
   .portal-topbar { gap: 1rem; }
   .overview-bottom { grid-template-columns: 1.8fr 1fr; }
-  .metric-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .metric-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .metric-card { padding: .9rem; }
   .metric-card small { font-size: .53rem; }
 }
@@ -886,7 +885,7 @@ label { font-weight: 500; color: #ddc7cc; }
   .point-one { left: calc(50% + 5rem); }
   .orbit-label-top { left: .5rem; }
   .orbit-label-bottom { left: 30%; }
-  .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metric-card { min-height: 10rem; padding: 1rem; }
   .overview-bottom { grid-template-columns: 1fr; }
   .field-note h2 br { display: none; }
@@ -948,7 +947,7 @@ label { font-weight: 500; color: #ddc7cc; }
   .point-two { top: calc(50% + 2.8rem); left: calc(50% - 2.8rem); }
   .hero-actions { gap: 1rem; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .metric-card:last-child { grid-column: 1 / -1; }
+  .metric-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .metric-card:last-child { min-height: 9rem; }
   .metric-card:last-child .metric-top { margin-bottom: .5rem; }
   .workflow-steps { grid-template-columns: 1fr; gap: 1.2rem; }
@@ -970,7 +969,7 @@ label { font-weight: 500; color: #ddc7cc; }
   .workspace-footer, .page-stamp, .hero-actions, .scope-orbit { display: none; }
   .overview-hero, .field-note, .metric-card { background: #fff; color: #111; break-inside: avoid; }
   .overview-hero { display: block; }
-  .metric-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .metric-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 
 /* Payload creation and active callback workspaces. */
@@ -1141,7 +1140,7 @@ label { font-weight: 500; color: #ddc7cc; }
 .callback-workspace-head h2 em { color: var(--accent); font-weight: 400; }
 .callback-workspace-head p:last-child { max-width: 60ch; margin: 0; color: var(--muted); font-size: .75rem; }
 .callback-workspace-actions { display: flex; gap: .6rem; flex-wrap: wrap; justify-content: flex-end; }
-.callback-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; }
+.callback-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; }
 .callback-summary article { display: grid; min-height: 8rem; padding: 1rem; border: 1px solid var(--border); border-radius: .65rem; background: var(--surface); }
 .callback-summary span { color: var(--muted); font-size: .65rem; }
 .callback-summary strong { align-self: end; font: 400 2.3rem/1 var(--font-editorial); }
@@ -1249,6 +1248,7 @@ label { font-weight: 500; color: #ddc7cc; }
   .callback-workspace-head { align-items: start; flex-direction: column; }
   .callback-workspace-actions { justify-content: start; }
   .callback-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .callback-summary article:last-child { grid-column: 1 / -1; }
   .callback-header { align-items: start; gap: .75rem; }
   .callback-header-actions { flex-direction: column; align-items: end; }
   .command-dock form { grid-template-columns: 1fr auto; }

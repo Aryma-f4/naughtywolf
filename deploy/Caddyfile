@@ -1,0 +1,49 @@
+# NaughtyWolf gateway: operator portal and headless C2 on one domain.
+#
+# {$GATEWAY_DOMAIN} comes from the environment so this file is identical across
+# deployments.
+#
+#   /        -> portal (operator console, payload builder, portal C2 at /c2/*)
+#   /c2b/*   -> headless C2 (/c2/checkin, /c2/ws), e.g. /c2b/checkin
+#
+# gRPC note: both C2s expose the same generated service path (/nw.C2/Checkin),
+# so they cannot be distinguished by path on one hostname. gRPC therefore needs
+# its own subdomain or a published port; it is intentionally not wired here.
+
+{$GATEWAY_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+
+	# Operator-only surfaces stay out of search indexes.
+	@private path /admin* /operations* /callbacks* /inventory* /evidence* /payloads* /attack* /credentials*
+	header @private {
+		X-Robots-Tag "noindex, nofollow"
+	}
+
+	# Headless C2 under a path prefix. The check-in handler reads only the
+	# request body and never inspects the URL, so rewriting is safe: the sealed
+	# envelope is opaque either way.
+	handle_path /c2b/* {
+		rewrite * /c2{uri}
+		reverse_proxy c2:8081
+	}
+
+	request_body {
+		max_size 32MB
+	}
+
+	reverse_proxy app:8080 {
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

@@ -19,7 +19,7 @@ pub struct CheckDefinition {
     pub execution_kind: ExecutionKind,
 }
 
-const CATALOG: [CheckDefinition; 2] = [
+const CATALOG: [CheckDefinition; 3] = [
     CheckDefinition {
         id: "asset-record-review",
         label: "Asset record review",
@@ -36,6 +36,16 @@ const CATALOG: [CheckDefinition; 2] = [
         required_role: Role::Operator,
         timeout: Duration::from_secs(15),
         max_output_bytes: 8_192,
+        builtin: true,
+        mutates_target: false,
+        execution_kind: ExecutionKind::InProcess,
+    },
+    CheckDefinition {
+        id: "directory-enum",
+        label: "Directory enumeration and posture",
+        required_role: Role::Operator,
+        timeout: Duration::from_secs(30),
+        max_output_bytes: 16_384,
         builtin: true,
         mutates_target: false,
         execution_kind: ExecutionKind::InProcess,

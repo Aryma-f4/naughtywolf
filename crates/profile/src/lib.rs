@@ -1,3 +1,5 @@
+pub mod chat;
+pub mod chat_channel;
 pub mod config;
 pub mod control;
 pub mod creds;

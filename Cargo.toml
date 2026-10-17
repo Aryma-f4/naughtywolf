@@ -87,11 +87,17 @@ hex.workspace = true
 base64 = { version = "0.22", features = ["std"] }
 nw-profile = { path = "crates/profile" }
 reqwest = { workspace = true, features = ["rustls-tls", "multipart"] }
+tonic.workspace = true
+prost.workspace = true
 ldap3 = { version = "0.12.1", default-features = false, features = ["sync"] }
+
+[build-dependencies]
+tonic-build.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 nw-implant = { path = "crates/implant" }
+nw-server = { path = "crates/server" }
 time = "0.3"
 
 [target.'cfg(windows)'.dependencies]

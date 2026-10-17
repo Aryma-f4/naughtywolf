@@ -177,17 +177,18 @@ The desktop dashboard is shown at the top of this README. Original screenshots a
 | Dashboard | `/dashboard` | Visible operation, asset, check, evidence, and audit counts. |
 | Topology | `/topology` | Interactive relationship map, filters, node inspector, and list view. |
 | Recon | `/recon` | Scoped DNS/HTTP observations and saved results; execution requires Operator or Admin. |
+| Directory | `/directory` | LDAP enumeration of users, groups, and computers, plus posture findings; execution requires Operator or Admin. |
 | Operations | `/operations` | Operation records and asset creation. |
-| Assets | `/inventory` | Inventory for visible operations. |
+| Assets | `/inventory` | Inventory for visible operations, with per-asset edit and retire. |
 | Checks | `/checks` | Recorded check-run history. |
 | Evidence | `/evidence` | Artifact metadata and verified downloads. |
 | Reports | `/reports` | Printable summaries from stored operation records. |
 | Audit | `/audit` | Recorded actions and outcomes. |
 | Active Callbacks | `/callbacks` | Session status board, callback inventory, task history, live output, and interaction workspace. |
 | Services | `/services` | Service records. |
-| Eventing | `/eventing` | Event-rule configuration. |
+| Eventing | `/eventing` | Callback groups with operation-scoped membership, dispatch preview, and automation rules. |
 | Event feed | `/events` | Workspace event records. |
-| Create Payload | `/payloads` | Four-step native payload wizard and generated artifact library. |
+| Create Payload | `/payloads` | Four-step native payload wizard, build randomizer, and a retrieval ledger showing which artifacts have actually been fetched. |
 | Search | `/search` | Search available workspace records. |
 | Administration | `/admin/users` | Local account roles and enabled state. |
 

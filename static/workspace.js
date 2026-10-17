@@ -52,24 +52,7 @@
     for (const n of data.nodes) if (!positions.has(n.id)) visit(n.id, 0);
     return positions;
   }
-  function sampleGraph() {
-    const nodes = [], edges = [];
-    for (let group = 0; group < 2; group++) {
-      const op = `sample-op-${group}`;
-      nodes.push({ id: op, kind: 'operation', label: ['Northstar lab', 'Redwood lab'][group], detail: 'Illustrative scope', operation: op, status: 'active', href: '', facts: [] });
-      for (let host = 0; host < 3; host++) {
-        const asset = `${op}-asset-${host}`;
-        const label = ['Gateway', 'Workstation', 'Application'][host] + ` ${group + 1}`;
-        nodes.push({ id: asset, kind: 'asset', label, detail: `192.0.2.${group * 10 + host + 10}`, operation: op, status: 'active', href: '', facts: [['Dataset', 'Sample only'], ['Owner', 'Lab team']] });
-        edges.push({ source: op, target: asset, label: 'contains' });
-        const id = `${asset}-callback`;
-        nodes.push({ id, kind: 'callback', label: `LAB-${group + 1}0${host + 1}`, detail: ['Windows · HTTPS', 'Linux · HTTP', 'macOS · HTTPS'][host], operation: op, status: ['active', 'beacon', 'dormant'][host], href: '', facts: [['Dataset', 'Sample only'], ['Relationship', 'Illustrative registered callback']] });
-        edges.push({ source: asset, target: id, label: 'registered callback' });
-      }
-    }
-    return { nodes, edges };
-  }
-  const model = { filterGraph, visibleGraph, layoutGraph, sampleGraph, MAX_VISIBLE };
+  const model = { filterGraph, visibleGraph, layoutGraph, MAX_VISIBLE };
   if (typeof module !== 'undefined' && module.exports) { module.exports = model; return; }
   root.NWGraph = model;
   const svgNS = 'http://www.w3.org/2000/svg';
@@ -126,8 +109,8 @@
     const canvas = $('[data-graph-canvas]'), svg = $('[data-graph-svg]'), layer = $('[data-graph-layer]');
     const list = $('[data-graph-list]'), detail = $('[data-node-detail]');
     const operation = $('[data-graph-operation]'), search = $('[data-graph-search]'), status = $('[data-graph-status]');
-    let live = { nodes: [], edges: [] }, data = live, graph = live, positions = new Map();
-    let sample = false, selected = '', view = 'graph', loading = false;
+    let data = { nodes: [], edges: [] }, graph = data, positions = new Map();
+    let selected = '', view = 'graph', loading = false;
     let camera = { x: 20, y: 20, k: 1 }, drag = null, bounds = { width: 800, height: 600 };
     const size = () => ({ width: Math.max(canvas.clientWidth, 280), height: Math.max(canvas.clientHeight, 400) });
     function move() { layer.setAttribute('transform', `translate(${camera.x} ${camera.y}) scale(${camera.k})`); }
@@ -159,9 +142,8 @@
       const facts = el('dl', 'node-facts');
       for (const [name, value] of [['Status', node.status], ...node.facts]) { const row = el('div'); row.append(el('dt', '', name), el('dd', '', value || '—')); facts.append(row); }
       detail.append(facts);
-      if (node.href && !sample) { const link = el('a', 'button', node.kind === 'callback' ? 'Open callback ↗' : node.kind === 'operation' ? 'Review operation ↗' : 'Open recon history ↗'); link.href = node.href; detail.append(link); }
+      if (node.href) { const link = el('a', 'button', node.kind === 'callback' ? 'Open callback ↗' : node.kind === 'operation' ? 'Review operation ↗' : 'Open recon history ↗'); link.href = node.href; detail.append(link); }
       if (node.operation) { const focus = el('button', 'btn btn-ghost', 'Focus this operation'); focus.addEventListener('click', () => { operation.value = node.operation; render(true); }); detail.append(focus); }
-      if (sample) detail.append(el('p', 'field-hint', 'Sample node. No target or callback was created.'));
       if (changed) root.NWMotion?.detail(detail);
     }
     function resetInspector() {
@@ -182,7 +164,6 @@
       bounds = { width: 1, height: 1 };
       for (const p of positions.values()) { bounds.width = Math.max(bounds.width, p.x + 225); bounds.height = Math.max(bounds.height, p.y + 80); }
       $('[data-graph-empty]').hidden = data.nodes.length > 0;
-      $('[data-sample-banner]').hidden = !sample;
       for (const kind of ['operation', 'asset', 'callback', 'address']) $(`[data-count="${kind}"]`).textContent = data.nodes.filter(n => n.kind === kind).length;
       const note = $('[data-graph-visible]');
       note.textContent = filtered.nodes.length > MAX_VISIBLE ? `${graph.nodes.length} of ${filtered.nodes.length} nodes · refine search or operation` : `${graph.nodes.length} nodes · ${graph.edges.length} relationships`;
@@ -217,20 +198,15 @@
         const response = await fetch('/topology/data', { credentials: 'same-origin', signal });
         if (!response.ok) throw new Error('Could not load the workspace. Use Refresh to retry.');
         const next = await response.json(); if (signal.aborted) return;
-        live = next;
-        if (!sample) {
-          const selection = { operation: operation.value, query: search.value, status: status.value, selected };
-          setData(live, false); operation.value = [...operation.options].some(o => o.value === selection.operation) ? selection.operation : '';
-          search.value = selection.query; status.value = selection.status; selected = selection.selected; render(true, true);
-        }
+        const selection = { operation: operation.value, query: search.value, status: status.value, selected };
+        setData(next, false); operation.value = [...operation.options].some(o => o.value === selection.operation) ? selection.operation : '';
+        search.value = selection.query; status.value = selection.status; selected = selection.selected; render(true, true);
         $('[data-graph-snapshot]').textContent = `Snapshot · ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
       } catch (error) { if (!signal.aborted) $('[data-graph-snapshot]').textContent = 'Could not load snapshot. Refresh to retry.'; }
       finally { loading = false; $('[data-graph-refresh]').disabled = false; }
     }
     on(search, 'input', () => render(true)); on(operation, 'change', () => render(true)); on(status, 'change', () => render(true));
     on($('[data-graph-refresh]'), 'click', refresh);
-    on($('[data-graph-demo]'), 'click', () => { sample = true; setData(sampleGraph()); });
-    on($('[data-graph-live]'), 'click', () => { sample = false; setData(live); });
     for (const button of scope.querySelectorAll('[data-view]')) on(button, 'click', () => {
       view = button.dataset.view; canvas.hidden = view !== 'graph'; list.hidden = view !== 'list';
       scope.querySelectorAll('[data-zoom]').forEach(control => { control.hidden = view !== 'graph'; });

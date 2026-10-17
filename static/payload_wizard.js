@@ -40,6 +40,47 @@
     const build = form.querySelector('[data-wizard-build]');
     let current = 0;
 
+    // Chat channels take a beacon token plus a channel id instead of a host
+    // and port, so the two field groups are mutually exclusive.
+    function syncChatFields() {
+      const protocol = form.querySelector('#payload-proto');
+      const group = form.querySelector('[data-chat-fields]');
+      if (!protocol || !group) return;
+      const enabled = protocol.value === 'discord' || protocol.value === 'telegram';
+      const host = form.querySelector('#payload-lhost');
+      const port = form.querySelector('#payload-lport');
+      group.hidden = !enabled;
+      group.querySelectorAll?.('input').forEach(input => {
+        input.disabled = !enabled;
+        input.required = enabled;
+      });
+      if (host && port) {
+        host.readOnly = enabled;
+        port.readOnly = enabled;
+        if (enabled) {
+          if (!host.dataset.chatPinned) {
+            host.dataset.directValue = host.value;
+            host.dataset.chatPinned = 'true';
+          }
+          host.value = '—';
+          if (!port.dataset.chatPinned) {
+            port.dataset.directValue = port.value;
+            port.dataset.chatPinned = 'true';
+          }
+          port.removeAttribute('required');
+        } else if (host.dataset.chatPinned) {
+          host.value = host.dataset.directValue || '';
+          host.removeAttribute('required');
+          if (port.dataset.chatPinned) {
+            port.value = port.dataset.directValue || '';
+            port.setAttribute('required', 'true');
+          }
+          delete host.dataset.chatPinned;
+          delete port.dataset.chatPinned;
+        }
+      }
+    }
+
     function syncGSocketFields() {
       const protocol = form.querySelector('#payload-proto');
       const group = form.querySelector('[data-gsocket-fields]');
@@ -114,7 +155,10 @@
       else if (stepIsValid()) goTo(current + 1);
     }));
     form.addEventListener?.('input', () => { if (current === steps.length - 1) renderReview(form); });
-    form.querySelector('#payload-proto')?.addEventListener('change', syncGSocketFields);
+    form.querySelector('#payload-proto')?.addEventListener('change', () => {
+      syncGSocketFields();
+      syncChatFields();
+    });
     form.querySelector('#payload-gsocket-port')?.addEventListener('input', event => {
       const port = form.querySelector('#payload-lport');
       if (port && form.querySelector('#payload-proto')?.value === 'gs') port.value = event.target.value;
@@ -124,6 +168,7 @@
       if (input && globalThis.crypto?.randomUUID) input.value = globalThis.crypto.randomUUID();
     });
     syncGSocketFields();
+    syncChatFields();
     show();
     return { goTo, get current() { return current; } };
   }

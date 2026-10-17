@@ -143,6 +143,8 @@ async fn migration_creates_the_core_schema() {
         "check_runs",
         "evidence",
         "audit_events",
+        "callback_groups",
+        "callback_group_members",
     ] {
         assert!(
             table_names.contains(&expected.to_string()),

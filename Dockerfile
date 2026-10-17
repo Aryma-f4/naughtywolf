@@ -7,8 +7,17 @@ COPY crates ./crates
 COPY src ./src
 COPY static ./static
 COPY migrations ./migrations
+# build.rs runs tonic-build over the shared C2 carrier schema, so the proto
+# must be present before any `cargo build`.
+COPY proto ./proto
+COPY build.rs ./build.rs
 
 FROM sources AS builder
+# tonic-build shells out to protoc for the C2 carrier schema; prost-build 0.13
+# does not vendor one, so the compiler must exist before cargo build runs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --locked --release -p naughtywolf --bin naughtywolf
@@ -18,7 +27,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # self-contained linker; musl-gcc remains available only for C dependencies.
 FROM sources AS musl-smoke-builder
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends musl-tools \
+    && apt-get install -y --no-install-recommends musl-tools protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* \
     && rustup target add x86_64-unknown-linux-musl
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
@@ -36,10 +45,16 @@ RUN apt-get update \
         binutils-mingw-w64-x86-64 \
         ca-certificates \
         curl \
+        gcc-aarch64-linux-gnu \
         gcc-mingw-w64-x86-64 \
+        libc6-dev-arm64-cross \
         musl-tools \
+        protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* \
-    && rustup target add x86_64-pc-windows-gnu x86_64-unknown-linux-musl \
+    && rustup target add \
+        aarch64-unknown-linux-gnu \
+        x86_64-pc-windows-gnu \
+        x86_64-unknown-linux-musl \
     && groupadd --gid 10001 naughtywolf \
     && useradd --uid 10001 --gid naughtywolf --create-home naughtywolf \
     && mkdir -p /data/evidence /data/payloads /app/target \
@@ -54,6 +69,8 @@ ENV NAUGHTYWOLF_BIND=0.0.0.0:8080 \
     NAUGHTYWOLF_COOKIE_SECURE=true \
     CC_x86_64_unknown_linux_musl=musl-gcc \
     CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     RUST_LOG=info
 WORKDIR /data
 USER naughtywolf

@@ -1,7 +1,10 @@
 pub mod application;
+pub mod attack;
 pub mod audit;
 pub mod auth;
 pub mod c2;
+pub mod c2_chat;
+pub mod c2_grpc;
 pub mod c2_tcp;
 pub mod callback_workspace;
 pub mod checks;

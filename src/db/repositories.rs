@@ -8,9 +8,9 @@ use crate::{
     audit::AuditEntry,
     auth::rbac::Role,
     db::models::{
-        Asset, AssetStatus, AuditEvent, Callback, CheckRun, EventRule, Evidence, FileSnapshot,
-        FileTransfer, InstalledService, Operation, OperationStatus, ProcessSnapshot, RunState,
-        TaskRecord,
+        Asset, AssetStatus, AuditEvent, Callback, CallbackGroup, CheckRun, EventRule, Evidence,
+        FileSnapshot, FileTransfer, HarvestedCredential, InstalledService, Operation,
+        OperationStatus, ProcessSnapshot, RunState, TaskRecord,
     },
     error::AppError,
 };
@@ -398,6 +398,61 @@ impl Repository {
         self.find_asset(&id).await?.ok_or(AppError::NotFound)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_asset_with_audit(
+        &self,
+        asset_id: &str,
+        name: &str,
+        kind: &str,
+        owner: &str,
+        address: &str,
+        status: AssetStatus,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<Asset, AppError> {
+        let operation_id: Option<String> =
+            sqlx::query_scalar("SELECT operation_id FROM assets WHERE id = ?")
+                .bind(asset_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| AppError::Internal)?;
+        let Some(operation_id) = operation_id else {
+            return Err(AppError::NotFound);
+        };
+
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        let updated = sqlx::query(
+            "UPDATE assets SET name = ?, kind = ?, owner = ?, address = ?, status = ?, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        )
+        .bind(name)
+        .bind(kind)
+        .bind(owner)
+        .bind(address)
+        .bind(status)
+        .bind(asset_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        if updated.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "asset.updated",
+            "asset",
+            asset_id,
+            "success",
+            correlation_id,
+        )
+        .for_operation(operation_id);
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+
+        self.find_asset(asset_id).await?.ok_or(AppError::NotFound)
+    }
+
     pub async fn list_assets(&self, operation_id: &str) -> Result<Vec<Asset>, AppError> {
         sqlx::query_as::<_, Asset>("SELECT * FROM assets WHERE operation_id = ? ORDER BY name, id")
             .bind(operation_id)
@@ -675,6 +730,95 @@ impl Repository {
             .fetch_optional(&self.pool)
             .await
             .map_err(|_| AppError::Internal)
+    }
+
+    /// Stable id for a harvested credential, matching the standalone C2 server
+    /// so both processes upsert the same row instead of duplicating.
+    pub fn credential_entry_id(
+        session_id: &str,
+        source: &str,
+        cred_type: &str,
+        identifier: &str,
+    ) -> String {
+        format!("{session_id}:{source}:{cred_type}:{identifier}")
+    }
+
+    /// Persist one harvested credential, replacing any earlier entry for the
+    /// same (session, source, type, identifier) so re-harvesting updates in
+    /// place rather than accumulating duplicates.
+    pub async fn upsert_credential(
+        &self,
+        session_id: &str,
+        source: &str,
+        cred_type: &str,
+        identifier: &str,
+        secret: &str,
+    ) -> Result<(), AppError> {
+        let id = Self::credential_entry_id(session_id, source, cred_type, identifier);
+        sqlx::query(
+            "INSERT OR REPLACE INTO c2_creds \
+             (id, session_id, source, cred_type, identifier, secret) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(source)
+        .bind(cred_type)
+        .bind(identifier)
+        .bind(secret)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        Ok(())
+    }
+
+    /// Credentials visible to a user. Admins see everything; everyone else
+    /// only sees credentials from callbacks belonging to an operation they are
+    /// a member of, so a credential is scoped exactly like its callback.
+    ///
+    /// A callback with no operation assignment is admin-only: it has no
+    /// membership to join through, and treating "unassigned" as visible to all
+    /// would leak harvested secrets to every operator.
+    pub async fn list_credentials_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<HarvestedCredential>, AppError> {
+        const SELECT: &str = "SELECT creds.*, callbacks.host AS callback_host \
+             FROM c2_creds creds \
+             LEFT JOIN callbacks ON callbacks.id = creds.session_id ";
+        let query = if is_admin {
+            sqlx::query_as::<_, HarvestedCredential>(&format!(
+                "{SELECT} ORDER BY creds.created_at DESC, creds.id"
+            ))
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, HarvestedCredential>(&format!(
+                "{SELECT} JOIN operation_members \
+                 ON operation_members.operation_id = callbacks.operation_id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY creds.created_at DESC, creds.id"
+            ))
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+        };
+        query.map_err(|_| AppError::Internal)
+    }
+
+    /// Fetch a single credential if it is visible to the user.
+    pub async fn find_credential_visible_to(
+        &self,
+        credential_id: &str,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<HarvestedCredential, AppError> {
+        let visible = self.list_credentials_visible_to(user_id, is_admin).await?;
+        visible
+            .into_iter()
+            .find(|c| c.id == credential_id)
+            .ok_or(AppError::NotFound)
     }
 
     pub async fn list_callbacks_visible_to(
@@ -1958,15 +2102,297 @@ impl Repository {
             .map_err(|_| AppError::Internal)
     }
 
-    pub async fn list_event_rules(&self) -> Result<Vec<EventRule>, AppError> {
-        sqlx::query_as::<_, EventRule>("SELECT * FROM event_rules ORDER BY created_at DESC, id")
+    pub async fn create_callback_group(
+        &self,
+        operation_id: &str,
+        name: &str,
+        description: &str,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<CallbackGroup, AppError> {
+        let id = Uuid::new_v4().to_string();
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        let inserted = sqlx::query(
+            "INSERT INTO callback_groups (id, operation_id, name, description, created_by) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(operation_id)
+        .bind(name)
+        .bind(description)
+        .bind(actor_id)
+        .execute(&mut *transaction)
+        .await;
+        if inserted.is_err() {
+            // The UNIQUE(operation_id, name) constraint is the real guard here.
+            return Err(AppError::Conflict(
+                "A group with that name already exists in this operation".to_owned(),
+            ));
+        }
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "callback_group.created",
+            "callback_group",
+            &id,
+            "success",
+            correlation_id,
+        )
+        .for_operation(operation_id);
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+
+        sqlx::query_as::<_, CallbackGroup>("SELECT * FROM callback_groups WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_callback_groups_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<CallbackGroup>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, CallbackGroup>(
+                "SELECT * FROM callback_groups ORDER BY operation_id, name",
+            )
+        } else {
+            sqlx::query_as::<_, CallbackGroup>(
+                "SELECT callback_groups.* FROM callback_groups \
+                 JOIN operation_members \
+                   ON operation_members.operation_id = callback_groups.operation_id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY callback_groups.operation_id, callback_groups.name",
+            )
+            .bind(user_id)
+        };
+        query
             .fetch_all(&self.pool)
             .await
             .map_err(|_| AppError::Internal)
     }
 
+    pub async fn find_callback_group_visible_to(
+        &self,
+        group_id: &str,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Option<CallbackGroup>, AppError> {
+        if is_admin {
+            return sqlx::query_as::<_, CallbackGroup>(
+                "SELECT * FROM callback_groups WHERE id = ?",
+            )
+            .bind(group_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal);
+        }
+        sqlx::query_as::<_, CallbackGroup>(
+            "SELECT callback_groups.* FROM callback_groups \
+             JOIN operation_members \
+               ON operation_members.operation_id = callback_groups.operation_id \
+             WHERE callback_groups.id = ? AND operation_members.user_id = ?",
+        )
+        .bind(group_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
+    /// Adds a callback to a group. The callback must belong to the same
+    /// operation as the group; the join is deliberate rather than a lookup the
+    /// caller could skip, so membership cannot cross an operation boundary.
+    pub async fn add_callback_to_group(
+        &self,
+        group_id: &str,
+        callback_id: &str,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<usize, AppError> {
+        let group =
+            sqlx::query_as::<_, CallbackGroup>("SELECT * FROM callback_groups WHERE id = ?")
+                .bind(group_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| AppError::Internal)?
+                .ok_or(AppError::NotFound)?;
+
+        let operation =
+            sqlx::query_scalar::<_, String>("SELECT operation_id FROM callbacks WHERE id = ?")
+                .bind(callback_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| AppError::Internal)?
+                .ok_or(AppError::NotFound)?;
+        if operation != group.operation_id {
+            return Err(AppError::Forbidden);
+        }
+
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO callback_group_members (group_id, callback_id) VALUES (?, ?) \
+             ON CONFLICT(group_id, callback_id) DO NOTHING",
+        )
+        .bind(group_id)
+        .bind(callback_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "callback_group.member_added",
+            "callback_group",
+            group_id,
+            "success",
+            correlation_id,
+        )
+        .for_operation(group.operation_id);
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)?;
+
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM callback_group_members WHERE group_id = ?",
+        )
+        .bind(group_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|count| count.max(0) as usize)
+        .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn remove_callback_from_group(
+        &self,
+        group_id: &str,
+        callback_id: &str,
+        actor_id: &str,
+        correlation_id: &str,
+    ) -> Result<(), AppError> {
+        let group =
+            sqlx::query_as::<_, CallbackGroup>("SELECT * FROM callback_groups WHERE id = ?")
+                .bind(group_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| AppError::Internal)?
+                .ok_or(AppError::NotFound)?;
+
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query("DELETE FROM callback_group_members WHERE group_id = ? AND callback_id = ?")
+            .bind(group_id)
+            .bind(callback_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AppError::Internal)?;
+
+        let entry = AuditEntry::new(
+            actor_id,
+            "callback_group.member_removed",
+            "callback_group",
+            group_id,
+            "success",
+            correlation_id,
+        )
+        .for_operation(group.operation_id);
+        insert_audit(&mut transaction, &entry).await?;
+        transaction.commit().await.map_err(|_| AppError::Internal)
+    }
+
+    pub async fn delete_callback_group(&self, group_id: &str) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM callback_groups WHERE id = ?")
+            .bind(group_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)?;
+        Ok(())
+    }
+
+    /// The exact callbacks a group dispatch would reach, already constrained to
+    /// the group's operation. This is the single source of truth for both the
+    /// preview and the dispatch, so the two can never disagree.
+    pub async fn resolve_group_targets(
+        &self,
+        group_id: &str,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<Callback>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, Callback>(
+                "SELECT callbacks.* FROM callbacks \
+                 JOIN callback_group_members ON callback_group_members.callback_id = callbacks.id \
+                 JOIN callback_groups ON callback_groups.id = callback_group_members.group_id \
+                 WHERE callback_group_members.group_id = ? \
+                   AND callbacks.operation_id = callback_groups.operation_id \
+                 ORDER BY callbacks.host, callbacks.id",
+            )
+            .bind(group_id)
+        } else {
+            sqlx::query_as::<_, Callback>(
+                "SELECT callbacks.* FROM callbacks \
+                 JOIN callback_group_members ON callback_group_members.callback_id = callbacks.id \
+                 JOIN callback_groups ON callback_groups.id = callback_group_members.group_id \
+                 JOIN operation_members \
+                   ON operation_members.operation_id = callback_groups.operation_id \
+                 WHERE callback_group_members.group_id = ? \
+                   AND callbacks.operation_id = callback_groups.operation_id \
+                   AND operation_members.user_id = ? \
+                 ORDER BY callbacks.host, callbacks.id",
+            )
+            .bind(group_id)
+            .bind(user_id)
+        };
+        query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    pub async fn list_group_member_callbacks(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<Callback>, AppError> {
+        sqlx::query_as::<_, Callback>(
+            "SELECT callbacks.* FROM callbacks \
+             JOIN callback_group_members ON callback_group_members.callback_id = callbacks.id \
+             WHERE callback_group_members.group_id = ? ORDER BY callbacks.host, callbacks.id",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)
+    }
+
+    /// Event rules carry a stored command, so they are scoped like every other
+    /// operation-owned record. Legacy rows have no operation and stay admin-only.
+    pub async fn list_event_rules_visible_to(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<EventRule>, AppError> {
+        let query = if is_admin {
+            sqlx::query_as::<_, EventRule>("SELECT * FROM event_rules ORDER BY created_at DESC, id")
+        } else {
+            sqlx::query_as::<_, EventRule>(
+                "SELECT event_rules.* FROM event_rules \
+                 JOIN operation_members \
+                   ON operation_members.operation_id = event_rules.operation_id \
+                 WHERE operation_members.user_id = ? \
+                 ORDER BY event_rules.created_at DESC, event_rules.id",
+            )
+            .bind(user_id)
+        };
+        query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| AppError::Internal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_event_rule(
         &self,
+        operation_id: &str,
         name: &str,
         trigger: &str,
         command: &str,
@@ -1977,8 +2403,9 @@ impl Repository {
         let id = Uuid::new_v4().to_string();
         let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
         sqlx::query(
-            "INSERT INTO event_rules (id, name, trigger, command, target, requested_by) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO event_rules \
+             (id, name, trigger, command, target, requested_by, operation_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(name)
@@ -1986,6 +2413,7 @@ impl Repository {
         .bind(command)
         .bind(target)
         .bind(actor_id)
+        .bind(operation_id)
         .execute(&mut *transaction)
         .await
         .map_err(|_| AppError::Internal)?;
@@ -1997,7 +2425,8 @@ impl Repository {
             &id,
             "success",
             correlation_id,
-        );
+        )
+        .for_operation(operation_id);
         insert_audit(&mut transaction, &entry).await?;
         transaction.commit().await.map_err(|_| AppError::Internal)?;
 

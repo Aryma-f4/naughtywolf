@@ -1,9 +1,26 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { filterGraph, visibleGraph, layoutGraph, sampleGraph, MAX_VISIBLE } = require('../static/workspace.js');
+const { filterGraph, visibleGraph, layoutGraph, MAX_VISIBLE } = require('../static/workspace.js');
+
+function fixtureGraph() {
+  const nodes = [], edges = [];
+  for (let group = 0; group < 2; group++) {
+    const op = `fixture-op-${group}`;
+    nodes.push({ id: op, kind: 'operation', label: `Operation ${group}`, detail: 'Test scope', operation: op, status: 'active', href: '', facts: [] });
+    for (let host = 0; host < 3; host++) {
+      const asset = `${op}-asset-${host}`;
+      nodes.push({ id: asset, kind: 'asset', label: `Host ${host}`, detail: `192.0.2.${group * 10 + host + 10}`, operation: op, status: 'active', href: '', facts: [] });
+      edges.push({ source: op, target: asset, label: 'contains' });
+      const id = `${asset}-callback`;
+      nodes.push({ id, kind: 'callback', label: `LAB-${group + 1}0${host + 1}`, detail: 'Test callback', operation: op, status: ['active', 'beacon', 'dormant'][host], href: '', facts: [] });
+      edges.push({ source: asset, target: id, label: 'registered callback' });
+    }
+  }
+  return { nodes, edges };
+}
 
 test('search retains the actual operation and asset context of a callback', () => {
-  const data = sampleGraph();
+  const data = fixtureGraph();
   const result = filterGraph(data, { query: 'LAB-101' });
   assert.equal(result.nodes.length, 3);
   assert.equal(result.edges.length, 2);
@@ -12,9 +29,9 @@ test('search retains the actual operation and asset context of a callback', () =
 });
 
 test('operation and status filters compose without introducing unrelated targets', () => {
-  const result = filterGraph(sampleGraph(), { operation: 'sample-op-1', status: 'beacon' });
+  const result = filterGraph(fixtureGraph(), { operation: 'fixture-op-1', status: 'beacon' });
   assert.equal(result.nodes.length, 3);
-  assert.ok(result.nodes.every(n => n.operation === 'sample-op-1'));
+  assert.ok(result.nodes.every(n => n.operation === 'fixture-op-1'));
   assert.equal(result.nodes.filter(n => !n.contextual).length, 1);
 });
 
@@ -35,7 +52,7 @@ test('large inventories stay bounded while preserving every visible parent chain
 });
 
 test('layout provides non-overlapping sibling cards and positions unlinked nodes', () => {
-  const data = sampleGraph();
+  const data = fixtureGraph();
   data.nodes.push({ id: 'unassigned', kind: 'callback', facts: [] });
   const positions = layoutGraph(data);
   assert.equal(positions.size, data.nodes.length);
@@ -53,10 +70,7 @@ test('malformed cyclic relationships do not hang filtering or layout', () => {
   assert.equal(layoutGraph(data).size, 2);
 });
 
-test('sample data is isolated and contains no operational action links', () => {
-  const data = sampleGraph();
-  assert.equal(data.nodes.length, 14);
-  assert.ok(data.nodes.every(n => n.id.startsWith('sample-') && n.href === ''));
-  assert.ok(data.nodes.filter(n => n.kind === 'asset').every(n => n.detail.startsWith('192.0.2.')));
-  assert.equal(sampleGraph().nodes.length, 14);
+test('test fixtures stay outside the production graph model', () => {
+  assert.equal('sampleGraph' in require('../static/workspace.js'), false);
+  assert.equal(fixtureGraph().nodes.length, 14);
 });

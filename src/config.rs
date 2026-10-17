@@ -7,6 +7,13 @@ pub struct Config {
     pub database_url: String,
     pub bind: SocketAddr,
     pub tcp_bind: Option<SocketAddr>,
+    /// Optional gRPC C2 listener. The payload wizard offers `grpc://`, so this
+    /// is what lets a beacon built from the portal actually check in.
+    pub grpc_bind: Option<SocketAddr>,
+    /// Optional chat-platform C2 channels, e.g. `discord://<token>@<channel>`.
+    /// These are the server half of the Discord/Telegram callback loop.
+    pub discord_channel: Option<String>,
+    pub telegram_channel: Option<String>,
     pub tcp_protocol: String,
     pub evidence_dir: PathBuf,
     pub max_transfer_bytes: u64,
@@ -35,6 +42,17 @@ impl Config {
                 .filter(|value| !value.trim().is_empty())
                 .map(|value| value.parse().map_err(ConfigError::InvalidTcpBind))
                 .transpose()?,
+            grpc_bind: env::var("NAUGHTYWOLF_GRPC_BIND")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.parse().map_err(ConfigError::InvalidGrpcBind))
+                .transpose()?,
+            discord_channel: env::var("NAUGHTYWOLF_DISCORD_CHANNEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            telegram_channel: env::var("NAUGHTYWOLF_TELEGRAM_CHANNEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             tcp_protocol: match env::var("NAUGHTYWOLF_TCP_PROTOCOL")
                 .unwrap_or_else(|_| "tcp".into())
                 .as_str()
@@ -89,6 +107,9 @@ impl Config {
             database_url: "sqlite::memory:".to_string(),
             bind: "127.0.0.1:8080".parse().expect("valid loopback address"),
             tcp_bind: None,
+            grpc_bind: None,
+            discord_channel: None,
+            telegram_channel: None,
             tcp_protocol: "tcp".into(),
             evidence_dir: PathBuf::from("evidence"),
             max_transfer_bytes: 268_435_456,
@@ -121,6 +142,8 @@ pub enum ConfigError {
     InvalidBind(#[source] std::net::AddrParseError),
     #[error("NAUGHTYWOLF_TCP_BIND must be a socket address: {0}")]
     InvalidTcpBind(#[source] std::net::AddrParseError),
+    #[error("invalid grpc bind: {0}")]
+    InvalidGrpcBind(#[source] std::net::AddrParseError),
     #[error("NAUGHTYWOLF_TCP_PROTOCOL must be tcp or gs")]
     InvalidTcpProtocol,
     #[error("NAUGHTYWOLF_MAX_TRANSFER_BYTES must be a positive integer")]

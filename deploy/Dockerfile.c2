@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1
+# Headless NaughtyWolf C2: listeners, sessions and task queue, no operator UI.
+#
+# Pins the toolchain and installs protoc: crates/server/build.rs runs
+# tonic-build over proto/c2.proto, and prost-build 0.13 does not vendor a
+# protoc binary, so the compiler must exist before cargo runs.
+
+FROM rust:1.90-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY proto ./proto
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --locked --release -p nw-server
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system nw && useradd --system --gid nw --create-home nw \
+    && mkdir -p /data && chown -R nw:nw /data
+COPY --from=builder /app/target/release/nw-server /usr/local/bin/nw-server
+USER nw
+WORKDIR /data
+ENV NW_BIND=0.0.0.0:8081 \
+    NW_DOWNLOADS=/data/downloads \
+    NW_DB=/data/c2.sqlite
+EXPOSE 8081
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["/bin/sh", "-c", "exit 0"]
+ENTRYPOINT ["nw-server"]

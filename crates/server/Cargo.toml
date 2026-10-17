@@ -23,6 +23,7 @@ futures = { workspace = true }
 chrono.workspace = true
 nw-modules = { path = "../modules" }
 tonic.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 prost.workspace = true
 
 [build-dependencies]
