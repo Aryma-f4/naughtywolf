@@ -286,6 +286,13 @@ pub struct CallbackCapabilities {
     pub file_transfer: bool,
     #[serde(default)]
     pub task_ack: bool,
+    /// The carrier holds an open duplex connection, so the server can push
+    /// work, kills and interactive shells without waiting for a beacon.
+    #[serde(default)]
+    pub live_channel: bool,
+    /// An interactive shell can be attached over that live channel.
+    #[serde(default)]
+    pub interactive_shell: bool,
 }
 
 #[cfg(test)]
@@ -300,6 +307,8 @@ mod tests {
         assert!(!capabilities.file_browser);
         assert!(!capabilities.file_transfer);
         assert!(!capabilities.task_ack);
+        assert!(!capabilities.live_channel);
+        assert!(!capabilities.interactive_shell);
     }
 
     #[test]

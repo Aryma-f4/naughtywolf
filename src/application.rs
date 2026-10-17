@@ -3,8 +3,8 @@ use std::sync::Arc;
 use axum::{Extension, Router};
 
 use crate::{
-    c2, callback_workspace::transfers::TransferStore, db::repositories::Repository,
-    evidence::EvidenceStore, portal,
+    c2, c2_live::LiveRegistry, callback_workspace::transfers::TransferStore,
+    db::repositories::Repository, evidence::EvidenceStore, portal, shell_hub::ShellHub,
 };
 
 /// The production router composition shared by the binary and the restart
@@ -28,4 +28,8 @@ pub fn router(
         .layer(Extension(c2_psk))
         .layer(axum::Extension(evidence_store))
         .layer(axum::Extension(transfer_store))
+        // One registry and one hub per process: a callback's live socket is
+        // process-wide state, exactly like the transfer store beside it.
+        .layer(axum::Extension(LiveRegistry::new()))
+        .layer(axum::Extension(ShellHub::new()))
 }

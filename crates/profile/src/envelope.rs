@@ -25,6 +25,10 @@ pub enum Kind {
     TaskResult,
     Heartbeat,
     Kill,
+    /// Server -> implant on the live channel, outside the beacon/queue cycle.
+    Push,
+    /// Implant -> server on the live channel, outside the beacon/queue cycle.
+    Event,
 }
 
 /// Inner fields sealed under AEAD; `session_id` is carried in the clear as a

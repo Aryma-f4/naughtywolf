@@ -5,6 +5,7 @@ pub mod auth;
 pub mod c2;
 pub mod c2_chat;
 pub mod c2_grpc;
+pub mod c2_live;
 pub mod c2_tcp;
 pub mod callback_workspace;
 pub mod checks;
@@ -16,5 +17,6 @@ pub mod evidence;
 pub mod payload;
 pub mod policy;
 pub mod portal;
+pub mod shell_hub;
 
 pub use error::AppError;

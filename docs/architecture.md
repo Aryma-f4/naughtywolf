@@ -51,6 +51,38 @@ flowchart LR
     native --> db[("Optional NW_DB\nindependent SQLite")]
 ```
 
+## The live channel
+
+Every transport in the protocol is request/response: the callback sends a sealed frame, the server answers in the same call, and anything the server wants to say is queued in `c2_tasks` until the callback's next beacon. That is deliberate — it keeps a beacon that sleeps for a minute cheap — but it makes "stop this now" wait for a timer.
+
+The WebSocket carrier is the exception, and the exception is now load-bearing. `GET /c2/ws` speaks the same sealed-envelope protocol as `/c2/checkin`, on a socket the implant opens once and keeps:
+
+```mermaid
+sequenceDiagram
+    participant I as implant (ws carrier)
+    participant S as portal /c2/ws
+    participant O as operator
+    O->>S: cancel task
+    S->>I: Live::Kill (sealed, written to the open socket)
+    I->>I: kill the running child now
+    I->>S: LiveEvent::Killed
+    S-->>O: delivery = "live", audit: task_kill_confirmed
+```
+
+Three pieces make that work, and each has one job:
+
+| Piece | File | Job |
+| --- | --- | --- |
+| `LiveSink` / `LiveRegistry` | [`src/c2_live.rs`](../src/c2_live.rs) | One writer per connected session. Pushes are sealed under that session's key and handed to the socket; a push to a session with no socket is an error, never a silent queue. |
+| `checkin_ws` | [`src/c2.rs`](../src/c2.rs) | Registers the socket as the session's live channel (on the first frame that names one, including the registration acknowledgement), writes pushes to it, and routes frames the implant sends unprompted. |
+| `WsLink` | [`crates/implant/src/transport.rs`](../crates/implant/src/transport.rs) | Owns the implant's socket in one task so beacons and live writes share it. A frame arriving while a beacon is outstanding is that beacon's reply; anything else is a push. |
+
+On the implant, the beacon loop waits on the interval *and* the live channel at once (`wait_for_tick`). A kill does not sit out a sleep, and every push is handled before the interval ends, so a burst of keystrokes is not dropped between beacons. Shells live in [`crates/implant/src/shell.rs`](../crates/implant/src/shell.rs): a real PTY where the platform has one, pipes otherwise, with output pumped to the server as it happens.
+
+The browser side is deliberately boring: [`static/shell-terminal.js`](../static/shell-terminal.js) renders the terminal (including ANSI colour) and turns key presses into terminal bytes; [`src/shell_hub.rs`](../src/shell_hub.rs) holds the per-session shell state and scrollback so a page reload reattaches to a shell that is still running; [`src/callback_workspace/shell.rs`](../src/callback_workspace/shell.rs) is the HTTP surface.
+
+Without a live socket every one of these actions still works, with its original semantics — the kill queues and is delivered first ahead of unrelated pending work, and the UI says "queued" rather than "live".
+
 ## Integration boundary
 
 The portal and native runtime share workspace libraries and project goals, but they are not one distributed runtime today. In particular:
@@ -58,7 +90,7 @@ The portal and native runtime share workspace libraries and project goals, but t
 | Boundary | Portal | Native runtime |
 | --- | --- | --- |
 | Main entry point | `naughtywolf serve` | `nw-server` or `nw-console` |
-| HTTP callback routes | `/c2/register`, `/c2/poll` | `/c2/checkin` |
+| HTTP callback routes | `/c2/register`, `/c2/poll`, `/c2/checkin`, `/c2/ws` | `/c2/checkin`, `/c2/ws` |
 | Configuration prefix | `NAUGHTYWOLF_*` | `NW_*` |
 | Persistence | Portal SQLite and `/data` artifacts | Optional, independent `NW_DB` SQLite |
 | Accounts and sessions | Portal users and signed browser sessions | Native operator store and native sessions |
@@ -72,6 +104,9 @@ Building an `nw-implant` artifact in the portal does not create a live bridge be
 | --- | --- |
 | Portal composition and startup | [`src/main.rs`](../src/main.rs) |
 | Portal callback routes | [`src/c2.rs`](../src/c2.rs) |
+| Live channel (server side) | [`src/c2_live.rs`](../src/c2_live.rs) |
+| Attached shell state | [`src/shell_hub.rs`](../src/shell_hub.rs) |
+| Shell HTTP endpoints | [`src/callback_workspace/shell.rs`](../src/callback_workspace/shell.rs) |
 | Recon execution | [`src/checks/recon.rs`](../src/checks/recon.rs) |
 | Payload builds | [`src/payload.rs`](../src/payload.rs) |
 | Native server entry point | [`crates/server/src/main.rs`](../crates/server/src/main.rs) |
@@ -79,4 +114,5 @@ Building an `nw-implant` artifact in the portal does not create a live bridge be
 | Native HTTP channel | [`crates/server/src/channels.rs`](../crates/server/src/channels.rs) |
 | Native console entry point | [`crates/console/src/main.rs`](../crates/console/src/main.rs) |
 | Implant transport | [`crates/implant/src/transport.rs`](../crates/implant/src/transport.rs) |
+| Implant shells | [`crates/implant/src/shell.rs`](../crates/implant/src/shell.rs) |
 | Coolify deployment | [`docker-compose.yml`](../docker-compose.yml) |

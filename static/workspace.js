@@ -1,11 +1,25 @@
 /* Shared pure graph model; also exercised by the dependency-free Node tests. */
 ((root) => {
   const MAX_VISIBLE = 240;
+  // "instant" and "busy" are derived, not stored: they answer the two questions
+  // an operator actually filters the graph by — can I reach this now, and is it
+  // already working on something.
+  const statusMatches = (node, status) => {
+    if (!status) return true;
+    if (status === 'instant') return node.instant === true;
+    if (status === 'busy') {
+      const tasks = Number((node.facts.find(([name]) => name === 'Tasks in flight') || [])[1] || 0);
+      const shells = Number((node.facts.find(([name]) => name === 'Shells attached') || [])[1] || 0);
+      return tasks > 0 || shells > 0;
+    }
+    return node.status === status;
+  };
+
   function filterGraph(data, { query = '', operation = '', status = '' } = {}) {
     const needle = query.trim().toLowerCase();
     const lookup = new Map(data.nodes.map(n => [n.id, n]));
     const parents = new Map(data.edges.map(e => [e.target, e.source]));
-    const matches = data.nodes.filter(n => (!operation || n.operation === operation) && (!status || n.status === status)
+    const matches = data.nodes.filter(n => (!operation || n.operation === operation) && statusMatches(n, status)
       && (!needle || [n.label, n.detail, n.kind, ...n.facts.flat()].join(' ').toLowerCase().includes(needle)));
     const included = new Set();
     // Keep the context chain for each match, even when the parent doesn't match a status filter.
@@ -52,7 +66,7 @@
     for (const n of data.nodes) if (!positions.has(n.id)) visit(n.id, 0);
     return positions;
   }
-  const model = { filterGraph, visibleGraph, layoutGraph, MAX_VISIBLE };
+  const model = { filterGraph, visibleGraph, layoutGraph, statusMatches, MAX_VISIBLE };
   if (typeof module !== 'undefined' && module.exports) { module.exports = model; return; }
   root.NWGraph = model;
   const svgNS = 'http://www.w3.org/2000/svg';
@@ -140,7 +154,8 @@
       detail.replaceChildren();
       detail.append(el('span', `inspector-kind kind-${node.kind}`, node.kind), el('h2', '', node.label), el('p', 'inspector-address', node.detail));
       const facts = el('dl', 'node-facts');
-      for (const [name, value] of [['Status', node.status], ...node.facts]) { const row = el('div'); row.append(el('dt', '', name), el('dd', '', value || '—')); facts.append(row); }
+      const statusName = node.instant ? 'active · instant' : node.status;
+      for (const [name, value] of [['Status', statusName], ...node.facts]) { const row = el('div'); row.append(el('dt', '', name), el('dd', '', value || '—')); facts.append(row); }
       detail.append(facts);
       if (node.href) { const link = el('a', 'button', node.kind === 'callback' ? 'Open callback ↗' : node.kind === 'operation' ? 'Review operation ↗' : 'Open recon history ↗'); link.href = node.href; detail.append(link); }
       if (node.operation) { const focus = el('button', 'btn btn-ghost', 'Focus this operation'); focus.addEventListener('click', () => { operation.value = node.operation; render(true); }); detail.append(focus); }
@@ -165,6 +180,11 @@
       for (const p of positions.values()) { bounds.width = Math.max(bounds.width, p.x + 225); bounds.height = Math.max(bounds.height, p.y + 80); }
       $('[data-graph-empty]').hidden = data.nodes.length > 0;
       for (const kind of ['operation', 'asset', 'callback', 'address']) $(`[data-count="${kind}"]`).textContent = data.nodes.filter(n => n.kind === kind).length;
+      // The three numbers that turn inventory into an operational picture.
+      const counts = data.counts || {};
+      if ($('[data-live-summary]')) $('[data-live-summary]').textContent = `${counts.instant || 0} reachable instantly`;
+      if ($('[data-busy-summary]')) $('[data-busy-summary]').textContent = `${counts.tasks_in_flight || 0} tasks in flight`;
+      if ($('[data-shell-summary]')) $('[data-shell-summary]').textContent = `${counts.shells || 0} shells attached`;
       const note = $('[data-graph-visible]');
       note.textContent = filtered.nodes.length > MAX_VISIBLE ? `${graph.nodes.length} of ${filtered.nodes.length} nodes · refine search or operation` : `${graph.nodes.length} nodes · ${graph.edges.length} relationships`;
       if (!filtered.nodes.length && data.nodes.length) note.textContent = 'No matches. Clear the search or filters.';
@@ -176,16 +196,16 @@
       }
       for (const node of graph.nodes) {
         const p = positions.get(node.id);
-        const g = svgEl('g', { transform: `translate(${p.x} ${p.y})`, class: `graph-node kind-${node.kind}${node.contextual ? ' contextual' : ''}`, 'data-node-id': node.id, tabindex: '0', role: 'button', 'aria-label': `${node.kind}: ${node.label}, ${node.status}` });
+        const g = svgEl('g', { transform: `translate(${p.x} ${p.y})`, class: `graph-node kind-${node.kind}${node.contextual ? ' contextual' : ''}${node.instant ? ' instant' : ''}`, 'data-node-id': node.id, tabindex: '0', role: 'button', 'aria-label': `${node.kind}: ${node.label}, ${node.status}` });
         g.append(svgEl('title', {}, `${node.label}\n${node.detail}`), svgEl('rect', { width: 210, height: 63, rx: 9, class: 'node-card' }), svgEl('rect', { x: 12, y: 14, width: 33, height: 33, rx: 7, class: 'node-icon-box' }));
         const symbols = { operation: '◇', asset: '▣', callback: 'ϟ', address: '◎' };
-        g.append(svgEl('text', { x: 28, y: 37, class: 'node-symbol', 'text-anchor': 'middle' }, symbols[node.kind]), svgEl('text', { x: 55, y: 27, class: 'node-title' }, trim(node.label, 20)), svgEl('text', { x: 55, y: 45, class: 'node-subtitle' }, trim(node.detail || node.kind, 24)), svgEl('circle', { cx: 198, cy: 13, r: 3, class: `node-status status-${node.status}` }));
+        g.append(svgEl('text', { x: 28, y: 37, class: 'node-symbol', 'text-anchor': 'middle' }, symbols[node.kind]), svgEl('text', { x: 55, y: 27, class: 'node-title' }, trim(node.label, 20)), svgEl('text', { x: 55, y: 45, class: 'node-subtitle' }, trim(node.instant ? `instant · ${node.detail || node.kind}` : node.detail || node.kind, 24)), svgEl('circle', { cx: 198, cy: 13, r: 3, class: `node-status status-${node.status}` }));
         g.addEventListener('click', () => select(node.id));
         g.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(node.id); } });
         layer.append(g);
         const row = el('button', `graph-list-row kind-${node.kind}`); row.type = 'button';
         row.setAttribute('data-node-id', node.id);
-        row.append(el('span', 'list-kind', node.kind), el('strong', '', node.label), el('span', 'list-detail', node.detail), el('span', 'list-status', node.status));
+        row.append(el('span', 'list-kind', node.kind), el('strong', '', node.label), el('span', 'list-detail', node.detail), el('span', 'list-status', node.instant ? 'instant' : node.status));
         row.addEventListener('click', () => select(node.id)); list.append(row);
       }
       if (selected && graph.nodes.some(n => n.id === selected)) select(selected); else if (selected) resetInspector();

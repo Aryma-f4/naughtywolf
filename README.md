@@ -33,7 +33,10 @@ The portal callback routes (`/c2/register` and `/c2/poll`) and the native endpoi
 
 - **Operation records:** define a purpose, track assets, and keep related lab records together.
 - **Scoped overview:** dashboard counts come from persisted records visible to the signed-in user.
-- **Interactive topology:** map operations, assets, registered callbacks, and saved DNS observations. Search, filter, pan, zoom, inspect nodes, or switch to a list.
+- **Live channel:** callbacks on the WebSocket carrier hold an open socket, so a kill, a command or a keystroke reaches the callback in one round trip instead of waiting for the next beacon. Without one, the same actions queue as before and the UI says which happened.
+- **Interactive shell:** attach a real terminal (`forkpty`/ConPTY, pipes as a fallback) to a callback and stream it live, with ANSI colour, control keys and scrollback that survives a page reload.
+- **Interactive topology:** map operations, assets, registered callbacks, addresses they report, and saved DNS observations, annotated with which hosts answer instantly, how many tasks are in flight, and which have shells attached. Search, filter, pan, zoom, inspect nodes, or switch to a list.
+- **Session board:** the callback list opens on active sessions, with active/offline/all filters and a count per view, because "what is live right now" is the question an operator actually asks.
 - **Integrated reconnaissance:** run DNS or DNS + HTTP/TLS observations against a selected active asset. Results persist in check history, enrich the topology, and leave an audit trail.
 - **Payload creation studio:** configure target, callback, and beacon timing in a four-step wizard, review the non-secret profile, then build or edit native artifacts.
 - **Active callback workspace:** scan session health from a compact status board, open a callback, and keep task history, live output, session context, and the command dock in one view. Tabbed Tasking / Processes / Files / Metadata sections keep their place through back/forward navigation, and offline callbacks queue new tasks until their next check-in.
@@ -121,15 +124,30 @@ For hosted deployment, follow the **[Coolify guide](docs/coolify.md)**: select t
 
 1. **Define an operation.** As an Admin, open **Operations → Create operation** and enter its name and purpose.
 2. **Record the assets.** Use **Add asset** on an operation to register its scoped targets.
-3. **Explore the relationships.** Open **Topology** to see recorded operation → asset → callback associations. Select a node to inspect its details.
+3. **Explore the relationships.** Open **Topology** to see recorded operation → asset → callback → reported-address associations, annotated with which hosts answer instantly and what they are running. Select a node to inspect its details.
 4. **Collect observations.** Review and activate the operation, then open **Recon**, choose an active asset and an observation profile, and run the check. DNS addresses from the latest recon run appear in the topology.
-5. **Read the summary.** Open **Checks** for recorded runs, **Reports** for operation summaries, and **Audit** to trace recorded changes.
+5. **Interact.** Open **Active Callbacks** (which opens on live sessions), pick one, and use the **Shell** tab for a live terminal or the command dock for queued tasking. See **[Live channel](#live-channel-and-interactive-shells)** for what changes when a callback holds an open socket.
+6. **Read the summary.** Open **Checks** for recorded runs, **Reports** for operation summaries, and **Audit** to trace recorded changes.
 
 A fresh workspace starts with zero operations, assets, checks, and evidence. Creating an account can already produce an audit record. Dashboard figures are stored counts, not sample analytics.
+
+### Live channel and interactive shells
+
+Every carrier in this project is request/response: the callback asks, the server answers, and the answer waits inside a task queue until the callback's next beacon. That is the right default for a beacon that sleeps for a minute, and the wrong one for "stop this now" or for typing at a prompt.
+
+Callbacks built on the **WebSocket** carrier (`ws://` or `wss://`) hold a duplex connection open between beacons. The portal registers that socket as the session's live channel, and from then on:
+
+- **Stop a task instantly.** Cancelling a running task writes the kill straight to the socket. The queued control task is marked delivered so the next beacon cannot send it twice, and the UI reports the channel it used. A callback with no live socket keeps the old behaviour: the kill is queued, and is delivered *first*, ahead of unrelated pending work.
+- **Attach a shell.** The Shell tab starts a real terminal on the callback (`forkpty` on Unix, ConPTY on Windows; pipes where no PTY can be created) and streams it over the same socket. Keystrokes are sent as the bytes a terminal sends — CR for Enter, DEL for Backspace, escape sequences for arrows, Ctrl-C for interrupt — and output is rendered as it arrives, including ANSI colour. Reopening the page replays what the shell already printed; the shell itself keeps running.
+- **Task instantly.** A task submitted from the command dock while a live channel is open is delivered immediately, and the callback acknowledges it on the next beacon like any other result.
+
+The callback advertises `live_channel` and `interactive_shell` at registration, so the UI only offers what the running implant can actually do. Anything pushed to a callback that is not connected is reported as an error rather than quietly queued.
 
 ### Topology and recon
 
 The topology uses persisted associations, including an asset link only when the callback belongs to the same operation. Unassigned callbacks remain unlinked. Lines describe recorded relationships, not discovered network routes. Viewer accounts can inspect scoped assets and recon results; callback nodes require Operator or Admin access.
+
+Callback nodes also carry what is true *now*: whether the session holds an open socket, how many tasks are queued or running on it, how many shells are attached, and how long ago it last checked in. The address a callback reports is a node in its own right, so two sessions behind one address read as one host. The summary bar counts the instant-reachable sessions, the tasks in flight, and the attached shells, and the status filter can select **Instant channel** or **Working** to answer "what can I reach right now, and what is already busy".
 
 Use search and the operation/status filters to focus a large inventory. Parent nodes remain visible for context. At most **240 nodes** are drawn at once; the counter discloses omitted nodes. Drag the canvas to pan, use **+ / −** to zoom, and **Fit** to center the graph. Keyboard users can select nodes with Enter or Space and use arrow keys, + / −, and 0 while the canvas is focused. **Refresh** loads a new snapshot; the graph does not auto-poll. An empty workspace offers a clearly labelled sample graph that creates no records.
 

@@ -95,6 +95,8 @@ async fn extended_callback_registration_persists_typed_metadata() {
             file_browser: false,
             file_transfer: true,
             task_ack: true,
+            live_channel: false,
+            interactive_shell: false,
         }),
         session_key: "implant-public-key".into(),
     };

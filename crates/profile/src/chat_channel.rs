@@ -536,7 +536,7 @@ mod discord_tests {
     /// the same batch, losing the task entirely.
     #[test]
     fn discord_poll_order_is_oldest_first_for_the_high_water_cursor() {
-        let mut messages = vec![msg("100", "b"), msg("99", "a"), msg("98", "c")];
+        let mut messages = [msg("100", "b"), msg("99", "a"), msg("98", "c")];
         messages.sort_by_key(|m| m.id.parse::<u128>().unwrap_or(u128::MAX));
         assert_eq!(
             messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),

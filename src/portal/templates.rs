@@ -1159,6 +1159,12 @@ pub fn callback_detail_page(
         .as_ref()
         .map(|capabilities| capabilities.file_transfer)
         .unwrap_or(false);
+    // An interactive shell needs both halves: a carrier that can hold an open
+    // socket, and an implant that knows how to serve one.
+    let shell_capable = callback
+        .capabilities_json
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.live_channel && capabilities.interactive_shell);
     let metadata_capabilities = {
         let flags = [
             (
@@ -1193,6 +1199,7 @@ pub fn callback_detail_page(
                     .map(|c| c.task_ack)
                     .unwrap_or(false),
             ),
+            ("Live channel", shell_capable),
         ];
         let names: Vec<&str> = flags
             .iter()
@@ -1229,7 +1236,7 @@ pub fn callback_detail_page(
           data-events-endpoint="/api/callbacks/{callback_id}/events"
           data-csrf-token="{csrf}" data-online="{online}">
           <header class="callback-tasking-title"><div><p class="eyebrow">TASKING / PERSISTENT LEDGER</p><h3>Tasking</h3><p>Authoritative callback history, reconciled after every connection.</p></div><div><span class="connection-label">Connection</span><span class="stream-state" data-connection-state role="status">Connecting</span></div></header>
-          <nav class="callback-tabs" aria-label="Callback workspace tabs"><a data-callback-tab="tasking" aria-current="page" href="?tab=tasking#tasking">Tasking</a><a data-callback-tab="processes" href="?tab=processes#processes">Processes</a><a data-callback-tab="files" href="?tab=files&amp;path={file_default_path_url}#files">Files</a><a data-callback-tab="metadata" href="?tab=metadata#metadata">Metadata</a></nav>
+          <nav class="callback-tabs" aria-label="Callback workspace tabs"><a data-callback-tab="tasking" aria-current="page" href="?tab=tasking#tasking">Tasking</a><a data-callback-tab="shell" href="?tab=shell#shell">Shell</a><a data-callback-tab="processes" href="?tab=processes#processes">Processes</a><a data-callback-tab="files" href="?tab=files&amp;path={file_default_path_url}#files">Files</a><a data-callback-tab="metadata" href="?tab=metadata#metadata">Metadata</a></nav>
           <p class="offline-queue" data-offline-queue hidden></p>
           <div class="task-filters" data-tab-panel="tasking">
             <label>Search task history<input type="search" data-task-search placeholder="Command, operator, or output"></label>
@@ -1237,6 +1244,13 @@ pub fn callback_detail_page(
             <label>Errors<span class="select-icon-field"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg><select data-task-error-filter><option value="">All output</option><option value="errors">Errors only</option></select></span></label>
           </div>
           <div class="callback-console-grid" data-tab-panel="tasking"><aside class="session-context-wrap">{session_context}</aside><div class="task-timeline"><div class="task-empty" data-task-empty><strong>No task history yet</strong><p>Submit a command from the dock below.</p></div><div class="task-card-list" data-task-list></div><button class="btn btn-ghost load-older" type="button" data-load-older hidden>Load older</button></div></div>
+          <section id="shell" class="shell-panel panel" data-shell-panel data-tab-panel="shell" data-shells-endpoint="/api/callbacks/{callback_id}/shell" data-shell-stream-endpoint="/api/callbacks/{callback_id}/shell/stream" data-shell-capable="{shell_capable}" data-csrf-token="{csrf}">
+            <header class="shell-panel-head"><div><p class="eyebrow">LIVE CHANNEL / INTERACTIVE</p><h3>Shell</h3><p>An attached shell streams straight over the callback's open socket. Keystrokes arrive the moment you send them.</p></div><div class="shell-controls"><span class="shell-state" data-shell-state role="status" aria-live="polite">Detached</span><select data-shell-program aria-label="Shell program"><option value="">Platform shell</option><option value="/bin/bash">/bin/bash</option><option value="/bin/sh">/bin/sh</option><option value="/bin/zsh">/bin/zsh</option><option value="python3">python3</option><option value="cmd.exe">cmd.exe</option><option value="powershell.exe">powershell.exe</option></select><button type="button" class="btn btn-ghost" data-shell-attach>{attach_label}</button></div></header>
+            <p class="shell-message" data-shell-message role="status" aria-live="polite"></p>
+            <div class="shell-session-bar" data-shell-session-bar hidden><span class="shell-badge" data-shell-badge>no shell</span><span class="shell-session-detail" data-shell-session-detail></span><button type="button" class="btn btn-danger btn-sm" data-shell-close>Close shell</button></div>
+            <div class="shell-screen" data-shell-screen tabindex="0" role="log" aria-label="Shell output" aria-live="polite"><p class="shell-placeholder" data-shell-placeholder>No shell attached. Choose a program and attach — output appears here as the callback writes it.</p></div>
+            <form class="shell-dock" data-shell-form><label class="sr-only" for="shell-input">Shell input</label><span aria-hidden="true">&gt;</span><input id="shell-input" type="text" data-shell-input autocomplete="off" spellcheck="false" placeholder="Attach a shell to type here" disabled><button type="submit" class="btn btn-primary" data-shell-send disabled>Send</button></form>
+          </section>
           <section id="processes" class="process-panel panel" data-process-panel data-tab-panel="processes" data-processes-endpoint="/api/callbacks/{callback_id}/processes" data-process-capable="{process_capable}" data-process-online="{online}">
             <header class="process-panel-head"><div><p class="eyebrow">PROCESS CONTROL / AUDITED</p><h3>Processes</h3><p>Latest structured snapshot from this callback.</p></div><div class="process-controls"><span data-process-snapshot-age>Loading snapshot…</span><button type="button" class="btn btn-ghost" data-process-refresh>Refresh</button></div></header>
             <p class="process-message" data-process-message role="status" aria-live="polite"></p>
@@ -1291,6 +1305,12 @@ pub fn callback_detail_page(
         process_capable = process_capable,
         file_capable = file_capable,
         transfer_capable = transfer_capable,
+        shell_capable = shell_capable,
+        attach_label = if shell_capable {
+            "Attach shell"
+        } else {
+            "Shell unsupported"
+        },
         transfer_disabled = if transfer_capable { "" } else { "disabled" },
         transfer_upload_label = if transfer_capable {
             "Upload file"
@@ -1982,7 +2002,7 @@ fn status_pill(label: &str, class_name: &'static str) -> String {
 }
 
 const MOTION_ASSETS: &str = r#"<script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script>"#;
-const APP_ASSETS: &str = r#"<link rel="stylesheet" href="/static/workspace.css"><link rel="stylesheet" href="/static/callback-workspace.css"><script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script><script defer src="/static/workspace.js"></script><script defer src="/static/payload-wizard.js"></script><script defer src="/static/module_studio.js"></script><script defer src="/static/callback-workspace.js"></script><script defer src="/static/admin.js"></script>"#;
+const APP_ASSETS: &str = r#"<link rel="stylesheet" href="/static/workspace.css"><link rel="stylesheet" href="/static/callback-workspace.css"><script defer src="/static/anime.min.js"></script><script defer src="/static/motion.js"></script><script defer src="/static/workspace.js"></script><script defer src="/static/payload-wizard.js"></script><script defer src="/static/module_studio.js"></script><script defer src="/static/callback-workspace.js"></script><script defer src="/static/shell-terminal.js"></script><script defer src="/static/admin.js"></script>"#;
 
 fn page_shell(title: &str, head_extra: &str, content: &str) -> String {
     format!(

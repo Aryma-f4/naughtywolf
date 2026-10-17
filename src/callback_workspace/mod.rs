@@ -8,6 +8,7 @@ use crate::db::repositories::Repository;
 
 pub mod files;
 pub mod processes;
+pub mod shell;
 pub mod tasks;
 pub mod transfers;
 
@@ -78,5 +79,21 @@ pub fn router_with_transfer_limit(max_transfer_bytes: u64) -> Router<Repository>
         .route(
             "/api/callbacks/{session_id}/transfers/{transfer_id}/download",
             get(files::download_completed),
+        )
+        .route(
+            "/api/callbacks/{session_id}/shell",
+            get(shell::list_shells).post(shell::open_shell),
+        )
+        .route(
+            "/api/callbacks/{session_id}/shell/input",
+            post(shell::shell_input),
+        )
+        .route(
+            "/api/callbacks/{session_id}/shell/close",
+            post(shell::close_shell),
+        )
+        .route(
+            "/api/callbacks/{session_id}/shell/stream",
+            get(shell::shell_stream),
         )
 }

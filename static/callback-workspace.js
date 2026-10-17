@@ -90,12 +90,13 @@
     let pendingFileAction = null;
     let tableSnapshot = null;
     const transfers = new Map();
+    let terminalHandle = null;
 
     const selectedTab = (() => {
       if (!browserLocation?.href) return "tasking";
       try {
         const value = new URL(browserLocation.href).searchParams.get("tab");
-        return ["tasking", "processes", "files", "metadata"].includes(value) ? value : "tasking";
+        return ["tasking", "shell", "processes", "files", "metadata"].includes(value) ? value : "tasking";
       } catch (_) {
         return "tasking";
       }
@@ -107,7 +108,7 @@
     let dialogTrigger = null;
 
     const switchTab = (tab, { push = true, fromHref = null } = {}) => {
-      if (!["tasking", "processes", "files", "metadata"].includes(tab)) return;
+      if (!["tasking", "shell", "processes", "files", "metadata"].includes(tab)) return;
       tabPanels.forEach(panel => { panel.hidden = panel.dataset.tabPanel !== tab; });
       tabLinks.forEach(link => {
         const active = link.dataset.callbackTab === tab;
@@ -116,6 +117,11 @@
       });
       if (push && browserHistory?.pushState) {
         browserHistory.pushState({}, "", fromHref || `?tab=${tab}`);
+      }
+      // The terminal only needs its output stream while it is on screen.
+      if (tab === "shell") {
+        const terminal = window.NWShell?.init?.(root) || terminalHandle;
+        if (terminal?.connect) terminal.connect();
       }
     };
 
@@ -755,7 +761,19 @@
           headers: { "x-csrf-token": root.dataset.csrfToken },
         });
         if (!response.ok) throw new Error(`Task action failed (${response.status})`);
-        upsert(await response.json());
+        const result = await response.json();
+        upsert(result);
+        if (action === "cancel") {
+          // Whether the kill was instant decides what the operator does next, so
+          // say which happened instead of leaving the state pill to imply it.
+          if (result.delivery === "live") {
+            setConnection("Stop sent over the live channel");
+          } else if (result.delivery === "queued") {
+            setConnection("Stop queued — the callback will read it at its next check-in");
+          } else {
+            setConnection("Stopped before delivery");
+          }
+        }
       } catch (_) {
         setConnection(`Unable to ${action} task — check connection and retry.`);
       }
@@ -1044,6 +1062,11 @@
       }
     }
     switchTab(selectedTab, { push: false });
+    if (root.querySelector?.("[data-shell-panel]")) {
+      // The terminal is a separate module so the tasking view stays readable;
+      // it is only started when the callback actually advertises one.
+      terminalHandle = window.NWShell?.init?.(root) || null;
+    }
     setConnection("Connecting");
     const ready = loadPage()
       .then(() => {
@@ -1069,6 +1092,7 @@
         closed = true;
         browserEvents?.removeEventListener?.("popstate", restoreFileLocation);
         eventSource?.close();
+        terminalHandle?.close?.();
       },
     };
   }

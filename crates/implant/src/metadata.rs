@@ -19,7 +19,7 @@ pub struct HostMetadata {
     pub capabilities: CallbackCapabilities,
 }
 
-pub fn discover(_endpoint: &str, interval: Duration, jitter: Duration) -> HostMetadata {
+pub fn discover(endpoint: &str, interval: Duration, jitter: Duration) -> HostMetadata {
     let hostname = hostname::get()
         .ok()
         .and_then(|value| nonempty(value.to_string_lossy().into_owned()))
@@ -58,6 +58,10 @@ pub fn discover(_endpoint: &str, interval: Duration, jitter: Duration) -> HostMe
             file_browser: true,
             file_transfer: true,
             task_ack: true,
+            // Only the WebSocket carrier holds an open duplex connection, so
+            // only that transport can be pushed work or an attached shell.
+            live_channel: endpoint.starts_with("ws://") || endpoint.starts_with("wss://"),
+            interactive_shell: true,
         },
     }
 }

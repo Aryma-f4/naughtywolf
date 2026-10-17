@@ -68,6 +68,7 @@ impl nw_profile::chat_channel::ChatChannel for MockChannel {
     }
 }
 
+#[allow(dead_code)]
 async fn repository() -> naughtywolf::db::repositories::Repository {
     let pool = naughtywolf::db::create_pool("sqlite::memory:")
         .await

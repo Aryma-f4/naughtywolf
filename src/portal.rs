@@ -105,6 +105,7 @@ pub fn public_router() -> Router {
             "/static/callback-workspace.css",
             get(callback_workspace_style),
         )
+        .route("/static/shell-terminal.js", get(shell_terminal_script))
         .route("/static/anime.min.js", get(anime_script))
         .route("/payloads/download/{token}", get(public_download_payload))
 }
@@ -459,7 +460,10 @@ fn valid_form_values(values: &[&str]) -> bool {
     })
 }
 
-async fn issue_csrf_token(session: &Session) -> Result<String, AppError> {
+/// Mint the CSRF token a session's forms will submit.
+///
+/// Public so a test can put a token in its session the way a page render does.
+pub async fn issue_csrf_token(session: &Session) -> Result<String, AppError> {
     let csrf_token = Uuid::new_v4().to_string();
     session
         .insert(CSRF_TOKEN_KEY, &csrf_token)
@@ -2170,6 +2174,17 @@ async fn callback_workspace_style() -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../static/callback-workspace.css"),
+    )
+        .into_response()
+}
+
+async fn shell_terminal_script() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/shell-terminal.js"),
     )
         .into_response()
 }

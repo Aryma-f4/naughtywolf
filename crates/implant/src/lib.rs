@@ -13,6 +13,7 @@ pub mod processes;
 pub mod registry;
 pub mod runner;
 pub mod runtime;
+pub mod shell;
 pub mod socks5;
 pub mod tokens;
 pub mod transport;

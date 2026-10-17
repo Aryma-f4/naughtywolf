@@ -106,3 +106,52 @@
   .file-panel-head, .file-path-form, .file-toolbar { align-items: stretch; flex-direction: column; }
   .file-controls, .file-toolbar form { align-items: stretch; flex-direction: column; }
 }
+
+/* ── Interactive shell ─────────────────────────────────────────────────── */
+.shell-panel { display: grid; gap: .75rem; padding: 1.25rem; }
+.shell-panel-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.shell-panel-head h3 { margin: .15rem 0; }
+.shell-panel-head p { margin: 0; max-width: 52ch; color: var(--muted); font-size: .82rem; }
+.shell-controls { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.shell-controls select { min-height: 2.4rem; min-width: 11rem; }
+.shell-state { display: inline-flex; align-items: center; gap: .4rem; padding: .25rem .6rem; border: 1px solid var(--border); border-radius: 999px; font: 600 .68rem var(--font-mono, monospace); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.shell-state::before { content: ""; width: .45rem; height: .45rem; border-radius: 50%; background: currentColor; }
+.shell-state[data-state="attached"] { color: var(--success); border-color: color-mix(in srgb, var(--success) 40%, transparent); }
+.shell-message { margin: 0; min-height: 1.2rem; color: var(--muted); font-size: .8rem; }
+.shell-session-bar { display: flex; align-items: center; gap: .6rem; padding: .5rem .7rem; border: 1px solid var(--border); background: var(--surface-soft, var(--surface)); }
+.shell-session-bar[hidden] { display: none; }
+.shell-badge { padding: .15rem .45rem; border-radius: .3rem; background: var(--accent); color: var(--accent-ink); font: 700 .62rem var(--font-mono, monospace); letter-spacing: .08em; }
+.shell-session-detail { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: .75rem var(--font-mono, monospace); color: var(--muted); }
+.shell-screen { min-height: 22rem; max-height: min(60vh, 40rem); overflow: auto; padding: .8rem .9rem; border: 1px solid var(--border); background: #05070a; color: #d6dde8; font: .8rem/1.5 var(--font-mono, monospace); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 8; }
+.shell-screen:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.shell-placeholder { margin: 0; color: var(--dim); white-space: pre-wrap; }
+.shell-placeholder[hidden] { display: none; }
+.shell-screen span[data-carriage-return] { display: block; height: 0; }
+.shell-screen span[data-backspace] { display: none; }
+.shell-dock { display: flex; align-items: center; gap: .5rem; padding: .55rem .7rem; border: 1px solid var(--border-strong); background: var(--surface-raised); }
+.shell-dock > span { color: var(--accent); font: 700 .85rem var(--font-mono, monospace); }
+.shell-dock input { flex: 1; min-width: 0; min-height: 2.2rem; border: 0; background: transparent; color: var(--text); font: .85rem var(--font-mono, monospace); }
+.shell-dock input:focus { outline: none; }
+.shell-dock input:disabled { color: var(--dim); }
+@media (max-width: 850px) {
+  .shell-panel-head { flex-direction: column; align-items: stretch; }
+  .shell-controls { align-items: stretch; flex-direction: column; }
+  .shell-screen { min-height: 16rem; }
+}
+
+/* ── Callback tabs and shell panel, console styling ────────────────────────
+   Loaded after admin.css, so these win over the editorial defaults there. */
+.callback-tabs [aria-current="page"],
+.callback-tabs > [aria-current="page"] { color: var(--text); }
+.callback-tabs a { text-decoration: none; }
+.callback-tabs a:not([aria-current="page"]) { color: var(--muted); }
+.callback-tabs a:not([aria-current="page"]):hover { color: var(--text); }
+.callback-workspace-head h2 em { display: none; }
+.callback-workspace-head h2 { font-size: .95rem; font-weight: 600; }
+.callback-tasking-title h3, .shell-panel-head h3, .process-panel-head h3,
+.file-panel-head h3, .metadata-head h3 { font-family: var(--font-ui); font-size: 1rem; font-weight: 600; }
+.callback-tasking-title p, .process-panel-head p, .file-panel-head p, .metadata-head p {
+  font-family: var(--font-ui);
+  font-size: .78rem;
+  color: var(--muted);
+}

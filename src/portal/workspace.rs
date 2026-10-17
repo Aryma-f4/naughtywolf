@@ -36,6 +36,12 @@ pub struct GraphNode {
     status: String,
     href: String,
     facts: Vec<(String, String)>,
+    /// Seconds since the last check-in, so a node that looks alive can be aged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_seconds: Option<i64>,
+    /// True when the callback holds an open socket, so actions on it are instant.
+    #[serde(default)]
+    instant: bool,
 }
 #[derive(Serialize)]
 pub struct GraphEdge {
@@ -43,10 +49,25 @@ pub struct GraphEdge {
     target: String,
     label: &'static str,
 }
+/// What the operator is looking at, in one line, before reading any node.
+#[derive(Serialize, Default)]
+pub struct TopologyCounts {
+    pub operations: usize,
+    pub assets: usize,
+    pub callbacks: usize,
+    pub active: usize,
+    /// Callbacks reachable without waiting for a beacon.
+    pub instant: usize,
+    /// Tasks queued or running on a callback right now.
+    pub tasks_in_flight: usize,
+    /// Shells attached to a callback right now.
+    pub shells: usize,
+}
 #[derive(Serialize)]
 pub struct TopologyData {
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
+    counts: TopologyCounts,
 }
 
 fn node(
@@ -67,6 +88,8 @@ fn node(
         status,
         href,
         facts: Vec::new(),
+        age_seconds: None,
+        instant: false,
     }
 }
 fn status<T: std::fmt::Debug>(value: T) -> String {
@@ -83,16 +106,40 @@ fn live_state(callback: &Callback, now: time::OffsetDateTime) -> String {
     }
 }
 
+/// How long ago a callback last checked in, from the recorded timestamp.
+fn check_in_age(last_seen: &str, now: time::OffsetDateTime) -> Option<i64> {
+    time::OffsetDateTime::parse(last_seen, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|seen| (now - seen).whole_seconds())
+}
+
+/// What is happening on callbacks right now, gathered once for the whole graph.
+///
+/// A graph of registered hosts is inventory; these three numbers are what make
+/// it operational — which hosts answer instantly, which are already working on
+/// something, and which have a shell an operator can type into.
+#[derive(Default)]
+pub struct CallbackActivity {
+    /// Callbacks with an open live socket.
+    pub live: HashSet<String>,
+    /// Tasks queued or running, per session.
+    pub tasks: HashMap<String, usize>,
+    /// Attached shells, per session.
+    pub shells: HashMap<String, usize>,
+}
+
 // Relationships come only from persisted foreign keys and saved observations.
 fn topology(
     operations: &[Operation],
     assets: &[Asset],
     callbacks: &[Callback],
     runs: &[CheckRun],
+    activity: &CallbackActivity,
 ) -> TopologyData {
     let mut data = TopologyData {
         nodes: vec![],
         edges: vec![],
+        counts: TopologyCounts::default(),
     };
     // `callbacks.status` is only ever written as "active" on check-in, so a
     // stored status never reports a host that went silent. Derive liveness
@@ -101,6 +148,9 @@ fn topology(
     let now = time::OffsetDateTime::now_utc();
     let operation_ids: HashSet<_> = operations.iter().map(|op| op.id.as_str()).collect();
     let asset_map: HashMap<_, _> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    data.counts.operations = operations.len();
+    data.counts.assets = assets.len();
+    data.counts.callbacks = callbacks.len();
     for op in operations {
         data.nodes.push(node(
             format!("operation:{}", op.id),
@@ -140,6 +190,7 @@ fn topology(
     for callback in callbacks {
         let id = format!("callback:{}", callback.id);
         let operation = callback.operation_id.clone().unwrap_or_default();
+        let online = callback.is_online(now);
         let mut n = node(
             id.clone(),
             "callback",
@@ -149,6 +200,30 @@ fn topology(
             live_state(callback, now),
             format!("/callbacks/{}", callback.id),
         );
+        if online {
+            data.counts.active += 1;
+        }
+        let tasks = activity
+            .tasks
+            .get(callback.id.as_str())
+            .copied()
+            .unwrap_or(0);
+        let shells = activity
+            .shells
+            .get(callback.id.as_str())
+            .copied()
+            .unwrap_or(0);
+        let instant = activity.live.contains(callback.id.as_str());
+        if instant {
+            data.counts.instant += 1;
+        }
+        data.counts.tasks_in_flight += tasks;
+        data.counts.shells += shells;
+        // What an operator needs when deciding where to act: how old this is,
+        // whether it answers instantly, and whether something is already
+        // running on it.
+        n.age_seconds = check_in_age(&callback.last_seen, now);
+        n.instant = instant;
         n.facts = vec![
             ("User".into(), callback.user_name.clone()),
             ("Process".into(), callback.process.clone()),
@@ -157,6 +232,19 @@ fn topology(
                 format!("{} / {}", callback.os, callback.arch),
             ),
             ("Protocol".into(), callback.protocol.clone()),
+            (
+                "Channel".into(),
+                if instant {
+                    "Instant (open socket)".to_owned()
+                } else {
+                    format!(
+                        "Beacon every ~{}s",
+                        callback.interval_ms.unwrap_or(0) / 1000
+                    )
+                },
+            ),
+            ("Tasks in flight".into(), tasks.to_string()),
+            ("Shells attached".into(), shells.to_string()),
             ("Last seen".into(), callback.last_seen.clone()),
         ];
         data.nodes.push(n);
@@ -173,8 +261,43 @@ fn topology(
         if let Some(source) = parent {
             data.edges.push(GraphEdge {
                 source,
-                target: id,
+                target: id.clone(),
                 label: "registered callback",
+            });
+        }
+        // The address the callback reported is what the operator will actually
+        // reach, so it belongs in the graph next to the host that reported it.
+        if let Some(address) = callback
+            .local_addr
+            .as_deref()
+            .map(str::trim)
+            .filter(|address| !address.is_empty() && address.parse::<std::net::IpAddr>().is_ok())
+        {
+            let address_id = format!("address:{address}");
+            if !data.nodes.iter().any(|existing| existing.id == address_id) {
+                let mut address_node = node(
+                    address_id.clone(),
+                    "address",
+                    address.to_owned(),
+                    "Reported by a callback".into(),
+                    operation.clone(),
+                    if online {
+                        "active".into()
+                    } else {
+                        "lost".to_owned()
+                    },
+                    format!("/callbacks/{}", callback.id),
+                );
+                address_node.facts = vec![
+                    ("Source".into(), callback.host.clone()),
+                    ("User".into(), callback.user_name.clone()),
+                ];
+                data.nodes.push(address_node);
+            }
+            data.edges.push(GraphEdge {
+                source: id,
+                target: address_id,
+                label: "reports",
             });
         }
     }
@@ -250,6 +373,8 @@ async fn records(
 pub async fn topology_data(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repo): State<Repository>,
+    live: Option<axum::Extension<crate::c2_live::LiveRegistry>>,
+    hub: Option<axum::Extension<crate::shell_hub::ShellHub>>,
 ) -> Result<Json<TopologyData>, AppError> {
     let (ops, assets, runs) = records(&repo, &user).await?;
     let callbacks = if user.role.allows(Role::Operator) {
@@ -258,7 +383,47 @@ pub async fn topology_data(
     } else {
         vec![]
     };
-    Ok(Json(topology(&ops, &assets, &callbacks, &runs)))
+    let activity = activity(&repo, &callbacks, live, hub).await;
+    Ok(Json(topology(&ops, &assets, &callbacks, &runs, &activity)))
+}
+
+/// Gather what is happening on the visible callbacks right now.
+///
+/// One query for task counts and two in-memory lookups: a graph that only shows
+/// registered hosts is inventory, and this is what makes it operational.
+async fn activity(
+    repo: &Repository,
+    callbacks: &[Callback],
+    live: Option<axum::Extension<crate::c2_live::LiveRegistry>>,
+    hub: Option<axum::Extension<crate::shell_hub::ShellHub>>,
+) -> CallbackActivity {
+    let mut activity = CallbackActivity {
+        live: live
+            .map(|live| {
+                live.live_sessions()
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ..CallbackActivity::default()
+    };
+    for callback in callbacks {
+        let shells = hub
+            .as_ref()
+            .map(|hub| {
+                hub.shells(&callback.id)
+                    .into_iter()
+                    .filter(|shell| shell.state != "closed")
+                    .count()
+            })
+            .unwrap_or(0);
+        if shells > 0 {
+            activity.shells.insert(callback.id.clone(), shells);
+        }
+    }
+    activity.tasks = repo.tasks_in_flight_by_session().await.unwrap_or_default();
+    activity
 }
 
 pub async fn topology_page(
@@ -281,8 +446,8 @@ pub async fn topology_page(
     };
     let body = format!(
         r#"<section class="topology-workspace" data-topology>
-<div class="topology-toolbar"><div class="view-switch" aria-label="Visualization view"><button type="button" data-view="graph" aria-pressed="true">Graph</button><button type="button" data-view="list" aria-pressed="false">List</button></div><label class="sr-only" for="graph-search">Search nodes</label><input id="graph-search" type="search" placeholder="Find a host, address, or operation…" data-graph-search><label class="sr-only" for="graph-operation">Operation</label><select id="graph-operation" data-graph-operation><option value="">All operations</option></select><label class="sr-only" for="graph-status">Node status</label><select id="graph-status" data-graph-status><option value="">All statuses</option><option value="active">Active</option><option value="beacon">Beacon</option><option value="dormant">Dormant</option><option value="lost">Lost</option><option value="observed">Observed</option></select><button type="button" class="btn btn-ghost" data-graph-refresh>Refresh</button></div>
-<div class="graph-summary"><span><i class="legend-dot operation-dot"></i><b data-count="operation">0</b> operations</span><span><i class="legend-dot asset-dot"></i><b data-count="asset">0</b> assets</span><span><i class="legend-dot callback-dot"></i><b data-count="callback">0</b> callbacks</span><span><i class="legend-dot address-dot"></i><b data-count="address">0</b> addresses</span><span class="graph-snapshot" data-graph-snapshot>Loading snapshot…</span></div>
+<div class="topology-toolbar"><div class="view-switch" aria-label="Visualization view"><button type="button" data-view="graph" aria-pressed="true">Graph</button><button type="button" data-view="list" aria-pressed="false">List</button></div><label class="sr-only" for="graph-search">Search nodes</label><input id="graph-search" type="search" placeholder="Find a host, address, or operation…" data-graph-search><label class="sr-only" for="graph-operation">Operation</label><select id="graph-operation" data-graph-operation><option value="">All operations</option></select><label class="sr-only" for="graph-status">Node status</label><select id="graph-status" data-graph-status><option value="">All statuses</option><option value="active">Active</option><option value="instant">Instant channel</option><option value="busy">Working</option><option value="lost">Lost</option><option value="observed">Observed</option></select><button type="button" class="btn btn-ghost" data-graph-refresh>Refresh</button></div>
+<div class="graph-summary"><span><i class="legend-dot operation-dot"></i><b data-count="operation">0</b> operations</span><span><i class="legend-dot asset-dot"></i><b data-count="asset">0</b> assets</span><span><i class="legend-dot callback-dot"></i><b data-count="callback">0</b> callbacks</span><span><i class="legend-dot address-dot"></i><b data-count="address">0</b> addresses</span><span class="graph-live" data-live-summary>0 reachable instantly</span><span class="graph-busy" data-busy-summary>0 tasks in flight</span><span class="graph-shell" data-shell-summary>0 shells attached</span><span class="graph-snapshot" data-graph-snapshot>Loading snapshot…</span></div>
 <div class="graph-layout"><div class="graph-canvas-wrap"><div class="graph-canvas" data-graph-canvas tabindex="0" aria-label="Relationship graph. Drag to pan; use the zoom buttons or arrow keys. Select a node for details."><svg data-graph-svg viewBox="0 0 1000 680" aria-label="Operation, asset and callback relationships"><g data-graph-layer></g></svg></div><div class="graph-list" data-graph-list hidden></div><div class="graph-empty" data-graph-empty hidden><span class="empty-orbit" aria-hidden="true">◎</span><h2>Your field of view starts here.</h2><p>Recorded operations and callbacks will appear here when available.</p><a href="/operations">Open operations ↗</a></div><div class="graph-controls"><button type="button" data-zoom="in" aria-label="Zoom in">+</button><button type="button" data-zoom="out" aria-label="Zoom out">−</button><button type="button" data-zoom="fit">Fit</button><span data-graph-visible role="status" aria-live="polite"></span></div></div><aside class="node-inspector" data-node-inspector aria-label="Selected node details"><p class="eyebrow">NODE INSPECTOR</p><div data-node-detail><span class="inspector-symbol" aria-hidden="true">⌖</span><h2>Every connection<br>has context.</h2><p>Select a node to see its identity, status, and recorded relationships.</p></div><div class="inspector-footnote">Lines represent saved associations and DNS observations. They do not imply a network route or pivot.</div></aside></div>
 <div class="graph-bottom"><span>Drag to pan · + / − to zoom · 0 to fit</span><a href="/recon">Open recon workspace ↗</a></div><details class="graph-fallback"><summary>Asset inventory without visualization</summary>{fallback}</details><noscript><p>Enable JavaScript for the interactive graph. The asset inventory above remains available.</p></noscript></section>"#
     );
@@ -813,7 +978,7 @@ mod topology_liveness_tests {
     #[test]
     fn topology_node_uses_liveness_not_the_stored_status() {
         let stale = callback_seen_at(&ago(86_400), Some(10_000));
-        let data = topology(&[], &[], &[stale], &[]);
+        let data = topology(&[], &[], &[stale], &[], &CallbackActivity::default());
         let node = data
             .nodes
             .iter()
@@ -825,12 +990,116 @@ mod topology_liveness_tests {
     #[test]
     fn a_live_callback_node_stays_active_in_the_graph() {
         let fresh = callback_seen_at(&ago(2), Some(10_000));
-        let data = topology(&[], &[], &[fresh], &[]);
+        let data = topology(&[], &[], &[fresh], &[], &CallbackActivity::default());
         let node = data
             .nodes
             .iter()
             .find(|n| n.kind == "callback")
             .expect("callback node present");
         assert_eq!(node.status, "active");
+    }
+
+    /// A graph of registered hosts is inventory. These are the numbers that say
+    /// which host to act on first.
+    #[test]
+    fn a_callback_node_reports_whether_it_answers_instantly_and_what_it_is_running() {
+        let callback = callback_seen_at(&ago(2), Some(10_000));
+        let mut activity = CallbackActivity::default();
+        activity.live.insert(callback.id.clone());
+        activity.tasks.insert(callback.id.clone(), 2);
+        activity.shells.insert(callback.id.clone(), 1);
+
+        let data = topology(&[], &[], &[callback], &[], &activity);
+        let node = data
+            .nodes
+            .iter()
+            .find(|n| n.kind == "callback")
+            .expect("callback node present");
+
+        assert!(node.instant, "an open socket means actions are instant");
+        assert_eq!(data.counts.instant, 1);
+        assert_eq!(data.counts.active, 1);
+        assert_eq!(data.counts.tasks_in_flight, 2);
+        assert_eq!(data.counts.shells, 1);
+        let fact = |name: &str| {
+            node.facts
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(fact("Tasks in flight").as_deref(), Some("2"));
+        assert_eq!(fact("Shells attached").as_deref(), Some("1"));
+        assert_eq!(fact("Channel").as_deref(), Some("Instant (open socket)"));
+    }
+
+    #[test]
+    fn a_callback_without_a_socket_says_it_works_on_its_beacon_interval() {
+        let callback = callback_seen_at(&ago(2), Some(10_000));
+        let data = topology(&[], &[], &[callback], &[], &CallbackActivity::default());
+        let node = data
+            .nodes
+            .iter()
+            .find(|n| n.kind == "callback")
+            .expect("callback node present");
+        assert!(!node.instant);
+        let channel = node
+            .facts
+            .iter()
+            .find(|(key, _)| key == "Channel")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        assert!(channel.starts_with("Beacon every"), "{channel}");
+    }
+
+    #[test]
+    fn a_reported_address_becomes_a_node_the_callback_points_at() {
+        let mut callback = callback_seen_at(&ago(2), Some(10_000));
+        callback.local_addr = Some("10.20.30.40".into());
+        let data = topology(&[], &[], &[callback], &[], &CallbackActivity::default());
+
+        let address = data
+            .nodes
+            .iter()
+            .find(|n| n.kind == "address")
+            .expect("the reported address is in the graph");
+        assert_eq!(address.label, "10.20.30.40");
+        assert!(
+            data.edges
+                .iter()
+                .any(|edge| edge.source.starts_with("callback:") && edge.target == address.id),
+            "the callback points at its own address"
+        );
+    }
+
+    /// Two callbacks behind one address share a node; a duplicated address node
+    /// would read as two hosts.
+    #[test]
+    fn a_shared_address_is_one_node() {
+        let mut first = callback_seen_at(&ago(2), Some(10_000));
+        first.local_addr = Some("10.20.30.40".into());
+        let mut second = callback_seen_at(&ago(3), Some(10_000));
+        second.local_addr = Some("10.20.30.40".into());
+        let data = topology(
+            &[],
+            &[],
+            &[first, second],
+            &[],
+            &CallbackActivity::default(),
+        );
+        assert_eq!(data.nodes.iter().filter(|n| n.kind == "address").count(), 1);
+        assert_eq!(
+            data.edges.iter().filter(|e| e.label == "reports").count(),
+            2,
+            "both callbacks still point at it"
+        );
+    }
+
+    #[test]
+    fn a_callback_age_is_reported_so_a_stale_node_can_be_spotted() {
+        let fresh = callback_seen_at(&ago(30), Some(10_000));
+        let data = topology(&[], &[], &[fresh], &[], &CallbackActivity::default());
+        let node = data.nodes.iter().find(|n| n.kind == "callback").unwrap();
+        let age = node.age_seconds.expect("age is reported");
+        assert!((25..=60).contains(&age), "unexpected age {age}");
     }
 }

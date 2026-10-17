@@ -1,5 +1,6 @@
 use serde_json::Value;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use nw_profile::msgs::Register;
@@ -32,6 +33,15 @@ struct PortalUserRow {
     role: String,
     disabled: bool,
     created_at: String,
+}
+
+/// Commands that preempt the queue when a callback has no live channel.
+///
+/// A cancellation is enqueued as `nw/killtask`. Waiting behind unrelated pending
+/// work means "stop" only takes effect once those tasks have been delivered,
+/// which is exactly the delay a kill must not have.
+pub fn is_priority_command(command: &str) -> bool {
+    matches!(command, "nw/killtask")
 }
 
 /// SQL-only access to persisted lab-platform records.
@@ -1312,10 +1322,17 @@ impl Repository {
             rows.iter().map(|row| row.id.as_str()).collect();
         redeliveries.retain(|row| !claimed_ids.contains(row.id.as_str()));
         rows.append(&mut redeliveries);
+        // A kill must not sit behind unrelated pending work: the operator asked
+        // for something to stop now, so the control task leaves first and
+        // everything else keeps its arrival order behind it. This is the
+        // fallback for callbacks with no live channel; with one, the kill has
+        // already been written to the socket before this is ever reached.
         rows.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then(left.id.cmp(&right.id))
+            is_priority_command(&left.command)
+                .cmp(&is_priority_command(&right.command))
+                .reverse()
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
         });
         transaction.commit().await.map_err(|_| AppError::Internal)?;
         Ok(rows)
@@ -1985,6 +2002,92 @@ impl Repository {
         .map_err(|_| AppError::Internal)?;
         transaction.commit().await.map_err(|_| AppError::Internal)?;
         Ok(TaskCancellation::Requested { control_task_id })
+    }
+
+    /// Record that the callback confirmed a pushed kill.
+    ///
+    /// The kill itself is recorded when the operator asks for it; this is the
+    /// callback's own answer, which is the only evidence the process actually went
+    /// away rather than merely being asked to.
+    pub async fn confirm_task_kill(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        killed: bool,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT INTO c2_audit (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+             VALUES (NULL, 'callback', ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(if killed {
+            "task_kill_confirmed"
+        } else {
+            "task_kill_not_needed"
+        })
+        .bind(session_id)
+        .bind(format!("task {task_id}"))
+        .bind(if killed { 1 } else { 0 })
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        Ok(())
+    }
+
+    /// Count queued and running tasks per session.
+    ///
+    /// Used by the topology, where "what is this host doing right now" is the
+    /// question the graph should answer.
+    pub async fn tasks_in_flight_by_session(&self) -> Result<HashMap<String, usize>, AppError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT session_id, COUNT(*) FROM c2_tasks \
+             WHERE status IN ('pending', 'delivering', 'delivered', 'processing') \
+             GROUP BY session_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        Ok(rows
+            .into_iter()
+            .map(|(session, count)| (session, count.max(0) as usize))
+            .collect())
+    }
+
+    /// Advance a control task that was written to the callback's live socket.
+    ///
+    /// A pushed task is already with the callback, so the row moves straight to
+    /// `delivered` instead of being handed out again on the next beacon. Doing
+    /// it conditionally keeps a concurrent beacon from double-delivering it.
+    pub async fn mark_task_delivered_by_push(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        operator_id: &str,
+    ) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await.map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "UPDATE c2_tasks SET status = 'delivered', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ? AND session_id = ? AND status = 'pending'",
+        )
+        .bind(task_id)
+        .bind(session_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        sqlx::query(
+            "INSERT INTO c2_audit (operator_id, operator_name, action, target_session, details, succeeded, timestamp) \
+             SELECT t.operator_id, COALESCE(u.username, 'operator'), 'task_pushed_live', t.session_id, \
+                    'control task ' || t.id || ' delivered on the live channel', 1, \
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             FROM c2_tasks t LEFT JOIN users u ON u.id = t.operator_id \
+             WHERE t.id = ? AND t.session_id = ?",
+        )
+        .bind(task_id)
+        .bind(session_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| AppError::Internal)?;
+        let _ = operator_id;
+        transaction.commit().await.map_err(|_| AppError::Internal)
     }
 
     /// List tasks for a session with their results (for the callback detail page).

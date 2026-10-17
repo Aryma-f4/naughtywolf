@@ -753,7 +753,8 @@ fn callbacks_page_presents_active_session_workspace() {
     assert!(all.contains("class=\"status-pill status-neutral\""));
     assert!(all.contains("action=\"/callbacks/callback-2/delete\""));
 
-    let offline = templates::callbacks_page(&user, &callbacks, "csrf-token", CallbackFilter::Offline);
+    let offline =
+        templates::callbacks_page(&user, &callbacks, "csrf-token", CallbackFilter::Offline);
     assert!(!offline.contains("LAB-WS-01"));
     assert!(offline.contains("STALE-HOST"));
 }

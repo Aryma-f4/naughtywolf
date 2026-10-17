@@ -559,7 +559,7 @@ mod priority_tests {
     #[test]
     fn killtask_is_delivered_before_ordinary_pending_tasks() {
         let kill = Uuid::new_v4();
-        let mut tasks = vec![
+        let mut tasks = [
             task(Uuid::new_v4(), "shell"),
             task(kill, "nw/killtask"),
             task(Uuid::new_v4(), "fs-list"),
@@ -575,7 +575,7 @@ mod priority_tests {
     fn ordering_is_stable_within_each_priority_group() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
-        let mut tasks = vec![task(first, "shell"), task(second, "shell")];
+        let mut tasks = [task(first, "shell"), task(second, "shell")];
         tasks.sort_by_key(|t| !TaskQueue::is_priority(&t.command));
         assert_eq!(tasks[0].id, first, "FIFO preserved among normal tasks");
         assert_eq!(tasks[1].id, second);

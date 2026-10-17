@@ -3601,6 +3601,8 @@ async fn enrich_callback_metadata(
         file_browser: true,
         file_transfer: true,
         task_ack: true,
+        live_channel: true,
+        interactive_shell: true,
     })
     .unwrap();
     sqlx::query(

@@ -1,12 +1,16 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::HeaderMap,
     response::sse::{Event, KeepAlive, Sse},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::{
     AppError,
@@ -318,26 +322,111 @@ pub async fn retry_task(
     Ok(Json(task_view(&repository, &session_id, &retry_id).await?))
 }
 
+/// How a cancellation reached the callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationDelivery {
+    /// Stopped here and now, over the callback's open socket. Nothing was
+    /// queued and no beacon was needed.
+    Live,
+    /// The task had not been delivered, so it never left the server at all.
+    BeforeDelivery,
+    /// No live socket: the kill is queued and rides the next beacon.
+    Queued,
+}
+
+/// The task as before, plus how the cancellation actually reached the callback.
+///
+/// Flattened so existing callers keep reading `status`, `state_label` and the
+/// rest straight off the response.
+#[derive(Debug, Serialize)]
+pub struct CancellationOutcome {
+    #[serde(flatten)]
+    pub task: TaskView,
+    pub delivery: CancellationDelivery,
+    /// The control task that carries the kill, when one was created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_task_id: Option<String>,
+}
+
 pub async fn cancel_task(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repository): State<Repository>,
+    live: Option<Extension<crate::c2_live::LiveRegistry>>,
     session: Session,
     Path((session_id, task_id)): Path<(String, String)>,
     headers: HeaderMap,
-) -> Result<Json<TaskView>, AppError> {
+) -> Result<Json<CancellationOutcome>, AppError> {
     user.require(Role::Operator)?;
     require_visible_callback(&repository, &user, &session_id).await?;
     require_csrf(&session, &headers).await?;
-    match repository
+    let cancellation = repository
         .request_task_cancellation(&session_id, &task_id, &user.id, &user.username)
-        .await?
-    {
+        .await?;
+
+    // A task that had not been delivered is already stopped: nothing is running
+    // on the callback, and queueing a kill for it would claim work that never
+    // started.
+    let control_task_id = match &cancellation {
+        TaskCancellation::Cancelled => None,
+        TaskCancellation::Requested { control_task_id } => Some(control_task_id.clone()),
         TaskCancellation::AlreadyTerminal => {
             return Err(AppError::Conflict("task is already terminal".to_owned()));
         }
-        TaskCancellation::Cancelled | TaskCancellation::Requested { .. } => {}
+    };
+
+    // With a live socket the kill does not wait in the queue: it is written
+    // straight to that socket, and the queued control task is marked delivered
+    // so the next beacon cannot send it a second time.
+    let mut delivery = match &cancellation {
+        TaskCancellation::Cancelled => CancellationDelivery::BeforeDelivery,
+        _ => CancellationDelivery::Queued,
+    };
+    if let (Some(control_task_id), Some(Extension(live))) = (control_task_id.as_ref(), &live)
+        && push_kill(&repository, live, &session_id, &task_id).await
+    {
+        repository
+            .mark_task_delivered_by_push(&session_id, control_task_id, &user.id)
+            .await?;
+        delivery = CancellationDelivery::Live;
     }
-    Ok(Json(task_view(&repository, &session_id, &task_id).await?))
+
+    Ok(Json(CancellationOutcome {
+        task: task_view(&repository, &session_id, &task_id).await?,
+        delivery,
+        control_task_id,
+    }))
+}
+
+/// Write one kill to the callback's live socket. Reports whether it went out.
+async fn push_kill(
+    repository: &Repository,
+    live: &crate::c2_live::LiveRegistry,
+    session_id: &str,
+    task_id: &str,
+) -> bool {
+    let (Ok(session), Ok(task)) = (Uuid::parse_str(session_id), Uuid::parse_str(task_id)) else {
+        return false;
+    };
+    let Ok(Some(encoded)) = repository.session_key_for(session_id).await else {
+        return false;
+    };
+    let Some(key) = decode_session_key(&encoded) else {
+        return false;
+    };
+    live.push(
+        &key,
+        session,
+        nw_profile::msgs::Live::Kill { task_id: task },
+    )
+    .await
+    .is_ok()
+}
+
+/// Session keys are base64 in the database; the live channel needs the bytes.
+fn decode_session_key(encoded: &str) -> Option<[u8; 32]> {
+    let raw = STANDARD.decode(encoded).ok()?;
+    <[u8; 32]>::try_from(raw.as_slice()).ok()
 }
 
 pub async fn task_events(
