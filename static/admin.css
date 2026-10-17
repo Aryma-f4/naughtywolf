@@ -1306,3 +1306,52 @@ label { font-weight: 500; color: #ddc7cc; }
 @media (max-width: 720px) {
   .payload-gsocket-fields { grid-template-columns: 1fr; }
 }
+
+/* Callback state filter ---------------------------------------------------
+   The board opens on active sessions; the tabs make the other states one
+   click away and show how many sessions each would reveal. */
+.callback-filter {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.35rem;
+	padding: 0.4rem;
+	margin-bottom: 1rem;
+}
+
+.callback-filter .filter-tab {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 0.5rem;
+	padding: 0.55rem 0.9rem;
+	border-radius: 0.5rem;
+	text-decoration: none;
+	color: var(--ink-muted, #8b93a7);
+	border: 1px solid transparent;
+	transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.callback-filter .filter-tab span {
+	font-size: 0.82rem;
+	letter-spacing: 0.02em;
+}
+
+.callback-filter .filter-tab strong {
+	font-variant-numeric: tabular-nums;
+	font-size: 0.95rem;
+}
+
+.callback-filter .filter-tab:hover {
+	background: rgba(255, 255, 255, 0.04);
+	color: var(--ink, #e8ecf4);
+}
+
+.callback-filter .filter-tab.is-current {
+	background: rgba(120, 190, 255, 0.12);
+	border-color: rgba(120, 190, 255, 0.35);
+	color: var(--ink, #e8ecf4);
+}
+
+.callback-filter .filter-tab:focus-visible {
+	outline: 2px solid rgba(120, 190, 255, 0.7);
+	outline-offset: 2px;
+}

@@ -30,6 +30,8 @@ use crate::{
 };
 
 pub mod templates;
+
+pub use templates::CallbackFilter;
 mod workspace;
 
 pub const CSRF_TOKEN_KEY: &str = "login_csrf_token";
@@ -1054,17 +1056,28 @@ async fn callbacks(
     AuthenticatedUserGuard(user): AuthenticatedUserGuard,
     State(repository): State<Repository>,
     session: Session,
+    Query(state): Query<CallbackStateQuery>,
 ) -> Result<Html<String>, AppError> {
     user.require(Role::Operator)?;
     let callbacks = repository
         .list_callbacks_visible_to(&user.id, user.role == Role::Admin)
         .await?;
     let csrf_token = issue_csrf_token(&session).await?;
+    // Defaults to active-only: an operator opening this page is asking what is
+    // live, and a board dominated by stale sessions hides that answer.
+    let filter = templates::CallbackFilter::parse(state.state.as_deref());
     Ok(Html(templates::callbacks_page(
         &user,
         &callbacks,
         &csrf_token,
+        filter,
     )))
+}
+
+#[derive(Deserialize)]
+struct CallbackStateQuery {
+    #[serde(default)]
+    state: Option<String>,
 }
 
 #[derive(Default, Deserialize)]

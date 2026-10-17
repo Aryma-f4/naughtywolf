@@ -17,7 +17,10 @@ use naughtywolf::{
     evidence::EvidenceStore,
     payload::PayloadMeta,
     policy,
-    portal::{DashboardSummary, dashboard_summary, public_router, templates, visible_operations},
+    portal::{
+        CallbackFilter, DashboardSummary, dashboard_summary, public_router, templates,
+        visible_operations,
+    },
 };
 use tower::ServiceExt;
 use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
@@ -726,22 +729,33 @@ fn callbacks_page_presents_active_session_workspace() {
         },
     ];
 
-    let body = templates::callbacks_page(&user, &callbacks, "csrf-token");
+    // The board opens on live sessions only, so the stale host is hidden by
+    // default even though its stored status still reads "active".
+    let body = templates::callbacks_page(&user, &callbacks, "csrf-token", Default::default());
 
     assert!(body.contains("data-callback-workspace"));
     assert!(body.contains("data-callback-summary"));
     assert!(body.contains("class=\"callback-row"));
     assert!(body.contains("LAB-WS-01"));
-    assert!(body.contains("STALE-HOST"));
+    assert!(!body.contains("STALE-HOST"));
     assert!(body.contains("href=\"/callbacks/callback-1\""));
-    assert!(body.contains("href=\"/callbacks/callback-2\""));
     assert!(body.contains("href=\"/payloads\""));
     assert!(body.contains("192.0.2.10"));
     assert!(body.contains("class=\"status-pill status-success\""));
-    assert!(body.contains("class=\"status-pill status-neutral\""));
     assert!(body.contains("action=\"/callbacks/callback-1/delete\""));
-    assert!(body.contains("action=\"/callbacks/callback-2/delete\""));
     assert!(body.contains(">Callbacks<"));
+
+    // Both filter tabs stay reachable, and the offline host returns on demand.
+    let all = templates::callbacks_page(&user, &callbacks, "csrf-token", CallbackFilter::All);
+    assert!(all.contains("LAB-WS-01"));
+    assert!(all.contains("STALE-HOST"));
+    assert!(all.contains("class=\"status-pill status-success\""));
+    assert!(all.contains("class=\"status-pill status-neutral\""));
+    assert!(all.contains("action=\"/callbacks/callback-2/delete\""));
+
+    let offline = templates::callbacks_page(&user, &callbacks, "csrf-token", CallbackFilter::Offline);
+    assert!(!offline.contains("LAB-WS-01"));
+    assert!(offline.contains("STALE-HOST"));
 }
 
 #[test]

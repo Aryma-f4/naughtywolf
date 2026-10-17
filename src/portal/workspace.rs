@@ -73,6 +73,16 @@ fn status<T: std::fmt::Debug>(value: T) -> String {
     format!("{value:?}").to_lowercase()
 }
 
+/// Live/dormant label for a callback node, independent of the stored status
+/// column that no sweeper ever demotes.
+fn live_state(callback: &Callback, now: time::OffsetDateTime) -> String {
+    if callback.is_online(now) {
+        "active".to_owned()
+    } else {
+        "lost".to_owned()
+    }
+}
+
 // Relationships come only from persisted foreign keys and saved observations.
 fn topology(
     operations: &[Operation],
@@ -84,6 +94,11 @@ fn topology(
         nodes: vec![],
         edges: vec![],
     };
+    // `callbacks.status` is only ever written as "active" on check-in, so a
+    // stored status never reports a host that went silent. Derive liveness
+    // instead, using the same window as the callbacks board, so the graph
+    // cannot show a three-day-old beacon as live.
+    let now = time::OffsetDateTime::now_utc();
     let operation_ids: HashSet<_> = operations.iter().map(|op| op.id.as_str()).collect();
     let asset_map: HashMap<_, _> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
     for op in operations {
@@ -131,7 +146,7 @@ fn topology(
             callback.host.clone(),
             format!("{} · {}", callback.os, callback.protocol),
             operation.clone(),
-            status(callback.status),
+            live_state(callback, now),
             format!("/callbacks/{}", callback.id),
         );
         n.facts = vec![
@@ -741,4 +756,81 @@ pub async fn run_directory(
     )
     .await?;
     Ok(Redirect::to(&format!("/directory?asset={}", form.asset_id)).into_response())
+}
+
+#[cfg(test)]
+mod topology_liveness_tests {
+    use super::*;
+    use crate::db::models::CallbackStatus;
+    use time::format_description::well_known::Rfc3339;
+
+    fn callback_seen_at(last_seen: &str, interval_ms: Option<i64>) -> Callback {
+        Callback {
+            id: "session-1".into(),
+            asset_id: None,
+            operation_id: None,
+            host: "web-01".into(),
+            user_name: "u".into(),
+            process: "p".into(),
+            arch: "x86_64".into(),
+            os: "linux".into(),
+            os_version: None,
+            executable_path: None,
+            local_addr: None,
+            implant_version: None,
+            interval_ms,
+            jitter_ms: None,
+            capabilities_json: None,
+            protocol: "http".into(),
+            // Deliberately "active": the stored column is never demoted, which
+            // is exactly the bug these tests pin down.
+            status: CallbackStatus::Active,
+            last_seen: last_seen.into(),
+            created_at: last_seen.into(),
+        }
+    }
+
+    fn ago(seconds: i64) -> String {
+        (time::OffsetDateTime::now_utc() - time::Duration::seconds(seconds))
+            .format(&Rfc3339)
+            .expect("valid timestamp")
+    }
+
+    #[test]
+    fn a_recent_checkin_reads_as_active() {
+        let now = time::OffsetDateTime::now_utc();
+        let state = live_state(&callback_seen_at(&ago(5), Some(10_000)), now);
+        assert_eq!(state, "active");
+    }
+
+    #[test]
+    fn a_silent_checkin_reads_as_lost_even_though_stored_status_is_active() {
+        let now = time::OffsetDateTime::now_utc();
+        let state = live_state(&callback_seen_at(&ago(3_600), Some(10_000)), now);
+        assert_eq!(state, "lost");
+    }
+
+    #[test]
+    fn topology_node_uses_liveness_not_the_stored_status() {
+        let stale = callback_seen_at(&ago(86_400), Some(10_000));
+        let data = topology(&[], &[], &[stale], &[]);
+        let node = data
+            .nodes
+            .iter()
+            .find(|n| n.kind == "callback")
+            .expect("callback node present");
+        assert_eq!(node.status, "lost");
+    }
+
+    #[test]
+    fn a_live_callback_node_stays_active_in_the_graph() {
+        let fresh = callback_seen_at(&ago(2), Some(10_000));
+        let data = topology(&[], &[], &[fresh], &[]);
+        let node = data
+            .nodes
+            .iter()
+            .find(|n| n.kind == "callback")
+            .expect("callback node present");
+        assert_eq!(node.status, "active");
+    }
 }

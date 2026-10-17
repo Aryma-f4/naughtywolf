@@ -1398,15 +1398,73 @@ pub fn event_feed_page(user: &AuthenticatedUser, events: &[AuditEvent]) -> Strin
     app_page("Event Feed", user, "events", &format!("{}{}", chat, rows))
 }
 
+/// Which callbacks the board is showing.
+///
+/// An operator's real question is "what is live right now", so the board
+/// opens on active sessions only and says so. Offline sessions stay one click
+/// away because they are still the interesting ones to triage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallbackFilter {
+    #[default]
+    Active,
+    Offline,
+    All,
+}
+
+impl CallbackFilter {
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("all") => Self::All,
+            Some("offline") => Self::Offline,
+            _ => Self::Active,
+        }
+    }
+
+    pub fn keeps(self, online: bool) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => online,
+            Self::Offline => !online,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active only",
+            Self::Offline => "Offline only",
+            Self::All => "All sessions",
+        }
+    }
+}
+
 pub fn callbacks_page(
     user: &AuthenticatedUser,
     callbacks: &[Callback],
     csrf_token: &str,
+    filter: CallbackFilter,
 ) -> String {
     let now = time::OffsetDateTime::now_utc();
     let active = callbacks.iter().filter(|c| c.is_online(now)).count();
     let offline = callbacks.len() - active;
-    let rows = callbacks
+    let visible: Vec<&Callback> = callbacks
+        .iter()
+        .filter(|c| filter.keeps(c.is_online(now)))
+        .collect();
+    let tabs = [
+        (CallbackFilter::Active, active, "active"),
+        (CallbackFilter::Offline, offline, "offline"),
+        (CallbackFilter::All, callbacks.len(), "all"),
+    ]
+    .iter()
+    .map(|(view, count, slug)| {
+        let current = if *view == filter { " is-current" } else { "" };
+        format!(
+            "<a class=\"filter-tab{current}\" href=\"/callbacks?state={slug}\" data-filter-state=\"{slug}\"><span>{}</span><strong>{count:02}</strong></a>",
+            view.label()
+        )
+    })
+    .collect::<String>();
+    let rows = visible
         .iter()
         .map(|c| {
             let online = c.is_online(now);
@@ -1443,8 +1501,21 @@ format!(
             )
         })
         .collect::<String>();
-    let table = if callbacks.is_empty() {
-        "<section class=\"empty-state panel callback-empty\"><span class=\"empty-callback-icon\" aria-hidden=\"true\">ϟ</span><h2>No callbacks in view.</h2><p>Create a compatible native payload and run it on an authorized lab host to see sessions here.</p><a class=\"button\" href=\"/payloads\">Create payload ↗</a></section>".to_owned()
+    let table = if visible.is_empty() {
+        let hint = if callbacks.is_empty() {
+            "Create a compatible native payload and run it on an authorized lab host to see sessions here."
+        } else {
+            match filter {
+                CallbackFilter::Active => {
+                    "No session has checked in recently. Switch to &ldquo;All sessions&rdquo; to review offline hosts."
+                }
+                CallbackFilter::Offline => "Every callback is currently active.",
+                CallbackFilter::All => "No callbacks in view.",
+            }
+        };
+        format!(
+            "<section class=\"empty-state panel callback-empty\"><span class=\"empty-callback-icon\" aria-hidden=\"true\">&#x3df;</span><h2>Nothing matches this filter.</h2><p>{hint}</p><a class=\"button\" href=\"/payloads\">Create payload &#8599;</a></section>"
+        )
     } else {
         format!(
             "<div class=\"callback-table-shell panel\"><div class=\"table-scroll\"><table class=\"data-table callbacks-table\"><caption>Callbacks</caption><thead><tr><th scope=\"col\">Host</th><th scope=\"col\">User</th><th scope=\"col\">Process</th><th scope=\"col\">OS / Arch</th><th scope=\"col\">Address</th><th scope=\"col\">Protocol</th><th scope=\"col\">State</th><th scope=\"col\">Last check-in</th><th scope=\"col\">Operation</th><th scope=\"col\">First seen</th><th scope=\"col\"><span class=\"sr-only\">Action</span></th></tr></thead><tbody>{rows}</tbody></table></div></div>"
@@ -1455,7 +1526,7 @@ format!(
         user,
         "callbacks",
         &format!(
-            "<section class=\"callback-workspace\" data-callback-workspace><header class=\"callback-workspace-head\"><div><p class=\"eyebrow\">SESSION BOARD / LIVE INVENTORY</p><h2>Every callback.<br><em>Ready to inspect.</em></h2><p>Registered sessions, their current state, and the operation context behind each connection.</p></div><div class=\"callback-workspace-actions\"><a class=\"btn btn-ghost\" href=\"/topology\">Open topology</a><a class=\"button\" href=\"/payloads\">Create payload <span aria-hidden=\"true\">↗</span></a></div></header><div class=\"callback-summary\" data-callback-summary><article><span>Total sessions</span><strong>{total:02}</strong><small>Registered callbacks</small></article><article class=\"summary-active\"><span>Active</span><strong>{active:02}</strong><small>Checked in recently</small></article><article><span>Offline</span><strong>{offline:02}</strong><small>No recent check-in</small></article></div>{table}</section>",
+            "<section class=\"callback-workspace\" data-callback-workspace><header class=\"callback-workspace-head\"><div><p class=\"eyebrow\">SESSION BOARD / LIVE INVENTORY</p><h2>Every callback.<br><em>Ready to inspect.</em></h2><p>Registered sessions, their current state, and the operation context behind each connection.</p></div><div class=\"callback-workspace-actions\"><a class=\"btn btn-ghost\" href=\"/topology\">Open topology</a><a class=\"button\" href=\"/payloads\">Create payload <span aria-hidden=\"true\">↗</span></a></div></header><div class=\"callback-summary\" data-callback-summary><article><span>Total sessions</span><strong>{total:02}</strong><small>Registered callbacks</small></article><article class=\"summary-active\"><span>Active</span><strong>{active:02}</strong><small>Checked in recently</small></article><article><span>Offline</span><strong>{offline:02}</strong><small>No recent check-in</small></article></div><div class=\"callback-filter panel\" data-callback-filter role=\"group\" aria-label=\"Filter callbacks by state\">{tabs}</div>{table}</section>",
             total = callbacks.len(),
             active = active,
             offline = offline,
@@ -1939,4 +2010,42 @@ pub(super) fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
+}
+
+#[cfg(test)]
+mod callback_filter_tests {
+    use super::CallbackFilter;
+
+    #[test]
+    fn default_is_active_only() {
+        assert_eq!(CallbackFilter::parse(None), CallbackFilter::Active);
+        assert_eq!(CallbackFilter::parse(Some("")), CallbackFilter::Active);
+        assert_eq!(
+            CallbackFilter::parse(Some("nonsense")),
+            CallbackFilter::Active
+        );
+    }
+
+    #[test]
+    fn explicit_states_parse() {
+        assert_eq!(
+            CallbackFilter::parse(Some("active")),
+            CallbackFilter::Active
+        );
+        assert_eq!(
+            CallbackFilter::parse(Some("offline")),
+            CallbackFilter::Offline
+        );
+        assert_eq!(CallbackFilter::parse(Some("all")), CallbackFilter::All);
+    }
+
+    #[test]
+    fn each_filter_admits_the_right_half() {
+        assert!(CallbackFilter::Active.keeps(true));
+        assert!(!CallbackFilter::Active.keeps(false));
+        assert!(CallbackFilter::Offline.keeps(false));
+        assert!(!CallbackFilter::Offline.keeps(true));
+        assert!(CallbackFilter::All.keeps(true));
+        assert!(CallbackFilter::All.keeps(false));
+    }
 }
