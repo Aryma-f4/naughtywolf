@@ -33,14 +33,21 @@ services:
       NAUGHTYWOLF_TCP_BIND: ${NAUGHTYWOLF_TCP_BIND:-0.0.0.0:4630}
       NAUGHTYWOLF_TCP_PROTOCOL: ${NAUGHTYWOLF_TCP_PROTOCOL:-gsocket}
       # Discord/Telegram are callback channels: the server polls the chat
-      # platform outbound. Set to enable.
-      # NAUGHTYWOLF_DISCORD_CHANNEL: ${NAUGHTYWOLF_DISCORD_CHANNEL:-}
-      # NAUGHTYWOLF_TELEGRAM_CHANNEL: ${NAUGHTYWOLF_TELEGRAM_CHANNEL:-}
+      # platform outbound. Both take "<token>@<channel-or-chat-id>" and stay
+      # empty unless the operator supplies credentials.
+      NAUGHTYWOLF_DISCORD_CHANNEL: ${NAUGHTYWOLF_DISCORD_CHANNEL:-}
+      NAUGHTYWOLF_TELEGRAM_CHANNEL: ${NAUGHTYWOLF_TELEGRAM_CHANNEL:-}
       RUST_LOG: ${RUST_LOG:-info}
     expose:
       - "8080"
       - "50051"
       - "4630"
+    # gRPC and the raw framed TCP listener are published so beacons can reach
+    # them directly. Both are cleartext (gRPC is h2c, TCP is a raw frame), so
+    # these ports must be firewalled to the lab network, not the open internet.
+    ports:
+      - "${NW_GRPC_PUBLISHED:-50051}:50051"
+      - "${NW_TCP_PUBLISHED:-4630}:4630"
     volumes:
       - portal-data:/data
     init: true
@@ -62,6 +69,7 @@ services:
       NW_PSK: ${NW_C2_PSK:?Set the headless C2 shared key}
       NW_DB: /data/c2.sqlite
       NW_DOWNLOADS: /data/downloads
+      NW_GRPC_BIND: 0.0.0.0:50052
       # Uncomment to add raw TCP or DNS listeners. Both speak cleartext framed
       # protocols, so publish them only to a restricted lab network.
       # NW_TCP_BIND: 0.0.0.0:4630
@@ -69,6 +77,9 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     expose:
       - "8081"
+      - "50052"
+    ports:
+      - "${NW_GRPC_PUBLISHED_HEADLESS:-50052}:50052"
     volumes:
       - c2-data:/data
     init: true
@@ -91,6 +102,7 @@ services:
       - "80:80"
       - "443:443"
       - "443:443/udp"
+      - "8443:8443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

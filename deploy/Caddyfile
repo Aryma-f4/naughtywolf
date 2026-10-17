@@ -10,6 +10,27 @@
 # so they cannot be distinguished by path on one hostname. gRPC therefore needs
 # its own subdomain or a published port; it is intentionally not wired here.
 
+# Plaintext C2 over HTTP: the automatic HTTP->HTTPS redirect would answer a
+# beacon with a 308, so the portal C2 routes are served directly on :80. Other
+# paths still redirect to TLS. This deliberately puts the C2 protocol on the
+# wire in the clear; use it only where that is acceptable.
+http://{$GATEWAY_DOMAIN} {
+	@portal_c2 path /c2/checkin /c2/register /c2/poll
+	handle @portal_c2 {
+		reverse_proxy app:8080
+	}
+
+	@headless_c2 path /c2b/c2/checkin /c2b/c2/ws
+	handle @headless_c2 {
+		rewrite * /c2{uri}
+		reverse_proxy c2:8081
+	}
+
+	handle {
+		redir https://{host}{uri} permanent
+	}
+}
+
 {$GATEWAY_DOMAIN} {
 	encode zstd gzip
 
@@ -45,5 +66,24 @@
 	log {
 		output stdout
 		format json
+	}
+}
+
+# gRPC over TLS for `grpcs` payloads. The portal and the headless C2 expose the
+# same generated service path (/nw.C2/Checkin), so they cannot share one
+# hostname by path; a dedicated TLS port separates them while keeping the
+# ciphertext off the wire. 8443 terminates TLS here and forwards h2c to the
+# plaintext gRPC listener.
+https://{$GATEWAY_DOMAIN}:8443 {
+	handle /nw.C2/* {
+		reverse_proxy app:50051 {
+			transport http {
+				versions h2c
+			}
+		}
+	}
+
+	handle {
+		respond "NaughtyWolf gRPC endpoint" 200
 	}
 }
